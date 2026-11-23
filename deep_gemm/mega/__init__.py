@@ -17,7 +17,7 @@ __all__ = [
     "SymmBuffer", "get_symm_buffer_for_mega_moe", "transform_weights_for_mega_moe",
     "fp4_fp4_mega_moe", "mega_moe_pre_dispatch",
     "transform_weights_for_fp8_mega_moe", "transform_weights_for_w4a16_mega_moe",
-    "fp8_fp8_mega_moe", "bf16_fp4_mega_moe",
+    "fp8_fp8_mega_moe", "bf16_fp4_mega_moe", "bf16_int4_mega_moe",
     "transform_weights_for_w4a8_mega_moe", "fp8_fp4_mega_moe",
     "int8_int8_mega_moe",
 ]
@@ -37,7 +37,7 @@ class SymmBuffer:
 
     mma_type='fp4xfp4' (also 'mxfp4xmxfp4') selects W4A4; 'fp8xfp4' selects W4A8.
     'int8xint8' selects SM80 INT8 with one FP32 scale per token.
-    'bf16xfp4' selects W4A16; 'fp8xfp8' selects W8A8, with
+    'bf16xfp4' selects MXFP4 W4A16 and 'bf16xint4' selects SM80 INT4 W4A16; 'fp8xfp8' selects W8A8, with
     quantization='channelwise' (default) or 'blockwise'. intermediate_hidden is I.
 
     Select the HGGC device before construction. base shares storage and
@@ -178,7 +178,7 @@ def get_symm_buffer_for_mega_moe(
 
     The workspace is filled by mega_moe_pre_dispatch and consumed by
     the corresponding complete compute entry. MMA modes are 'fp4xfp4' (alias 'mxfp4xmxfp4'),
-    'int8xint8', 'fp8xfp4', 'bf16xfp4' and 'fp8xfp8'. Only fp8xfp8 accepts quantization,
+    'int8xint8', 'fp8xfp4', 'bf16xfp4', 'bf16xint4' and 'fp8xfp8'. Only fp8xfp8 accepts quantization,
     selecting channelwise (default) or blockwise scales.
     """
     if use_fp8_dispatch is not None:
@@ -426,7 +426,9 @@ def _interleave_weights(tensor: torch.Tensor, gran: int = 8) -> torch.Tensor:
             .transpose(1, 2).contiguous().reshape(experts, n, k))
 
 
-def _check_routed_weights(l1_weights, l2_weights, dtype, blockwise=False):
+def _check_routed_weights(l1_weights, l2_weights, dtype, blockwise=False, *, scale_dtypes=None):
+    if scale_dtypes is None:
+        scale_dtypes = (torch.uint8,) if dtype == torch.uint8 else (torch.float32,)
     for name, pair in (("l1_weights", l1_weights), ("l2_weights", l2_weights)):
         if not isinstance(pair, (tuple, list)) or len(pair) != 2:
             raise TypeError(f"{name} must be a (weight, scale) pair")
@@ -437,7 +439,7 @@ def _check_routed_weights(l1_weights, l2_weights, dtype, blockwise=False):
         w, s = pair
         if (
             w.dtype != dtype
-            or s.dtype != (torch.uint8 if dtype == torch.uint8 else torch.float32)
+            or s.dtype not in scale_dtypes
             or not w.is_cuda
             or not s.is_cuda
             or not w.is_contiguous()
@@ -490,18 +492,28 @@ def transform_weights_for_w4a16_mega_moe(
         l1_weights: Tuple[torch.Tensor, torch.Tensor], l2_weights: Tuple[torch.Tensor, torch.Tensor],
         activation: str = "situ",
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
-    """Pack canonical MXFP4 weights and UE8M0 scales for BF16 x MXFP4.
+    """Pack group-32 W4 weights for BF16 activations.
+
+    SM80 INT4 uses offset-binary nibbles (q = code - 8, even K in the low
+    nibble) and BF16 scales [E,N,K/32]. MXFP4 uses E2M1 and uint8 UE8M0 scales.
 
     For an [E, N, K] matrix, SM80 returns int32 weights [E, K/16, 2N]
-    and uint8 scales [E, K/32, N]. SM89 uses packed uint8 weights [E, N, K/2]
+    and scales [E, K/32, N] in the input scale dtype. SM89 uses packed uint8 weights [E, N, K/2]
     and uint8 scales [E, N/64, 2K].
     """
     _normalize_activation(activation)
-    _check_routed_weights(l1_weights, l2_weights, torch.uint8)
+    _check_routed_weights(l1_weights, l2_weights, torch.uint8, scale_dtypes=(torch.uint8, torch.bfloat16))
+    if l1_weights[1].dtype != l2_weights[1].dtype:
+        raise ValueError("both W4A16 banks must use the same scale dtype")
 
     w1, s1 = l1_weights
-    mode = (_C.PreprocessMode.W4A16_MXFP4 if torch.cuda.get_device_capability(w1.device) == (8, 0)
-            else _C.PreprocessMode.W4A16_MXFP4_MMA)
+    sm80 = torch.cuda.get_device_capability(w1.device) == (8, 0)
+    if s1.dtype == torch.bfloat16:
+        if not sm80:
+            raise ValueError("BF16 x INT4 MegaMoE requires SM80")
+        mode = _C.PreprocessMode.W4A16_INT4
+    else:
+        mode = _C.PreprocessMode.W4A16_MXFP4 if sm80 else _C.PreprocessMode.W4A16_MXFP4_MMA
     pack = _C.preprocess_weights_and_scales
     return (pack(mode, False, _interleave_weights(w1), _interleave_weights(s1)),
             pack(mode, False, *l2_weights))
@@ -525,7 +537,7 @@ def _check_routed_buffer(
         raise ValueError("l1_weights must match the workspace intermediate_hidden")
     weight = l1_weights[0]
     intermediate = sym_buffer.intermediate_hidden
-    if sym_buffer.mma_type == 'bf16xfp4' and weight.dtype == torch.int32:
+    if sym_buffer.mma_type in ('bf16xfp4', 'bf16xint4') and weight.dtype == torch.int32:
         matches = weight.shape[1:] == (sym_buffer.hidden // 16, 4 * intermediate)
     else:
         matches = weight.shape[1] == 2 * intermediate
@@ -601,12 +613,44 @@ def bf16_fp4_mega_moe(
     """
     if not isinstance(sym_buffer, SymmBuffer) or sym_buffer.mma_type != 'bf16xfp4':
         raise TypeError("bf16_fp4_mega_moe requires SymmBuffer(mma_type='bf16xfp4')")
+    _run_bf16_w4(_C.bf16_fp4_mega_moe, y, l1_weights, l2_weights, sym_buffer,
+                 cumulative_local_expert_recv_stats, activation, activation_clamp, fast_math,
+                 l1_weights_replicas, l2_weights_replicas, situ_beta, situ_linear_beta, activation_alpha)
+
+
+def bf16_int4_mega_moe(
+    y: torch.Tensor,
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+    sym_buffer: SymmBuffer,
+    cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+    activation: str = "situ",
+    activation_clamp: Optional[float] = None,
+    fast_math: bool = True,
+    *,
+    l1_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    l2_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    situ_beta: Optional[float] = 4.0,
+    situ_linear_beta: Optional[float] = 25.0,
+    activation_alpha: Optional[float] = None,
+) -> None:
+    """SM80 BF16 x INT4 MoE with group-32 BF16 scales and BF16 output."""
+    if not isinstance(sym_buffer, SymmBuffer) or sym_buffer.mma_type != 'bf16xint4':
+        raise TypeError("bf16_int4_mega_moe requires SymmBuffer(mma_type='bf16xint4')")
+    _run_bf16_w4(_C.bf16_int4_mega_moe, y, l1_weights, l2_weights, sym_buffer,
+                 cumulative_local_expert_recv_stats, activation, activation_clamp, fast_math,
+                 l1_weights_replicas, l2_weights_replicas, situ_beta, situ_linear_beta, activation_alpha)
+
+
+def _run_bf16_w4(entry, y, l1_weights, l2_weights, sym_buffer, cumulative_local_expert_recv_stats,
+                 activation, activation_clamp, fast_math, l1_weights_replicas, l2_weights_replicas,
+                 situ_beta, situ_linear_beta, activation_alpha):
     _check_routed_buffer(y, l1_weights, sym_buffer)
     activation = _normalize_activation(activation)
     if activation != 'situ':
         situ_beta = None if situ_beta == 4.0 else situ_beta
         situ_linear_beta = None if situ_linear_beta == 25.0 else situ_linear_beta
-    _C.bf16_fp4_mega_moe(
+    entry(
         y, l1_weights, l2_weights, cumulative_local_expert_recv_stats,
         sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,

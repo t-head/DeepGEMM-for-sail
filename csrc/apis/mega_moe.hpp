@@ -246,7 +246,7 @@ get_symm_buffer_size_for_mega_moe(
     if (is_fp4_mma_type(mma_type))
         return get_mega_moe_buffer_slices<layout::MegaMoEBuffer>(
             num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, staging_config);
-    if (mma_type == "bf16xfp4" && is_sm80())
+    if ((mma_type == "bf16xfp4" || mma_type == "bf16xint4") && is_sm80())
         return get_mega_moe_buffer_slices<layout::Bf16MegaMoEBuffer>(
             num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, staging_config);
     if (mma_type == "int8xint8")
@@ -300,7 +300,7 @@ static void mega_moe_pre_dispatch(
     const auto owner_mma_type = owner.attr("mma_type").cast<std::string>();
     if (owner_mma_type != mma_type && !(is_fp4_mma_type(owner_mma_type) && is_fp4_mma_type(mma_type)))
         throw pybind11::value_error("mma_type must match the output views' MegaMoE SymmBuffer");
-    const bool bf16 = mma_type == "bf16xfp4" && is_sm80();
+    const bool bf16 = (mma_type == "bf16xfp4" || mma_type == "bf16xint4") && is_sm80();
     if (!bf16 && !is_fp4_mma_type(mma_type) && mma_type != "int8xint8") {
         TORCH_CHECK(mma_type == "fp8xfp8" || mma_type == "fp8xfp4" || mma_type == "bf16xfp4",
                     "Unsupported MegaMoE mma_type: ", mma_type);
@@ -721,7 +721,8 @@ void fp8_fp8_mega_moe(
         situ_beta_opt, situ_linear_beta_opt, activation_alpha_opt, l1_weights_replicas, l2_weights_replicas, staging_config);
 }
 
-void bf16_fp4_mega_moe(
+template <bool kInt4>
+void bf16_w4_mega_moe(
     const Tensor& y, const WeightPair& l1_weights_tuple, const WeightPair& l2_weights_tuple,
     const OptTensor& cumulative_local_expert_recv_stats, const Tensor& sym_buffer,
     const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx, const int& num_max_tokens_per_rank,
@@ -730,6 +731,7 @@ void bf16_fp4_mega_moe(
     const std::optional<float>& situ_beta_opt, const std::optional<float>& situ_linear_beta_opt,
     const std::optional<WeightPair>& l1_weights_replicas, const std::optional<WeightPair>& l2_weights_replicas,
     const std::optional<float>& activation_alpha_opt, const std::array<int, 3>& staging_config) {
+    TORCH_CHECK(!kInt4 || is_sm80(), "BF16 x INT4 MegaMoE requires SM80");
     if (is_sm80()) {
         const auto& w = std::get<0>(l1_weights_tuple);
         TORCH_CHECK(y.dim() == 2 && w.dim() == 3, "Invalid output or packed GEMM1 weight rank");
@@ -746,7 +748,7 @@ void bf16_fp4_mega_moe(
                     (l1_weights_replicas ? masters < groups : masters == groups), "Invalid expert banks");
         auto check = [&](const WeightPair& bank, int e, int n, int k) {
             check_tensor(std::get<0>(bank), torch::kInt32, device, {e, k / 16, int64_t(n) * 2}, "W4A16 packed weights");
-            check_tensor(std::get<1>(bank), torch::kUInt8, device, {e, k / 32, n}, "W4A16 E8M0 scales");
+            check_tensor(std::get<1>(bank), kInt4 ? torch::kBFloat16 : torch::kUInt8, device, {e, k / 32, n}, "W4A16 scales");
         };
         check(l1_weights_tuple, masters, 2 * i, h);
         check(l2_weights_tuple, masters, h, i);
@@ -886,7 +888,8 @@ static void int8_int8_mega_moe(
 
 static void register_apis(pybind11::module_& m) {
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
-    m.def("bf16_fp4_mega_moe", &bf16_fp4_mega_moe);
+    m.def("bf16_fp4_mega_moe", &bf16_w4_mega_moe<false>);
+    m.def("bf16_int4_mega_moe", &bf16_w4_mega_moe<true>);
     m.def("fp8_fp8_mega_moe", &fp8_fp8_mega_moe);
     m.def("fp4_fp4_mega_moe", &fp4_fp4_mega_moe);
     m.def("int8_int8_mega_moe", &int8_int8_mega_moe);

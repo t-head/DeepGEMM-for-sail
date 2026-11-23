@@ -154,9 +154,9 @@ def dequantize(q, s, blockwise=False):
 
 def make_weights(e, n, k, precision, rng):
     """Build quantized weights with FP8 temporaries bounded to one expert."""
-    if precision in ("w4a16", "w4a8"):
+    if precision in ("w4a16", "w4a16_int4", "w4a8"):
         source = torch.randn((e, n, k), device="cuda", dtype=torch.bfloat16, generator=rng) * 0.05
-        ref, w, s = quant_w4(source, d="w4fa16_mma")
+        ref, w, s = quant_w4(source, d="w4a16" if precision == "w4a16_int4" else "w4fa16_mma")
         return (w, s), ref
     # Quantized weights are fixed before transforming their storage layout.
     w = torch.empty((e, n, k), device="cuda", dtype=torch.float8_e4m3fn)
@@ -172,7 +172,7 @@ def make_weights(e, n, k, precision, rng):
 
 def reference(c, source, ids, weights, w1, w2, rank, tokens, *, situ_beta=4.0, situ_linear_beta=25.0):
     blockwise = c.precision == "fp8_blockwise"
-    if c.precision != "w4a16":
+    if c.precision not in ("w4a16", "w4a16_int4"):
         q, s = quantize_rows(source, blockwise)
         source = dequantize(q, s, blockwise)
     result = torch.zeros((source.size(0), source.size(1), c.hidden), device="cuda", dtype=torch.float32)
@@ -206,7 +206,7 @@ def reference(c, source, ids, weights, w1, w2, rank, tokens, *, situ_beta=4.0, s
         # quantization consumes FP32 activation values directly.
         if c.precision != "fp8_blockwise":
             activated = activated.bfloat16()
-        if c.precision != "w4a16":
+        if c.precision not in ("w4a16", "w4a16_int4"):
             q, s = quantize_rows(activated, blockwise)
             activated = dequantize(q, s, blockwise)
         output = (activated.float() @ w2[local_expert].float().T).bfloat16().float() * weights[src, row, slot, None]
@@ -227,10 +227,11 @@ def make_pipeline(c, group, rng, *, replicas=False, fast_math=True):
         w1, w2 = dg.transform_weights_for_w4a8_mega_moe(raw1, raw2)
         mma_type, quantization = "fp8xfp4", None
         entry = dg.fp8_fp4_mega_moe
-    elif c.precision == "w4a16":
+    elif c.precision in ("w4a16", "w4a16_int4"):
         w1, w2 = dg.transform_weights_for_w4a16_mega_moe(raw1, raw2)
-        mma_type, quantization = "bf16xfp4", None
-        entry = dg.bf16_fp4_mega_moe
+        int4 = c.precision == "w4a16_int4"
+        mma_type, quantization = ("bf16xint4" if int4 else "bf16xfp4"), None
+        entry = dg.bf16_int4_mega_moe if int4 else dg.bf16_fp4_mega_moe
     else:
         mma_type = "fp8xfp8"
         quantization = c.precision.removeprefix("fp8_")
@@ -489,6 +490,31 @@ def test_mega_moe_w4a16_zero_weight_nan(mega_moe_group):
         torch.testing.assert_close(stats, expected.int(), rtol=0, atol=0)
     finally:
         pipeline.buffer.destroy()
+
+
+@pytest.mark.parametrize("activation", ("situ", "swiglu", "swiglu_step", "swiglu_oai"))
+def test_mega_moe_w4a16_int4(mega_moe_group, activation):
+    case = replace(CASES[2], precision="w4a16_int4", activation=activation,
+                   experts=4 * mega_moe_group.size(), intermediate=384)
+    run_case(case, mega_moe_group, replicas=True, fast_math=False)
+
+
+def test_mega_moe_w4a16_int4_rejects_mixed_formats(mega_moe_group):
+    case = replace(CASES[2], precision="w4a16_int4", experts=4 * mega_moe_group.size())
+    rng = torch.Generator(device="cuda").manual_seed(42)
+    p = make_pipeline(case, mega_moe_group, rng)
+    try:
+        w, sf = p.raw2
+        with pytest.raises(ValueError, match="same scale dtype"):
+            dg.transform_weights_for_w4a16_mega_moe(p.raw1, (w, sf.byte()))
+        y = torch.empty(1, case.hidden, device="cuda", dtype=torch.bfloat16)
+        with pytest.raises(TypeError, match="bf16xfp4"):
+            dg.bf16_fp4_mega_moe(y, p.l1_weights, p.l2_weights, p.buffer)
+        w, sf = p.l2_weights
+        with pytest.raises(RuntimeError, match="dtype"):
+            dg.bf16_int4_mega_moe(y, p.l1_weights, (w, sf.byte()), p.buffer)
+    finally:
+        p.buffer.destroy()
 
 
 def test_mega_moe_w4a16_complete_tiles(mega_moe_group):

@@ -6,18 +6,18 @@
 #include <deep_gemm/epilogue/gated_activation.cuh>
 
 namespace deep_gemm::sm80 {
-template <bool First, int N, int BM, int BN, int WM, int Ranks, int Capacity, int TopK,
+template <typename ElementScale, bool First, int N, int BM, int BN, int WM, int Ranks, int Capacity, int TopK,
           int TilesPerFlag, GatedActivation Activation, bool FastMath>
 struct W4Output {
     const layout::SymBuffer<Ranks>& scatter;
     layout::TokenSrcMetadata* sources;
     cutlass::bfloat16_t* activated;
     const int* replica;
-    const uint8_t* replica_scale;
+    const ElementScale* replica_scale;
     int masters;
     float limit, alpha, beta, linear_beta;
 
-    CUTLASS_DEVICE void select_bank(int& expert, const int*& w, const uint8_t*& sf) const {
+    CUTLASS_DEVICE void select_bank(int& expert, const int*& w, const ElementScale*& sf) const {
         if (expert >= masters) {
             expert -= masters;
             w = replica;
@@ -70,21 +70,21 @@ struct W4Output {
     }
 };
 
-// Both phases use the native grouped W4A16 MMA and offline-packed E8M0 weights.
-template <bool First, int N, int K, int BM, int BN, int BK, int WM, int WK,
+// Both phases use the native grouped W4A16 MMA and offline-packed weights and group-32 scales.
+template <typename ElementB, typename ElementScale, bool First, int N, int K, int BM, int BN, int BK, int WM, int WK,
           int Groups, int Stages, int Ranks, int Capacity, int TopK, int TilesPerFlag,
           GatedActivation Activation, bool FastMath, bool OutputAligned,
           int ColumnSplits, int ReduceGroupThreads>
 __device__ void w4_mega_gemm(const sched::Int8MegaMoESchedulerArguments& routing,
         const layout::SymBuffer<Ranks>& scatter, const cutlass::bfloat16_t* a,
-        const int* w, const uint8_t* sf, const int* replica, const uint8_t* replica_sf,
+        const int* w, const ElementScale* sf, const int* replica, const ElementScale* replica_sf,
         int masters, cutlass::bfloat16_t* d, float limit, float alpha, float beta, float linear_beta,
         char* smem, const int64_t* ids, const float* weights, __ppu_bfloat16* output, int tokens) {
     using Dispatch = Int8FusedDispatch<BK, true>;
     using Scheduler = sched::SM80MegaMoEScheduler<N, K, BM, BN, Groups,
         First ? MegaMoEPhaseKind::Linear1 : MegaMoEPhaseKind::Linear2,
         Ranks, TilesPerFlag, Capacity, TopK, Dispatch>;
-    using Kernel = cutlass::gemm::kernel::W4A16GEMM<cutlass::float4_t, uint8_t, N, K,
+    using Kernel = cutlass::gemm::kernel::W4A16GEMM<ElementB, ElementScale, N, K,
         BM, BN, BK, WM, 64, WK, Groups, Stages, GemmType::MGroupedNoPad, 32, 1, Scheduler>;
     typename Kernel::Params p{a, w, sf, d};
     if constexpr (First) {
@@ -93,7 +93,7 @@ __device__ void w4_mega_gemm(const sched::Int8MegaMoESchedulerArguments& routing
     } else {
         p.scheduler = TileSchedulerArguments(routing.shape_m, routing.grouped_layout);
     }
-    Kernel{}(p, smem, W4Output<First, N, BM, BN, WM, Ranks, Capacity, TopK, TilesPerFlag, Activation, FastMath>{
+    Kernel{}(p, smem, W4Output<ElementScale, First, N, BM, BN, WM, Ranks, Capacity, TopK, TilesPerFlag, Activation, FastMath>{
         scatter, routing.src_info, d, replica, replica_sf, masters, limit, alpha, beta, linear_beta});
     if constexpr (!First) {
         auto* signals = routing.sym_buffer.get_base_ptr<layout::MegaMoESignals*>();

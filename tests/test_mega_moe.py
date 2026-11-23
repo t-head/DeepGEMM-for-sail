@@ -75,7 +75,7 @@ class MegaMoECase:
     def supported_arches(self):
         if self.precision == "w4a16":
             return ((8, 0), (8, 9))
-        return ((8, 0),) if self.precision == "int8_channelwise" else ((8, 9),)
+        return ((8, 0),) if self.precision in ("int8_channelwise", "w4a16_int4") else ((8, 9),)
 
     def require_world(self):
         if torch.cuda.get_device_capability() not in self.supported_arches:

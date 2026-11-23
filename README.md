@@ -577,7 +577,8 @@ Shared experts remain outside the routed pipeline; `num_shared_experts` must be 
 
 All precisions use `SymmBuffer` or `get_symm_buffer_for_mega_moe` for workspace
 allocation. Select the mode below; FP8 additionally distinguishes scale granularity
-with `quantization` (channelwise by default). These backends require PPU1.5.
+with `quantization` (channelwise by default). FP8 and W4A8 require PPU1.5.
+On ZW810E (SM80), W4A16 supports MXFP4 and INT4 weights.
 
 | Backend | Compute | Workspace mode | Activation | EP limit |
 |---|---|---|---|---|
@@ -585,6 +586,7 @@ with `quantization` (channelwise by default). These backends require PPU1.5.
 | FP8 blockwise | `fp8_fp8_mega_moe` | `mma_type="fp8xfp8", quantization="blockwise"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
 | E4M3 x MXFP4 | `fp8_fp4_mega_moe` | `mma_type="fp8xfp4"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
 | BF16 x MXFP4 | `bf16_fp4_mega_moe` | `mma_type="bf16xfp4"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
+| BF16 x INT4 (SM80) | `bf16_int4_mega_moe` | `mma_type="bf16xint4"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
 
 All MegaMoE backends pass FP32 GEMM1 accumulators to FP32 gated activation.
 Sigmoid and tanh always use the native PPU instructions, including when
@@ -650,6 +652,11 @@ dg.mega_moe_pre_dispatch(
     num_tokens=x.shape[0], mma_type=workspace.mma_type)
 dg.bf16_fp4_mega_moe(y, l1, l2, workspace, activation="situ")
 ```
+
+For INT4 on ZW810E, use the same transform with packed uint8 weights
+`[E,N,K/2]` and BF16 scales `[E,N,K/32]` for both GEMMs. Each nibble stores
+`q + 8` for a signed weight code `q` in [-8, 7], with even K in the low nibble.
+Select `mma_type="bf16xint4"` and call `dg.bf16_int4_mega_moe` with the same arguments.
 
 ```python
 # W4A8 uses the common workspace entry point; I remains the activated width.
