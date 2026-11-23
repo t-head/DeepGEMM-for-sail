@@ -44,23 +44,23 @@ public:
 #include <deep_gemm/impls/ppu_mega_mhc_tc01.cuh>
 extern "C"
 __global__ __launch_bounds__(128) void ppu_mega_mhc_tc01_pre(deep_gemm::mhc::Args args) {{
-    deep_gemm::mhc::ppu_mega_mhc_tc01_prenorm_device<{},{},{},{}>(args);
+    deep_gemm::mhc::ppu_mega_mhc_tc01_prenorm_device<{},{},{},{},{}>(args);
 }}
-)", c.hidden, c.splits, c.tc01_round_b, c.tc01_pre_chunk);
+)", c.hidden, c.splits, c.tc01_round_b, c.tc01_pre_chunk, c.shifted);
         if (c.phase == MegaMhcPhase::Finish) return fmt::format(R"(
 #include <deep_gemm/impls/ppu_mega_mhc_tc01.cuh>
 extern "C"
 __global__ __launch_bounds__(128) void ppu_mega_mhc_tc01_finish(deep_gemm::mhc::Args args) {{
-    deep_gemm::mhc::ppu_mega_mhc_tc01_coeff_device<{},{},{}>(args);
+    deep_gemm::mhc::ppu_mega_mhc_tc01_coeff_device<{},{},{},{}>(args);
 }}
-)", c.hidden, c.splits, c.iterations);
+)", c.hidden, c.splits, c.iterations, c.shifted);
         if (c.tc01) return fmt::format(R"(
 #include <deep_gemm/impls/ppu_mega_mhc_tc01.cuh>
 extern "C"
 __global__ __launch_bounds__(128) void ppu_mega_mhc_tc01(deep_gemm::mhc::Args args) {{
-    deep_gemm::mhc::ppu_mega_mhc_tc01_device<{},{},{}>(args);
+    deep_gemm::mhc::ppu_mega_mhc_tc01_device<{},{},{},{}>(args);
 }}
-)", c.hidden, c.splits, c.tc01_round_b);
+)", c.hidden, c.splits, c.tc01_round_b, c.tc01_stages);
         std::string specialization;
         if (c.single) {
             specialization = fmt::format(
@@ -155,7 +155,8 @@ static PreparedMegaMhc prepare_mega_mhc(MegaMhcRuntime::Args args, int num_sms,
         const auto tile = c.phase == MegaMhcPhase::Pre ?
             fmt::format("tokens_per_cta:1, hidden_chunk:{}", c.tc01_pre_chunk) :
             c.phase == MegaMhcPhase::Finish ?
-            fmt::format("tokens_per_cta:{}, coefficients:24", launch.block_dim.x / (c.splits < 32 ? 16 : 32)) :
+            fmt::format("tokens_per_cta:{}, coefficients:24",
+                        c.shifted ? launch.block_dim.x / (c.splits < 32 ? 16 : 32) : 1) :
             fmt::format("ThreadblockShape[{}, {}, {}]", c.single ? c.tile_m : 64, c.single ? 24 : 32, c.compact_k ? 32 : 64);
         printf("[MegaMhc] kernel:%s path:%s mode:%s hidden:%d sinkhorn_iters:%d\n"
                "problem:[%d, 24, %d]\n"

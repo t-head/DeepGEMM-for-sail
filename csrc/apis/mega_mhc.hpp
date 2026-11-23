@@ -139,11 +139,12 @@ static void mega_mhc(
     const auto arch = get_ppu_arch();
     DG_HOST_ASSERT(arch == AC_PPU0010 or arch == AC_PPU0015);
     const bool tc01 = arch == AC_PPU0010;
-    DG_HOST_ASSERT((not tc01 or shifted) and "Normal Mega-mHC requires M890");
     if (tc01) DG_HOST_ASSERT(t64 <= INT_MAX / 26);
     DG_HOST_ASSERT((not tc01 or not y_fp8.has_value()) and
                    "810E Mega-mHC supports BF16 output only");
-    const auto plan = select_mega_mhc_plan(t, h, num_sinkhorn_iters, get_num_sms(), tc01,
+    const int num_sms = get_num_sms();
+    const int tensor_cu_count = tc01 && !shifted ? device_runtime->get_tensor_cu_count() : 0;
+    const auto plan = select_mega_mhc_plan(t, h, num_sinkhorn_iters, num_sms, tensor_cu_count, tc01,
         y_bf16.has_value(), y_fp8.has_value(), shared_sf_block_m, y_token_sf.has_value(),
         at::cuda::getCurrentDeviceProperties()->multiProcessorCount, shifted);
     const auto& y_primary_sf = y_token_sf.has_value() ? y_token_sf :

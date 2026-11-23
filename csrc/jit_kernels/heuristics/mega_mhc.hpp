@@ -22,6 +22,7 @@ struct MegaMhcConfig {
     MegaMhcPhase phase = MegaMhcPhase::Main;
     bool tc01_round_b = false;
     int tc01_pre_chunk = 1024;
+    int tc01_stages = 2;
 };
 
 struct MegaMhcPlan {
@@ -91,35 +92,50 @@ static int select_normal_splits(int tokens, int hidden, bool ring, int fallback,
     return selected;
 }
 
-static MegaMhcPlan select_mega_mhc_plan(int t, int h, int iterations, int sms,
+static MegaMhcPlan select_mega_mhc_plan(int t, int h, int iterations, int num_sms, int tensor_cu_count,
                                        bool tc01, bool store_bf16, bool store_fp8,
                                        int shared_sf_block_m, bool per_token_fp8,
                                        int physical_sms, bool shifted) {
+    const int sms = tc01 && !shifted ? std::min(num_sms, tensor_cu_count) : num_sms;
     DG_HOST_ASSERT(t > 0 and sms > 0);
     if (tc01) {
-        int splits = 80;
+        constexpr int kTileK = 64;
+        constexpr int kDoubleBufferCtasPerSm = 8, kSingleBufferCtasPerSm = 16;
+        constexpr int kMinKTilesPerSplit = 8;
+        const int m_tiles = ceil_div(t, kMegaMhcGeneralTileM);
+        const int k_tiles = h / kTileK;
+        int splits = k_tiles;
         if (t >= 128) {
             int64_t best = INT64_MAX;
-            for (int candidate : {4, 5, 6, 7, 8, 10, 12, 16, 20, 32, 40, 80}) {
-                const int64_t waves = ceil_div<int64_t>(ceil_div(t, 64) * int64_t(candidate), 8 * sms);
-                const int64_t cost = waves * (64 * ceil_div(80, candidate) + 20) + candidate;
+            const auto consider = [&](int candidate) {
+                if (candidate > k_tiles) return;
+                const int64_t waves = ceil_div<int64_t>(int64_t(m_tiles) * candidate, kDoubleBufferCtasPerSm * sms);
+                const int64_t cost = waves * (kTileK * ceil_div(k_tiles, candidate) + 20) + candidate;
                 if (cost < best) { best = cost; splits = candidate; }
-            }
+            };
+            for (int candidate : {4, 5, 6, 7, 8, 10, 12, 16, 20, 32, 40, 80}) consider(candidate);
+            consider(k_tiles);
         }
-        const int tile_m = splits == 16 && t < 1024 && ceil_div(t, 16) <= sms ? 16 : 32;
-        MegaMhcPlan plan{
-            {h, splits, iterations, tile_m, 2, t % 64 == 0,
-             false, false, t % tile_m != 0, t % (tile_m / 8) != 0, t != 1248,
-             store_bf16, store_fp8, shared_sf_block_m, per_token_fp8, shifted, 0, false},
-            {dim3(ceil_div(t, 64), splits), dim3(128), 0}, sms, 0,
-            ceil_div<int64_t>(t, 64) * splits * 64 * 26};
+        MegaMhcPlan plan{};
         auto& c = plan.config;
+        c.hidden = h;
+        c.splits = splits;
+        c.iterations = iterations;
+        c.tile_m = kMegaMhcGeneralTileM;
+        c.store_bf16 = store_bf16;
+        c.shifted = shifted;
         c.tc01 = true;
-        c.tc01_round_b = ceil_div(t, 64) >= 3;
+        plan.launch_args = {dim3(m_tiles, splits), dim3(128), 0};
+        plan.num_sms = sms;
+        plan.num_partials = int64_t(m_tiles) * splits * kMegaMhcGeneralTileM * 26;
+        c.tc01_round_b = m_tiles >= 3;
+        if (!shifted && int64_t(m_tiles) * splits >= kSingleBufferCtasPerSm * sms &&
+            k_tiles >= kMinKTilesPerSplit * splits)
+            c.tc01_stages = 1;
         if (c.tc01_round_b) plan.num_partials += 24 * 4 * h;
         c.tc01_pre_chunk = t > 8 * physical_sms ? 512 : 1024;
         plan.pre_launch = {dim3(t), dim3(128), 0};
-        plan.finish_launch = {dim3(ceil_div(t, splits < 32 ? 8 : 4)), dim3(128), 0};
+        plan.finish_launch = {dim3(shifted ? ceil_div(t, splits < 32 ? 8 : 4) : t), dim3(128), 0};
         return plan;
     }
     constexpr int kGeneralCtasPerSm = 4, kRingCtasPerSm = 8, kCompactCtasPerSm = 12;

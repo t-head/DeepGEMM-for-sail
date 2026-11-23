@@ -775,7 +775,7 @@ For more information, please refer to the `tf32_hc_prenorm_gemm` function docume
 `deep_gemm.mega_mhc` fuses residual update, coefficient prediction, input
 mixing, and RMSNorm with `hc_mult=4` into caller-provided output buffers.
 
-- **DeepSeek V4 normal on Zhenwu M890** (`H=4096` or `7168`): pass `None`
+- **DeepSeek V4 normal on Zhenwu 810E and M890** (`H=4096` or `7168`): pass `None`
   for both `shifted_prev_mix` and `new_prev_mix`. Input mixing uses the newly
   predicted pre-mix coefficients internally.
 - **DeepSeek V4.1 Flash shifted on Zhenwu 810E and M890** (`H=5120`): pass
@@ -797,7 +797,9 @@ BF16-rounded RMSNorm output and requires one of these scale formats:
   API and cannot be combined with the grouped scale outputs. The scale is
   used for dequantization: `y ≈ y_fp8 * y_token_sf`.
 
-810E uses three kernels for residual/RMSNorm, projection, and coefficients.
+810E uses three kernels for residual update, projection, and coefficients.
+Only the projection uses Tensor Cell. In normal mode, input mixing and
+RMSNorm run after coefficient prediction in the final kernel.
 
 See the [API definition](csrc/apis/mega_mhc.hpp) for argument and layout requirements,
 and [the reference and correctness tests](tests/test_mega_mhc.py) for a

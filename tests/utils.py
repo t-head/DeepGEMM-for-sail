@@ -3800,15 +3800,16 @@ def test_mega_mhc(args):
             deep_gemm.set_num_sms(num_sms)
         if args.get('case') == 'layout' and get_acc_check():
             from test_mega_mhc import check_layout
-            return check_layout(kwargs['tokens'])
+            return check_layout(kwargs['tokens'], kwargs['hidden'], mode)
         if args.get('case') == 'interface_graph':
             from test_mega_mhc import check_graph
+            graph_kwargs = dict(tokens=kwargs['tokens'], hidden=kwargs['hidden'], mode=mode)
             if os.environ.get('HGGC_WARM_UP') or deep_gemm.get_compile_mode() == 1:
-                return check_graph(warmup=True, mode=mode)
+                return check_graph(warmup=True, **graph_kwargs)
             if get_acc_check():
                 from test_mega_mhc import check_interface
-                check_interface()
-                return check_graph(mode=mode)
+                check_interface(kwargs['hidden'], mode)
+                return check_graph(**graph_kwargs)
         return check(**kwargs)
     finally:
         if num_sms is not None:

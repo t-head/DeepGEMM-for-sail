@@ -28,7 +28,8 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   without D2H synchronization.
 
 - **DeepSeek V4 normal Mega-mHC**: `mega_mhc` supports hidden sizes 4096 and
-  7168 on Zhenwu M890 when both `shifted_prev_mix` and `new_prev_mix` are `None`.
+  7168 on Zhenwu M890 and 810E when both pre-mix arguments are `None`.
+  810E supports BF16 output.
 
 - **Weighted MQA logits**: M890 FP8 supports native H8 with D64/D128.
   Paged FP8 and INT8 accept optional request IDs in metadata and logits calls.

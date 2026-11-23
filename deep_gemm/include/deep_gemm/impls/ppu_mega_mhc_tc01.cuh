@@ -10,31 +10,57 @@
 
 namespace deep_gemm::mhc {
 
-template<int H, int S, bool RoundB, int Chunk>
+__device__ __forceinline__ float2 tc01_bf16_pair(uint32_t bits) {
+    return make_float2(__uint_as_float(__byte_perm(bits,0,0x1054)),
+                       __uint_as_float(__byte_perm(bits,0,0x3254)));
+}
+
+template<int H>
+__device__ __forceinline__ void ppu_mega_mhc_tc01_store_norm(Args a, int t, const __ppu_bfloat16* u_buffer,
+                                                            const uint4* norm_weight, float inv) {
+    const int tid=threadIdx.x;
+    constexpr int E=8;
+    using OutPack=uint4;
+    #pragma unroll (H/(128*8))
+    for(int i=0;i<H/(128*8);++i) {
+        const int h=tid*8+i*128*8;
+        OutPack up=*reinterpret_cast<const OutPack*>(u_buffer+h);
+        const OutPack wp=norm_weight[i];
+        OutPack output;
+        #pragma unroll
+        for(int z=0;z<E/2;++z) {
+            const float2 u=tc01_bf16_pair(reinterpret_cast<const uint32_t*>(&up)[z]);
+            const float2 w=tc01_bf16_pair(reinterpret_cast<const uint32_t*>(&wp)[z]);
+            reinterpret_cast<__ppu_bfloat162*>(&output)[z]=__floats2bfloat162_rn(
+                (u.x*inv)*(w.x*a.norm_scale),(u.y*inv)*(w.y*a.norm_scale));
+        }
+        *reinterpret_cast<OutPack*>(a.y+(int64_t)t*H+h)=output;
+    }
+}
+
+template<int H, int S, bool RoundB, int Chunk, bool Shifted>
 __device__ __forceinline__ void ppu_mega_mhc_tc01_prenorm_device(Args a) {
 #if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
-    static_assert(H==5120 && (Chunk==512 || Chunk==1024));
+    static_assert(H%1024==0 && (Chunk==512 || Chunk==1024));
     constexpr int V=Chunk/128;
     using Pack=std::conditional_t<Chunk==512,uint2,uint4>;
     __shared__ float shared_coeff[24], sums[4][2], inv;
-    __shared__ __align__(16) __ppu_bfloat16 input[2][5][Chunk], u_buffer[H];
+    __shared__ __align__(16) __ppu_bfloat16 input[2][5][Chunk], u_buffer[Shifted ? H : 1];
     const int tid=threadIdx.x, t=blockIdx.x, lane=tid%32, warp=tid/32;
     float local_coeff[24];
     if constexpr(Chunk==512) {
         #pragma unroll
-        for(int i=0;i<24;++i) local_coeff[i]=i<4 ? a.pre[t*4+i] : i<8 ? a.post[t*4+i-4] : a.comb[t*16+i-8];
+        for(int i=0;i<24;++i) local_coeff[i]=i<4 ? (Shifted ? a.pre[t*4+i] : 0.f) :
+            i<8 ? a.post[t*4+i-4] : a.comb[t*16+i-8];
     } else {
-        if(tid<24) shared_coeff[tid]=tid<4 ? a.pre[t*4+tid] : tid<8 ? a.post[t*4+tid-4] : a.comb[t*16+tid-8];
+        if(tid<24) shared_coeff[tid]=tid<4 ? (Shifted ? a.pre[t*4+tid] : 0.f) :
+            tid<8 ? a.post[t*4+tid-4] : a.comb[t*16+tid-8];
         __syncthreads();
     }
     const auto coeff=[&](int i) {if constexpr(Chunk==512) return local_coeff[i];else return shared_coeff[i];};
     const auto copy=[&](void* dst,const void* src) {
         if constexpr(Chunk==512) cute::PPU_CP_ASYNC_CACHEGLOBAL<Pack>::copy(*reinterpret_cast<const Pack*>(src),*reinterpret_cast<Pack*>(dst));
         else cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Global>(dst,src,true);
-    };
-    const auto unpack=[](uint32_t bits) {
-        return make_float2(__uint_as_float(__byte_perm(bits,0,0x1054)),
-                           __uint_as_float(__byte_perm(bits,0,0x3254)));
     };
     const auto load=[&](int base,int stage) {
         #pragma unroll
@@ -45,10 +71,12 @@ __device__ __forceinline__ void ppu_mega_mhc_tc01_prenorm_device(Args a) {
     };
     float sq=0,usq=0;
     load(0,0);
-    uint4 norm_weight[H/(128*8)];
-    #pragma unroll
-    for(int i=0;i<H/(128*8);++i)
-        norm_weight[i]=*reinterpret_cast<const uint4*>(a.weight+tid*8+i*128*8);
+    uint4 norm_weight[Shifted ? H/(128*8) : 1];
+    if constexpr(Shifted) {
+        #pragma unroll
+        for(int i=0;i<H/(128*8);++i)
+            norm_weight[i]=*reinterpret_cast<const uint4*>(a.weight+tid*8+i*128*8);
+    }
     #pragma unroll 1
     for(int base=0;base<H;base+=Chunk) {
         const int stage=(base/Chunk)%2;
@@ -63,32 +91,36 @@ __device__ __forceinline__ void ppu_mega_mhc_tc01_prenorm_device(Args a) {
             Pack output;
             #pragma unroll
             for(int z=0;z<V;z+=2) {
-                const float2 x=unpack(reinterpret_cast<const uint32_t*>(&packed[4])[z/2]);
+                const float2 x=tc01_bf16_pair(reinterpret_cast<const uint32_t*>(&packed[4])[z/2]);
                 float v0=x.x*coeff(4+route),v1=x.y*coeff(4+route);
                 #pragma unroll
                 for(int j=0;j<4;++j) {
-                    const float2 old=unpack(reinterpret_cast<const uint32_t*>(&packed[j])[z/2]);
+                    const float2 old=tc01_bf16_pair(reinterpret_cast<const uint32_t*>(&packed[j])[z/2]);
                     v0=fmaf(old.x,coeff(8+j*4+route),v0);
                     v1=fmaf(old.y,coeff(8+j*4+route),v1);
                 }
                 const auto rounded=__floats2bfloat162_rn(v0,v1);
                 reinterpret_cast<__ppu_bfloat162*>(&output)[z/2]=rounded;
-                const float2 v=unpack(*reinterpret_cast<const uint32_t*>(&rounded));
+                const float2 v=tc01_bf16_pair(*reinterpret_cast<const uint32_t*>(&rounded));
                 sq=fmaf(v.x,v.x,sq);sq=fmaf(v.y,v.y,sq);
-                u[z]=fmaf(v.x,coeff(route),u[z]);
-                u[z+1]=fmaf(v.y,coeff(route),u[z+1]);
+                if constexpr(Shifted) {
+                    u[z]=fmaf(v.x,coeff(route),u[z]);
+                    u[z+1]=fmaf(v.y,coeff(route),u[z+1]);
+                }
             }
             *reinterpret_cast<Pack*>(a.new_residual+((int64_t)t*4+route)*H+base+tid*V)=output;
         }
-        Pack output;
-        #pragma unroll
-        for(int z=0;z<V;z+=2) {
-            const auto rounded=__floats2bfloat162_rn(u[z],u[z+1]);
-            reinterpret_cast<__ppu_bfloat162*>(&output)[z/2]=rounded;
-            const float2 v=unpack(*reinterpret_cast<const uint32_t*>(&rounded));
-            usq=fmaf(v.x,v.x,usq);usq=fmaf(v.y,v.y,usq);
+        if constexpr(Shifted) {
+            Pack output;
+            #pragma unroll
+            for(int z=0;z<V;z+=2) {
+                const auto rounded=__floats2bfloat162_rn(u[z],u[z+1]);
+                reinterpret_cast<__ppu_bfloat162*>(&output)[z/2]=rounded;
+                const float2 v=tc01_bf16_pair(*reinterpret_cast<const uint32_t*>(&rounded));
+                usq=fmaf(v.x,v.x,usq);usq=fmaf(v.y,v.y,usq);
+            }
+            *reinterpret_cast<Pack*>(u_buffer+base+tid*V)=output;
         }
-        *reinterpret_cast<Pack*>(u_buffer+base+tid*V)=output;
     }
     #pragma unroll
     for(int delta=1;delta<32;delta*=2) {
@@ -103,25 +135,11 @@ __device__ __forceinline__ void ppu_mega_mhc_tc01_prenorm_device(Args a) {
         #pragma unroll
         for(int i=0;i<4;++i) {sq+=sums[i][0];usq+=sums[i][1];}
         p[24]=sq;
-        inv=rsqrtf(usq/H+a.norm_eps);
+        if constexpr(Shifted) inv=rsqrtf(usq/H+a.norm_eps);
     }
-    __syncthreads();
-    constexpr int E=8;
-    using OutPack=uint4;
-    #pragma unroll (H/(128*8))
-    for(int i=0;i<H/(128*8);++i) {
-        const int h=tid*8+i*128*8;
-        OutPack up=*reinterpret_cast<const OutPack*>(u_buffer+h);
-        const OutPack wp=norm_weight[i];
-        OutPack output;
-        #pragma unroll
-        for(int z=0;z<E/2;++z) {
-            const float2 u=unpack(reinterpret_cast<const uint32_t*>(&up)[z]);
-            const float2 w=unpack(reinterpret_cast<const uint32_t*>(&wp)[z]);
-            reinterpret_cast<__ppu_bfloat162*>(&output)[z]=__floats2bfloat162_rn(
-                (u.x*inv)*(w.x*a.norm_scale),(u.y*inv)*(w.y*a.norm_scale));
-        }
-        *reinterpret_cast<OutPack*>(a.y+(int64_t)t*H+h)=output;
+    if constexpr(Shifted) {
+        __syncthreads();
+        ppu_mega_mhc_tc01_store_norm<H>(a,t,u_buffer,norm_weight,inv);
     }
     if constexpr(RoundB) {
         auto* rounded=reinterpret_cast<uint32_t*>(a.partials+(int64_t)((a.tokens+63)/64)*S*64*P);
@@ -137,21 +155,32 @@ __device__ __forceinline__ void ppu_mega_mhc_tc01_prenorm_device(Args a) {
 #endif
 }
 
-template<int H, int Iters, int W, bool Unroll>
-__device__ __forceinline__ void ppu_mega_mhc_tc01_store_coeff(Args a, int t, float v, float v1, float sq) {
+template<int H, int Iters, int W, bool Unroll, bool Shifted>
+__device__ __forceinline__ void ppu_mega_mhc_tc01_store_coeff(Args a, int t, float v, float v1, float sq, float* pre_mix) {
     const int lane=threadIdx.x%W;
     const uint32_t mask=W==32?0xffffffffu:0xffffu<<((threadIdx.x%32)/16*16);
-    if(lane>=24) v=0.f;
-    if(lane<24) {
-        v=v*rsqrtf(sq/(4*H)+a.hc_eps);
-        v=v*a.scales[lane<4?0:lane<8?1:2]+a.bases[lane];
+    if(Shifted || threadIdx.x<32) {
+        if(lane>=24) v=0.f;
+        if(lane<24) {
+            v=v*rsqrtf(sq/(4*H)+a.hc_eps);
+            v=v*a.scales[lane<4?0:lane<8?1:2]+a.bases[lane];
+        }
+        if constexpr(W==16) if(lane<8) {
+            v1=v1*rsqrtf(sq/(4*H)+a.hc_eps);
+            v1=v1*a.scales[2]+a.bases[lane+16];
+        }
+        if(lane<4) {
+            const float pre=__ppu_sgmdf(v)+a.pre_eps;
+            if constexpr(Shifted) a.new_pre[t*4+lane]=pre;
+            else pre_mix[lane]=pre;
+        }
+        if(lane>=4 && lane<8) a.new_post[t*4+lane-4]=__ppu_sgmdf(v)*a.post_scale;
     }
-    if constexpr(W==16) if(lane<8) {
-        v1=v1*rsqrtf(sq/(4*H)+a.hc_eps);
-        v1=v1*a.scales[2]+a.bases[lane+16];
+    if constexpr(!Shifted) {
+        // Other warps start input mixing while warp 0 finishes Sinkhorn.
+        __syncthreads();
+        if(threadIdx.x>=32) return;
     }
-    if(lane<4) a.new_pre[t*4+lane]=__ppu_sgmdf(v)+a.pre_eps;
-    if(lane>=4 && lane<8) a.new_post[t*4+lane-4]=__ppu_sgmdf(v)*a.post_scale;
     float c;
     if constexpr(W==16) {
         float c0=__shfl_sync(mask,v,(lane%8)+8,W);
@@ -179,31 +208,91 @@ __device__ __forceinline__ void ppu_mega_mhc_tc01_store_coeff(Args a, int t, flo
     if(lane<16) a.new_comb[t*16+lane]=c;
 }
 
-template<int H,int S,int Iters>
+template<int H,int S,int Iters,bool Shifted>
 __device__ __forceinline__ void ppu_mega_mhc_tc01_coeff_device(Args a) {
-    constexpr int W=S<32?16:32;
-    const int t=blockIdx.x*(128/W)+threadIdx.x/W,lane=threadIdx.x%W;
-    if(t>=a.tokens) return;
-    const volatile float* p=a.partials+(int64_t)(t/64)*S*64*P+(t%64)*P;
-    float v=0,v1=0;
-    #pragma unroll
-    for(int split=0;split<S;++split) {
-        if(lane<24) v+=p[split*64*P+lane];
-        if constexpr(W==16) v1+=p[split*64*P+16+lane%8];
+    if constexpr(Shifted) {
+        constexpr int W=S<32?16:32;
+        const int t=blockIdx.x*(128/W)+threadIdx.x/W,lane=threadIdx.x%W;
+        if(t>=a.tokens) return;
+        const volatile float* p=a.partials+(int64_t)(t/64)*S*64*P+(t%64)*P;
+        float v=0,v1=0;
+        #pragma unroll
+        for(int split=0;split<S;++split) {
+            if(lane<24) v+=p[split*64*P+lane];
+            if constexpr(W==16) v1+=p[split*64*P+16+lane%8];
+        }
+        ppu_mega_mhc_tc01_store_coeff<H,Iters,W,(S<32),true>(a,t,v,v1,p[24],nullptr);
+    } else {
+        const int t = blockIdx.x, tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+        __shared__ float pre[4], sums[4], inv;
+        __shared__ __align__(16) __ppu_bfloat16 u_buffer[H];
+        uint4 norm_weight[H / (128 * 8)];
+        #pragma unroll
+        for(int i = 0; i < H / (128 * 8); ++i)
+            norm_weight[i] = *reinterpret_cast<const uint4*>(a.weight + tid * 8 + i * 128 * 8);
+        float v = 0, residual_sq = 0;
+        if(warp == 0) {
+            const volatile float* p = a.partials + (int64_t)(t / 64) * S * 64 * P + (t % 64) * P;
+            #pragma unroll
+            for(int split = 0; split < S; ++split)
+                if(lane < 24)
+                    v += p[split * 64 * P + lane];
+            residual_sq = p[24];
+        }
+        ppu_mega_mhc_tc01_store_coeff<H, Iters, 32, false, false>(a, t, v, 0, residual_sq, pre);
+        float sq = 0;
+        #pragma unroll
+        for(int i = 0; i < H / (128 * 8); ++i) {
+            const int h = tid * 8 + i * 128 * 8;
+            float u[8] = {};
+            #pragma unroll
+            for(int route = 0; route < 4; ++route) {
+                const uint4 input = *reinterpret_cast<const uint4*>(a.new_residual + ((int64_t)t * 4 + route) * H + h);
+                #pragma unroll
+                for(int z = 0; z < 4; ++z) {
+                    const float2 r = tc01_bf16_pair(reinterpret_cast<const uint32_t*>(&input)[z]);
+                    u[2 * z] = fmaf(r.x, pre[route], u[2 * z]);
+                    u[2 * z + 1] = fmaf(r.y, pre[route], u[2 * z + 1]);
+                }
+            }
+            uint4 packed;
+            #pragma unroll
+            for(int z = 0; z < 4; ++z) {
+                const auto rounded = __floats2bfloat162_rn(u[2 * z], u[2 * z + 1]);
+                reinterpret_cast<__ppu_bfloat162*>(&packed)[z] = rounded;
+                const float2 v = tc01_bf16_pair(*reinterpret_cast<const uint32_t*>(&rounded));
+                sq = fmaf(v.x, v.x, sq);
+                sq = fmaf(v.y, v.y, sq);
+            }
+            *reinterpret_cast<uint4*>(u_buffer + h) = packed;
+        }
+        #pragma unroll
+        for(int delta = 1; delta < 32; delta *= 2)
+            sq += __shfl_xor_sync(0xffffffff, sq, delta);
+        if(lane == 0)
+            sums[warp] = sq;
+        __syncthreads();
+        if(tid == 0) {
+            sq = 0;
+            #pragma unroll
+            for(int i = 0; i < 4; ++i)
+                sq += sums[i];
+            inv = rsqrtf(sq / H + a.norm_eps);
+        }
+        __syncthreads();
+        ppu_mega_mhc_tc01_store_norm<H>(a, t, u_buffer, norm_weight, inv);
     }
-    // Prenorm produces the complete residual square sum in split zero.
-    float sq=p[24];
-    ppu_mega_mhc_tc01_store_coeff<H,Iters,W,(S<32)>(a,t,v,v1,sq);
 }
 
-template<int H, int S, bool RoundB>
+template<int H, int S, bool RoundB, int Stages>
 __device__ __forceinline__ void ppu_mega_mhc_tc01_device(Args a) {
 #if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
     constexpr int BM=64, BK=64;
-    static_assert(H==5120 && H%BK==0);
+    static_assert(H%BK==0 && S>0 && S<=H/BK);
+    static_assert(Stages==1 || Stages==2);
     struct Storage {
-        __ppu_bfloat16 input[2][BM*BK];
-        float b[2][2][32*32];
+        __ppu_bfloat16 input[Stages][BM*BK];
+        float b[Stages][2][32*32];
     };
     __shared__ __align__(128) Storage sm;
     const int tid=threadIdx.x, lane=tid%32, warp=tid/32;
@@ -228,10 +317,11 @@ __device__ __forceinline__ void ppu_mega_mhc_tc01_device(Args a) {
     };
     load(0,0);
     for(int step=0;step<(end-begin)*4;++step) {
-        const int stage=step%2;
+        const int stage=step%Stages;
         if(warp==0) cute::cp_async_wait<0>();
         __syncthreads();
-        if(step+1<(end-begin)*4) load(step+1,stage^1);
+        if constexpr(Stages==2)
+            if(step+1<(end-begin)*4) load(step+1,stage^1);
         #pragma unroll
         for(int kk=0;kk<BK;kk+=16) {
             uint32_t av[2][4],bv[2][2][4],packed[4];
@@ -267,6 +357,11 @@ __device__ __forceinline__ void ppu_mega_mhc_tc01_device(Args a) {
                         d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7]);
                 }
             }
+        }
+        if constexpr(Stages==1) {
+            // Retire all shared-memory reads before reusing the only stage.
+            __syncthreads();
+            if(step+1<(end-begin)*4) load(step+1,0);
         }
     }
 
