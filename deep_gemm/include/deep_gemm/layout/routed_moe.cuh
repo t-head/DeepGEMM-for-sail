@@ -245,7 +245,8 @@ struct RoutedMoEInputLayout {
 
     CUTLASS_HOST_DEVICE
     RoutedMoEInputLayout(uint32_t ranks, uint32_t experts, uint32_t capacity, uint32_t topk,
-                        uint64_t token_bytes, uint64_t scale_bytes, uint64_t routing_bytes = 0):
+                        uint64_t token_bytes, uint64_t scale_bytes, uint64_t routing_bytes = 0,
+                        uint64_t min_pool_token_bytes = 0):
         dispatch(nullptr, ranks, experts, capacity, topk, routing_bytes) {
         const uint64_t pool = dispatch.num_max_pool_tokens;
         const auto align16 = [](uint64_t n) { return math::align<uint64_t>(n, 16); };
@@ -255,7 +256,7 @@ struct RoutedMoEInputLayout {
         topk_idx = align16(input_scales + capacity * scale_bytes);
         topk_weights = align16(topk_idx + uint64_t(capacity) * topk * sizeof(int64_t));
         dispatched_tokens = align128(topk_weights + uint64_t(capacity) * topk * sizeof(float));
-        dispatched_scales = align16(dispatched_tokens + pool * token_bytes);
+        dispatched_scales = align16(dispatched_tokens + pool * math::constexpr_max(token_bytes, min_pool_token_bytes));
         gemm2_metadata = align16(dispatched_scales + pool * scale_bytes);
     }
 };
@@ -272,13 +273,21 @@ struct RoutedMoEBuffer : RoutedMoEInputLayout {
     RoutedMoEBuffer(uint32_t ranks, uint32_t experts, uint32_t capacity, uint32_t topk,
                     uint32_t hidden, uint32_t intermediate, bool fp8, bool blockwise, uint64_t routing_bytes = 0):
         RoutedMoEInputLayout(ranks, experts, capacity, topk, uint64_t(hidden) * (fp8 ? 1 : 2),
-                            fp8 ? (blockwise ? hidden / 128 : 1) * sizeof(float) : 0, routing_bytes) {
+                            fp8 ? (blockwise ? hidden / 128 : 1) * sizeof(float) : 0, routing_bytes,
+                            fp8 && !blockwise ? intermediate : 0) {
         const uint64_t pool = dispatch.num_max_pool_tokens, groups = experts / ranks;
         const auto align128 = [](uint64_t n) { return math::align<uint64_t>(n, 128); };
         packed_routes = gemm2_metadata + Gemm2Metadata::rows_bytes(groups);
-        l2_acts = align128(packed_routes + pool * sizeof(int64_t));
-        l2_scales = align128(l2_acts + pool * intermediate * (fp8 ? 1 : 2));
-        bf16_scratch = align128(l2_scales + (fp8 ? pool * (blockwise ? intermediate / 128 : 1) * sizeof(float) : 0));
+        const auto after_routes = align128(packed_routes + pool * sizeof(int64_t));
+        if (fp8 && !blockwise) {
+            l2_acts = dispatched_tokens;
+            l2_scales = dispatched_scales;
+            bf16_scratch = after_routes;
+        } else {
+            l2_acts = after_routes;
+            l2_scales = align128(l2_acts + pool * intermediate * (fp8 ? 1 : 2));
+            bf16_scratch = align128(l2_scales + (fp8 ? pool * (intermediate / 128) * sizeof(float) : 0));
+        }
         block_info = align128(bf16_scratch + (fp8 && !blockwise ? pool * intermediate * 2 : 0));
         block_info_elements = groups >= 128 ? 4 * (1 + groups + pool / kMinCandidateBlockM) : 0;
         combine = align128(block_info + block_info_elements * sizeof(int32_t));

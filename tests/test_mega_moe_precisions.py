@@ -403,6 +403,12 @@ def test_mega_moe_precision_replicas(case, mega_moe_group):
                      tokens=(1, 33)), mega_moe_group, replicas=True, fast_math=False)
 
 
+def test_mega_moe_smoke_w4a8_wide_intermediate(mega_moe_group):
+    case = MegaMoECase("w4a8_wide_intermediate", 512, 1024, 2, 2, 512, tokens=(512, 1, 511),
+                       worlds=(1, 2), precision="w4a8", routing="random", reference_tokens=0)
+    run_case(case, mega_moe_group)
+
+
 def test_mega_moe_channelwise_quantization_reuse(mega_moe_group):
     # I=512 exercises cached vector quantization. Dense and sparse calls share
     # one allocation while the row lookup and selected G1 tile can change.
