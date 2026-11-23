@@ -334,7 +334,8 @@ __device__ __forceinline__ void metadata_scan_test_sync() {
         result = subprocess.run(
             [sys.executable, '-c',
              'from test_attention import _check_paged_metadata_scan; _check_paged_metadata_scan()'],
-            env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+            env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180,
+            cwd=str(Path(__file__).resolve().parent))
         assert result.returncode == 0, result.stdout
         print(result.stdout, end='')
 
