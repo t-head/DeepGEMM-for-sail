@@ -15,7 +15,8 @@ The weighted MXFP4 entry points do not silently quantize FP8 inputs.
 | Legacy INT8 (810E only) | FP32 or BF16 | Same dtype as weights | 1 |
 | MXFP4 weighted | BF16 | BF16 | 1 |
 | Sparse INT8 / MXFP4 | BF16 | Fixed BF16 | 1 (flatten multiple Q per request) |
-| FP8/FP4 AVG | none | BF16 by default; optional FP32 for H4; FP4 H8 requires BF16 | 1–6 |
+| FP8 AVG | none | BF16 by default; optional FP32 | 1–6 |
+| FP4 AVG | none | Fixed BF16 | 1–6 |
 | INT8 AVG (810E only) | none; explicit Q quantization scales | Fixed BF16 | 1–6 |
 
 Dense FP8 on M890 and dense INT8 on 810E support logical head dimensions
@@ -567,16 +568,20 @@ Use `fp8_paged_mqa_avg_logits` for ordinary FP8 paged AVG. The nonpaged
 
 ```python
 def fp8_mqa_avg_logits(q, kv_s, cu_seq_len_k_start, cu_seq_len_k_end, max_seqlen_k, q_scale=None, logits_dtype=torch.bfloat16) -> torch.Tensor: ...
-def fp8_fp4_mqa_avg_logits(q, kv, cu_seq_len_k_start, cu_seq_len_k_end, max_seqlen_k, q_scale=None, logits_dtype=torch.bfloat16) -> torch.Tensor: ...
+def fp8_fp4_mqa_avg_logits(q, kv, cu_seq_len_k_start, cu_seq_len_k_end, max_seqlen_k, q_scale=None) -> torch.Tensor: ...
 def fp8_paged_mqa_avg_logits(q, fused_kv_cache, context_lens, block_table, schedule_meta, max_context_len, indices=None, logits_dtype=torch.bfloat16) -> torch.Tensor: ...
-def fp8_fp4_paged_mqa_avg_logits(q, fused_kv_cache, context_lens, block_table, schedule_meta, max_context_len, indices=None, logits_dtype=torch.bfloat16) -> torch.Tensor: ...
+def fp8_fp4_paged_mqa_avg_logits(q, fused_kv_cache, context_lens, block_table, schedule_meta, max_context_len, indices=None) -> torch.Tensor: ...
 ```
 
 MXFP4 AVG supports 4 or 8 Q heads; FP8 AVG supports 4. The head reduction
 is a sum followed by `1/sqrt(head_dim)` (and optional nonpaged `q_scale`),
 without division by the number of heads.
 
-All four AVG functions default to BF16 output. H4 retains explicit FP32 output; MXFP4 H8 requires BF16 output for both non-paged and paged AVG.
+`fp8_fp4_mqa_avg_logits` and `fp8_fp4_paged_mqa_avg_logits` return BF16
+and have no `logits_dtype` argument, for both H4 and H8. The separate
+`fp8_mqa_avg_logits` and `fp8_paged_mqa_avg_logits` retain `logits_dtype`
+(BF16 by default, or explicit FP32). Use those FP8 entries when selecting
+an FP8 output dtype.
 The FP8-only APIs take Q as a tensor. The `fp8_fp4_*` APIs take Q as a tuple:
 `(fp8_values, None)` for non-paged ordinary FP8, or
 `(packed_fp4_values, int32_mx_scales)` for MXFP4. The paged tuple API accepts
@@ -626,7 +631,7 @@ with the actual model on the target device.
 | M890 / PPU1.5 paged DSA | `fp8_fp4_paged_mqa_logits` | MXFP4 + int32 MX scales in the fused KV cache | BF16 | Fixed BF16 |
 | 810E sparse | `int8_sparse_mqa_logits` / `int8_paged_sparse_mqa_logits` | INT8 + FP32 K scales; Q scales folded into weights | BF16 | Fixed BF16 |
 | M890 / PPU1.5 sparse | `fp8_fp4_sparse_mqa_logits` / `fp8_fp4_paged_sparse_mqa_logits` | MXFP4 | BF16 | Fixed BF16 |
-| M890 / PPU1.5 AVG | Non-paged / paged `fp8_fp4_*avg_logits` | MXFP4 | None | BF16 by default |
+| M890 / PPU1.5 AVG | Non-paged / paged `fp8_fp4_*avg_logits` | MXFP4 | None | Fixed BF16 |
 
 Dense INT8 APIs no longer accept `logits_dtype`: callers must supply BF16 weights
 to obtain BF16 logits. If Q's INT8 quantization scales must be folded into
