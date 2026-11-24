@@ -330,10 +330,10 @@ __device__ __forceinline__ void metadata_scan_test_sync() {
         env.pop('HGGC_WARM_UP', None)
         result = subprocess.run(
             [sys.executable, '-c',
-             'import json, sys; '
-             'sys.path[:] = json.loads(sys.argv[1]); '
+             'import sys; '
+             'sys.path[:] = sys.argv[1:]; '
              'from test_attention import _check_paged_metadata_scan; _check_paged_metadata_scan()',
-             json.dumps(sys.path)],
+             *sys.path],
             env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
         assert result.returncode == 0, result.stdout
         print(result.stdout, end='')
