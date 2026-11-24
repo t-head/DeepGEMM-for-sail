@@ -20,8 +20,7 @@ struct MqaLogitsConfig {
     int block_q, block_qh, block_kv;
     int warp_qh, warp_kv;
     int num_q_stages, num_kv_stages;
-    // Effective output schedule: FP32 G0 is coarse; positive G groups M blocks.
-    // The base selector supplies BF16's G1 default.
+    // FP4 groups M blocks with positive G; FP8 retains its output-specific default.
     int m_block_group = 0;
     bool q_owner_epilogue = false;
     bool balance_output_tiles = false;
@@ -250,90 +249,48 @@ static bool prefer_fp4_avg_short_kv_tile(int seq_len_q, int seq_len_k,
     return seq_len_k < 2048 or (seq_len_q <= 4096 and seq_len_k <= 4096);
 }
 
-// Six geometry/stage candidates for FP4 AVG. G is filled
-// separately after selecting the base tile, including the Q2048 override.
+// Five geometry/stage candidates for BF16 FP4 AVG. Select G separately.
 static MqaLogitsConfig select_fp4_avg_tile(int seq_len_q, int seq_len_k,
-                                         torch::ScalarType logits_dtype, int num_sms, QScaleMode scale_mode,
-                                         bool is_compressed) {
-    // FP4 AVG uses H4, WARP_QH=16 and one Q stage. Only varying fields
-    // belong in the candidate list; expand the complete launch config here.
+                                         int num_sms, bool is_compressed) {
+    // H4, WARP_QH=16 and one Q stage are shared by all candidates.
     constexpr auto make_tile = [](int block_q, int block_kv, int warp_kv, int kv_stages) {
         return MqaLogitsConfig{block_q, block_q * 4, block_kv, 16, warp_kv, 1, kv_stages};
     };
     static constexpr auto tile_q16_kv128 = make_tile(16, 128, 64, 3);
-    static constexpr auto tile_q16_kv128_w32 = make_tile(16, 128, 32, 4);
     static constexpr auto tile_q16_kv256 = make_tile(16, 256, 64, 4);
     static constexpr auto tile_q16_kv512 = make_tile(16, 512, 128, 4);
     static constexpr auto tile_q32_kv128_s3 = make_tile(32, 128, 64, 3);
     static constexpr auto tile_q32_kv128_s4 = make_tile(32, 128, 64, 4);
 
-    // Preserve the Scalar FP32 long-KV crossover before the shared short-KV rule.
-    if (not is_compressed and logits_dtype == torch::kFloat32
-        and scale_mode == kScaleModeQScalar and seq_len_k >= 4096
-        and seq_len_q >= get_mqa_q_rows_per_wave(tile_q32_kv128_s4.block_q, num_sms, 4))
-        return tile_q32_kv128_s4;
-
-    // Reuse the Q16/KV128 tile for all short KV, regardless of output type.
-    if (seq_len_k <= 512
+    if (seq_len_k < 1024
         or prefer_fp4_avg_short_kv_tile(seq_len_q, seq_len_k, num_sms, is_compressed))
         return tile_q16_kv128;
-
-    const bool is_bf16 = logits_dtype == torch::kBFloat16;
-    if (is_compressed or is_bf16) {
-        // Both paths use small tiles for short KV. KV is the total length,
-        // not compressed row capacity: a CTA processes the union of Q windows.
-        if (seq_len_k < 1024)
-            return tile_q16_kv128;
-        // On 39 CUs these resident Q capacities are 624, 1248 and 2496 rows.
-        if (is_bf16 and seq_len_q <= get_mqa_q_rows_per_wave(tile_q16_kv512.block_q, num_sms, 1))
-            return tile_q16_kv512;
-        // Compressed output stays with BQ16: measured BQ32 variants use local storage.
-        if (is_compressed or seq_len_q <= get_mqa_q_rows_per_wave(tile_q16_kv256.block_q, num_sms, 2))
-            return tile_q16_kv256;
-        // Keep S4 for larger Q: S3 increases register use on the QRow path and regresses.
-        return seq_len_q <= get_mqa_q_rows_per_wave(tile_q32_kv128_s3.block_q, num_sms, 2)
-            ? tile_q32_kv128_s3 : tile_q32_kv128_s4;
-    }
-
-    if (seq_len_q >= 4096) {
-        if (seq_len_k <= 1024 or seq_len_k >= 2048)
-            return tile_q16_kv128;
-    } else if (seq_len_q != 2048 and seq_len_k >= 1024 and seq_len_q <= seq_len_k) {
-        // Smaller Q with long KV: prefer fewer unused resident Q slots.
-        // Q2048 retains Q32/S3 for its owner epilogue, unless Scalar selected S4 above.
-        const int wide_capacity = get_mqa_q_rows_per_wave(tile_q16_kv256.block_q, num_sms, 2);
-        const int narrow_capacity = get_mqa_q_rows_per_wave(tile_q16_kv128_w32.block_q, num_sms, 4);
-        const int wide_slots = ceil_div(seq_len_q, wide_capacity) * wide_capacity;
-        const int narrow_slots = ceil_div(seq_len_q, narrow_capacity) * narrow_capacity;
-        // Ties retain the measured narrow-KV preference. This is a tile heuristic,
-        // not a prediction of total kernel cost or post-balance utilization.
-        return wide_slots < narrow_slots ? tile_q16_kv256 : tile_q16_kv128_w32;
-    }
-    return tile_q32_kv128_s3;
+    // KV is the total length, not compressed row capacity: a CTA processes
+    // the union of Q windows. On 39 CUs these capacities are 624/1248/2496 Qs.
+    if (seq_len_q <= get_mqa_q_rows_per_wave(tile_q16_kv512.block_q, num_sms, 1))
+        return tile_q16_kv512;
+    // Compressed output stays with BQ16: measured BQ32 variants use local storage.
+    if (is_compressed or seq_len_q <= get_mqa_q_rows_per_wave(tile_q16_kv256.block_q, num_sms, 2))
+        return tile_q16_kv256;
+    // S4 avoids the QRow register increase measured with S3 at larger Q.
+    return seq_len_q <= get_mqa_q_rows_per_wave(tile_q32_kv128_s3.block_q, num_sms, 2)
+        ? tile_q32_kv128_s3 : tile_q32_kv128_s4;
 }
 
-// Called only for positive-size FP4 AVG inputs. Group a full or half warp's M
-// blocks; 16 mirrors PPUMqaLogitsFP4::InstM. The scheduling choices below are
-// measured policy, not a register/occupancy model.
-static int get_fp4_avg_m_block_group(int seq_len_q, int seq_len_k,
-                                     torch::ScalarType logits_dtype, int num_sms,
+// Group a full or half warp's M blocks; 16 mirrors PPUMqaLogitsFP4::InstM.
+static int get_fp4_avg_m_block_group(int seq_len_q, int num_sms,
                                      bool is_compressed, const MqaLogitsConfig& config) {
     const int m_blocks = config.warp_kv / 16;
     if (is_compressed and config.block_kv >= 256) {
-        // BKV256 full/coarse grouping measured two CTAs/CU; G2 measured three.
-        // After two full-group Q waves, prefer G2's lower register pressure.
+        // Full grouping measured two CTAs/CU; G2 measured three. After two
+        // full-group Q waves, prefer G2's lower register pressure.
         const int full_group_q_wave = get_mqa_q_rows_per_wave(config.block_q, num_sms, 2);
-        return seq_len_q > 2 * full_group_q_wave ? m_blocks / 2
-            : (logits_dtype == torch::kBFloat16 ? m_blocks : 0);
+        return seq_len_q > 2 * full_group_q_wave ? m_blocks / 2 : m_blocks;
     }
-    // Q16/S3 and Q32/S4 share half-warp grouping (G2); avoid extra
-    // specializations for tiny inputs.
     if ((config.block_q == 16 and config.num_kv_stages == 3)
         or (config.block_q == 32 and config.num_kv_stages == 4))
         return m_blocks / 2;
-    if (logits_dtype == torch::kBFloat16 or (seq_len_q == 2048 and seq_len_k >= 1024))
-        return m_blocks;
-    return 0;
+    return m_blocks;
 }
 
 // FP8 AVG uses a fixed tile.
@@ -345,50 +302,26 @@ static MqaLogitsConfig get_fp8_avg_configs(torch::ScalarType logits_dtype) {
 // Apply lane ownership and KV balancing after tile/G selection.
 // This only sets host permissions; the kernel checks the actual KV windows.
 static void configure_fp4_avg_lane_and_kv_balance(MqaLogitsConfig& config, int seq_len_q, int seq_len_k,
-                                          torch::ScalarType logits_dtype, int num_sms,
-                                          bool is_compressed, QScaleMode scale_mode) {
-    // Host grants permission; the kernel checks actual KV windows.
+                                                 int num_sms, bool is_compressed) {
     if (seq_len_k < 1024)
         return;
     if (is_compressed) {
-        // Split long windows across workers; runtime probes retain the Q-only
-        // scheduler for short windows. Compressed lane ownership benefits BF16.
+        // Runtime probes retain Q-only scheduling for short windows.
         config.balance_output_tiles = true;
-        config.q_owner_epilogue = logits_dtype == torch::kBFloat16;
+        config.q_owner_epilogue = true;
         return;
     }
-    if (logits_dtype == torch::kFloat32) {
-        if (scale_mode == kScaleModeQScalar and config.block_q == 32 and config.num_kv_stages == 4) {
-            config.balance_output_tiles = true;
-            config.q_owner_epilogue = true;
-        } else if (seq_len_q >= 8 and seq_len_q <= 1024 and seq_len_k >= 8192) {
-            config.balance_output_tiles = true;
-            config.q_owner_epilogue = true;
-        } else if (seq_len_q == 2048) {
-            config.q_owner_epilogue = true;
-            // All Q-scale modes benefit on long KV; runtime window probes
-            // keep short-window requests on the Q-only scheduler.
-            config.balance_output_tiles = seq_len_k >= 8192;
-        }
-    } else {
-        // Long KV is the main target; very small Q benefits from balancing
-        // earlier. Keep tile/G independent of this output scheduling choice.
-        config.balance_output_tiles = seq_len_k >= 8192 or (seq_len_q < 128 and seq_len_k >= 2048);
-        config.q_owner_epilogue = config.balance_output_tiles
-            or (seq_len_q >= 128 and seq_len_q <= get_mqa_q_rows_per_wave(32, num_sms, 2));
-    }
+    config.balance_output_tiles = seq_len_k >= 8192 or (seq_len_q < 128 and seq_len_k >= 2048);
+    config.q_owner_epilogue = config.balance_output_tiles
+        or (seq_len_q >= 128 and seq_len_q <= get_mqa_q_rows_per_wave(32, num_sms, 2));
 }
 
-// FP4 AVG H4 policy: choose a base tile, derive G, then configure lane ownership and KV balancing.
+// FP4 AVG H4 policy: tile, M-block group, then lane ownership and KV balancing.
 static MqaLogitsConfig get_fp4_avg_configs(int seq_len_q, int seq_len_k,
-                                         torch::ScalarType logits_dtype, int num_sms,
-                                         bool is_compressed, QScaleMode scale_mode) {
-    auto config = select_fp4_avg_tile(seq_len_q, seq_len_k, logits_dtype, num_sms,
-                                      scale_mode, is_compressed);
-    config.m_block_group = get_fp4_avg_m_block_group(seq_len_q, seq_len_k, logits_dtype,
-                                                    num_sms, is_compressed, config);
-    configure_fp4_avg_lane_and_kv_balance(config, seq_len_q, seq_len_k, logits_dtype, num_sms,
-                                  is_compressed, scale_mode);
+                                         int num_sms, bool is_compressed) {
+    auto config = select_fp4_avg_tile(seq_len_q, seq_len_k, num_sms, is_compressed);
+    config.m_block_group = get_fp4_avg_m_block_group(seq_len_q, num_sms, is_compressed, config);
+    configure_fp4_avg_lane_and_kv_balance(config, seq_len_q, seq_len_k, num_sms, is_compressed);
     return config;
 }
 
@@ -404,12 +337,11 @@ static MqaLogitsConfig get_best_configs(torch::ScalarType qk_dtype, int seq_len_
         return {64 / num_heads, 64, 128, 16, 32, 1, 3};
     const bool is_avg = scale_mode != kScaleModeWeights;
     if (is_avg) {
-        // One H8 geometry for all Q-scale modes and output dtypes.
+        // One H8 geometry for all Q-scale modes.
         if (is_fp4 and num_heads == 8)
             return {8, 64, 256, 16, 64, 1, 3, 2, false, seq_len_k >= 1024};
         if (is_fp4)
-            return get_fp4_avg_configs(seq_len_q, seq_len_k, logits_dtype, num_sms,
-                                       is_compressed, scale_mode);
+            return get_fp4_avg_configs(seq_len_q, seq_len_k, num_sms, is_compressed);
         return get_fp8_avg_configs(logits_dtype);
     }
 

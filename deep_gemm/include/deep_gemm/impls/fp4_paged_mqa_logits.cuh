@@ -19,7 +19,7 @@ namespace cutlass::gemm::kernel {
 //   - Additional q_sf (Q scale factor, uint8 e8m0) parameter
 //   - k_sf is uint8 e8m0 (not float32 per-token scale)
 //   - Q/K/q_sf/k_sf and optional weights use AIU load
-//   - Output dtype controlled by ElementLogits (float or bfloat16)
+//   - BF16 output (FP32 MMA accumulation)
 //   - MMA atom: F32F4F4F32 (16x16x64)
 // ============================================================================
 
@@ -47,6 +47,7 @@ template <typename ElementQK, typename ElementAcc, typename ElementLogits, typen
           bool SPLIT_MBLOCK, uint32_t kScaleMode = deep_gemm::kScaleModeWeights, bool kGrouped = false>
 class PPUPagedMqaLogitsFP4 {
 public:
+    static_assert(cute::is_same_v<ElementLogits, __ppu_bfloat16>, "FP4 paged MQA requires BF16 output");
     static_assert(PAGE_KV == 32 || (PAGE_KV > 0 && PAGE_KV % BLOCK_KV == 0),
                   "KV page must be 32 rows or a positive multiple of the compute tile");
     static_assert(cute::is_same_v<ElementQK, uint8_t>, "FP4 paged MQA logits requires uint8_t ElementQK");
@@ -671,7 +672,7 @@ public:
             cp_async_fence();
         };
 
-        // Load KV (A + SFA) from smem to vreg — all M blocks for one k_block (float path)
+        // Load KV (A + SFA) from smem to vreg — all M blocks for one k_block
         auto load_kv_s2r = [&](int k_block) {
             auto source_a = smem_thr_copy_A.partition_S(make_mix_tensor_like(sA_full(_, _, _, read_kv_slot_cached)));
             auto sf = recast<uint16_t>(sSFA_full(_, _, _, read_kv_slot_cached));
@@ -722,7 +723,6 @@ public:
             if constexpr (kIsAvg && kNumHeads == 8) {
                 CUTE_STATIC_ASSERT(MmaIterN == 1 && kQueriesPerWarp == 2);
                 const uint32_t token = warp_n_idx * kQueriesPerWarp + (lane_idx % 4) / 2;
-                static_assert(cute::is_same_v<ElementLogits, __ppu_bfloat16>, "H8 AVG requires BF16 output");
                 const ElementLogits value = __hmul(deep_gemm::bf16_epilogue_reduce_wq2(accum, m, lane_idx),
                                                    (__ppu_bfloat16)kInvSqrtHeadDim);
                 // The quad owns two queries x two KV rows, exactly once each.
@@ -741,51 +741,32 @@ public:
                 const uint32_t lane_in_quad = lane_idx % 4;
                 const uint32_t token_base = warp_n_idx * kQueriesPerWarp;
                 const uint32_t logits_kv_offset = kv_idx * BLOCK_KV + warp_offset + m * InstM + v_offset_mine;
-                if constexpr (cute::is_same_v<ElementLogits, float>) {
-                    float sums[2][2];
-                    deep_gemm::float_epilogue_reduce_wq4(accum, m, sums);
-                    #pragma unroll
-                    for (int t = 0; t < 2; ++t) {
-                        const float recv = __shfl_xor_sync(0xffffffffu, sums[t][r_mine ^ 1], 1);
-                        const float total = sums[t][r_mine] + recv;
-                        const uint32_t token = token_base + 2 * t + lane_in_quad / 2;
-                        if (token < kNextN) {
-                            if constexpr (kReuseAvgLogitsBase) {
-                                avg_logits_bases[t][m * InstM] = total * kInvSqrtHeadDim;
-                            } else {
-                                const auto logits_q_offset = (q_idx * kNextN + token) * params.logits_stride;
-                                params.logits[logits_q_offset + logits_kv_offset] = static_cast<ElementLogits>(total * kInvSqrtHeadDim);
-                            }
-                        }
-                    }
-                } else {
-                    // Match FP8 AVG's BF16 rounding order. FP4 MMA has already
-                    // applied Q/K block scales; only 1/sqrt(head_dim) remains.
-                    #pragma unroll
-                    for (int t = 0; t < 2; ++t) {
-                        uint32_t pa = deep_gemm::tix::cvt_rte_bf16x2_f32_relu(
-                            accum(4 * t + 2, m, 0), accum(4 * t + 0, m, 0));
-                        uint32_t pb = deep_gemm::tix::cvt_rte_bf16x2_f32_relu(
-                            accum(4 * t + 3, m, 0), accum(4 * t + 1, m, 0));
-                        const __ppu_bfloat162 partial = __hadd2(
-                            reinterpret_cast<__ppu_bfloat162&>(pa),
-                            reinterpret_cast<__ppu_bfloat162&>(pb));
-                        const uint32_t recv = __shfl_xor_sync(
-                            0xffffffffu, reinterpret_cast<const uint32_t&>(partial), 1);
-                        const __ppu_bfloat162 total2 = __hadd2(
-                            partial, reinterpret_cast<const __ppu_bfloat162&>(recv));
-                        const __ppu_bfloat16 total =
-                            r_mine ? __high2bfloat16(total2) : __low2bfloat16(total2);
-                        const uint32_t token = token_base + 2 * t + lane_in_quad / 2;
-                        if (token < kNextN) {
-                            if constexpr (kReuseAvgLogitsBase) {
-                                avg_logits_bases[t][m * InstM] =
-                                    __hmul(total, (__ppu_bfloat16)kInvSqrtHeadDim);
-                            } else {
-                                const auto logits_q_offset = (q_idx * kNextN + token) * params.logits_stride;
-                                params.logits[logits_q_offset + logits_kv_offset] =
-                                    __hmul(total, (__ppu_bfloat16)kInvSqrtHeadDim);
-                            }
+                // Match FP8 AVG's BF16 rounding order. FP4 MMA has already
+                // applied Q/K block scales; only 1/sqrt(head_dim) remains.
+                #pragma unroll
+                for (int t = 0; t < 2; ++t) {
+                    uint32_t pa = deep_gemm::tix::cvt_rte_bf16x2_f32_relu(
+                        accum(4 * t + 2, m, 0), accum(4 * t + 0, m, 0));
+                    uint32_t pb = deep_gemm::tix::cvt_rte_bf16x2_f32_relu(
+                        accum(4 * t + 3, m, 0), accum(4 * t + 1, m, 0));
+                    const __ppu_bfloat162 partial = __hadd2(
+                        reinterpret_cast<__ppu_bfloat162&>(pa),
+                        reinterpret_cast<__ppu_bfloat162&>(pb));
+                    const uint32_t recv = __shfl_xor_sync(
+                        0xffffffffu, reinterpret_cast<const uint32_t&>(partial), 1);
+                    const __ppu_bfloat162 total2 = __hadd2(
+                        partial, reinterpret_cast<const __ppu_bfloat162&>(recv));
+                    const __ppu_bfloat16 total =
+                        r_mine ? __high2bfloat16(total2) : __low2bfloat16(total2);
+                    const uint32_t token = token_base + 2 * t + lane_in_quad / 2;
+                    if (token < kNextN) {
+                        if constexpr (kReuseAvgLogitsBase) {
+                            avg_logits_bases[t][m * InstM] =
+                                __hmul(total, (__ppu_bfloat16)kInvSqrtHeadDim);
+                        } else {
+                            const auto logits_q_offset = (q_idx * kNextN + token) * params.logits_stride;
+                            params.logits[logits_q_offset + logits_kv_offset] =
+                                __hmul(total, (__ppu_bfloat16)kInvSqrtHeadDim);
                         }
                     }
                 }
@@ -799,43 +780,33 @@ public:
                 auto logits_q_offset = uint64_t(output_row) * params.logits_stride;
                 auto logits_kv_offset = kv_idx * BLOCK_KV + warp_offset + mma_offset;
 
-                if constexpr (cute::is_same_v<ElementLogits, float>) {
-                    float v_0, v_1;
-                    deep_gemm::float_epilogue_reduce_tCrW(accum, m, tCrW, v_0, v_1);
+                // bf16 output: separate cvt and fma2 phases with __ppu_sched_bound()
+                constexpr int kTotalTransforms = 4 * size<2>(accum);
+                __ppu_bfloat162 sum_0 = {0, 0};
+                __ppu_bfloat162 sum_1 = {0, 0};
+                uint32_t cvt_buf[kTotalTransforms];
 
-                    // Inter-thread reduction
-                    deep_gemm::shfl_xor_reduce_2(v_0, v_1);
-                    params.logits[logits_q_offset + logits_kv_offset + v_0_offset] = v_0;
-                    params.logits[logits_q_offset + logits_kv_offset + v_1_offset] = v_1;
+                // cvt phase: issue all ppu.cvt.rtte.bf16x2.f32.relu
+                deep_gemm::cvt_accum_to_bf16x2_buf<kTotalTransforms>(accum, m, cvt_buf);
+                __ppu_sched_bound();
+                // fma2 phase: issue all __hfma2
+                deep_gemm::fma2_phase_tCrW<kTotalTransforms>(cvt_buf, tCrW, sum_0, sum_1);
+                // Intra-thread reduction in bfloat16
+                __ppu_bfloat16 v_0_bf = __hadd(__low2bfloat16(sum_0), __high2bfloat16(sum_0));
+                __ppu_bfloat16 v_1_bf = __hadd(__low2bfloat16(sum_1), __high2bfloat16(sum_1));
+
+                // Cross-lane reduction: pack v_0/v_1 into bfloat162 for single 32-bit shuffle
+                __ppu_bfloat162 packed = deep_gemm::shfl_xor_reduce_bf16x2({v_0_bf, v_1_bf});
+                if constexpr (kGrouped) {
+                    // A quad has identical reduced values. Lanes 0/1 own
+                    // the low/high KV row; lanes 2/3 do not duplicate stores.
+                    const uint32_t column = logits_kv_offset + v_offset_mine;
+                    if ((lane_idx & 2) == 0 && column < output_context_cached)
+                        params.logits[logits_q_offset + column] = r_mine
+                            ? __high2bfloat16(packed) : __low2bfloat16(packed);
                 } else {
-                    // bf16 output: separate cvt and fma2 phases with __ppu_sched_bound()
-                    constexpr int kTotalTransforms = 4 * size<2>(accum);
-                    __ppu_bfloat162 sum_0 = {0, 0};
-                    __ppu_bfloat162 sum_1 = {0, 0};
-                    uint32_t cvt_buf[kTotalTransforms];
-
-                    // cvt phase: issue all ppu.cvt.rtte.bf16x2.f32.relu
-                    deep_gemm::cvt_accum_to_bf16x2_buf<kTotalTransforms>(accum, m, cvt_buf);
-                    __ppu_sched_bound();
-                    // fma2 phase: issue all __hfma2
-                    deep_gemm::fma2_phase_tCrW<kTotalTransforms>(cvt_buf, tCrW, sum_0, sum_1);
-                    // Intra-thread reduction in bfloat16
-                    __ppu_bfloat16 v_0_bf = __hadd(__low2bfloat16(sum_0), __high2bfloat16(sum_0));
-                    __ppu_bfloat16 v_1_bf = __hadd(__low2bfloat16(sum_1), __high2bfloat16(sum_1));
-
-                    // Cross-lane reduction: pack v_0/v_1 into bfloat162 for single 32-bit shuffle
-                    __ppu_bfloat162 packed = deep_gemm::shfl_xor_reduce_bf16x2({v_0_bf, v_1_bf});
-                    if constexpr (kGrouped) {
-                        // A quad has identical reduced values. Lanes 0/1 own
-                        // the low/high KV row; lanes 2/3 do not duplicate stores.
-                        const uint32_t column = logits_kv_offset + v_offset_mine;
-                        if ((lane_idx & 2) == 0 && column < output_context_cached)
-                            params.logits[logits_q_offset + column] = r_mine
-                                ? __high2bfloat16(packed) : __low2bfloat16(packed);
-                    } else {
-                        params.logits[logits_q_offset + logits_kv_offset + v_0_offset] = __low2bfloat16(packed);
-                        params.logits[logits_q_offset + logits_kv_offset + v_1_offset] = __high2bfloat16(packed);
-                    }
+                    params.logits[logits_q_offset + logits_kv_offset + v_0_offset] = __low2bfloat16(packed);
+                    params.logits[logits_q_offset + logits_kv_offset + v_1_offset] = __high2bfloat16(packed);
                 }
             }
         };

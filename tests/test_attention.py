@@ -434,8 +434,6 @@ def test_mqa_avg_logits_loop():
             (4096, 4096, 0), (4096, 4096, 1), (4096, 4096, 2),
         )
     ]
-    # Explicit FP32 output remains supported alongside the BF16 default.
-    prefill_cases.append('MqaAvgLogits,data_type:fp4,seq_len_q:129,seq_len_kv:258,num_heads:4,head_dim:128,q_scale:0,logits_dtype:fp32,compressed_logits:1')
     # Eight heads: BF16, each scale mode, with partial Q and KV tiles.
     prefill_cases += [
         f'MqaAvgLogits,data_type:fp4,seq_len_q:{seq_len_q},seq_len_kv:{seq_len_kv},'
@@ -460,11 +458,12 @@ def test_mqa_avg_logits_loop():
         f'PagedMqaAvgLogits,data_type:fp4,batch_size:{request_switch_batch},next_n:5,num_heads:4,head_dim:128,context_pattern:[17,0,1,63,64,65,129,257,513],page_kv:64,max_context_len:1024,logits_dtype:bf16',
         'PagedMqaAvgLogits,data_type:fp4,batch_size:1,next_n:6,num_heads:4,head_dim:128,distribution:[129],page_kv:128,max_context_len:256,logits_dtype:bf16',
     ]
-    paged_cases.append('PagedMqaAvgLogits,data_type:fp4,batch_size:1,next_n:1,num_heads:4,head_dim:128,distribution:[17],page_kv:32,max_context_len:128,logits_dtype:fp32')
     # Generalized pages: both Q layouts/output types, page and compute-tile tails.
     for data_type in ('fp4', 'fp8'):
         for next_n, page_kv, dtype in ((1, 192, 'fp32'), (4, 256, 'bf16'),
                                       (5, 512, 'bf16'), (6, 1024, 'fp32')):
+            if data_type == 'fp4':
+                dtype = 'bf16'
             paged_cases.append(
                 f'PagedMqaAvgLogits,data_type:{data_type},batch_size:7,next_n:{next_n},'
                 f'num_heads:4,head_dim:128,page_kv:{page_kv},logits_dtype:{dtype},'

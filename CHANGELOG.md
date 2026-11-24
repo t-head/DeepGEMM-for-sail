@@ -6,6 +6,14 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ## unreleased
 
+### Changed
+
+- **M890 FP4 AVG output**: non-paged and paged H4/H8 AVG now return BF16 only.
+  Removed `logits_dtype` from `fp8_fp4_mqa_avg_logits` and
+  `fp8_fp4_paged_mqa_avg_logits`, along with FP32 epilogues and scheduling
+  policies. Callers must omit this argument. The separate FP8 AVG APIs retain
+  BF16/FP32 output selection through `logits_dtype`.
+
 ### Added
 
 - **Zhenwu810E INT8 AVG MQA**: adds `int8_mqa_avg_logits` and

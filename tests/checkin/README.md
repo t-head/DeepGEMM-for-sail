@@ -84,8 +84,8 @@ The unified entry point calls `test_activation.py` and `test_fp4_core.py` direct
 - 890P BF16 dense cases cover odd N, N=1, packed/scalar JIT cache switching for both output types, and constrained-CU N=1 dispatch.
 - `DenseGemm,data_type:bf16_bf16_fp32`: BF16 inputs with real FP32 outputs, preserving main's strict planted-element check against BF16 rounding. Both boards include main's dense, tail and GEMV cases, using the default kernel path.
 - `GroupedMasked` / `GroupedNoPad,data_type:w4a8_int8`: 810E packed INT4 weights with INT8 activations. Cases from main retain large shapes, K=32/K=160 tails, and both small-M GEMV shapes; weight packing/preprocessing is exercised by the original generators.
-- `MqaAvgLogits,data_type:fp4`: six 890P cases cover the required compressed output, all three Q-scale modes, both output dtypes, Q/KV tails, active/fallback KV balancing, and multi-MMA-group execution for every Q-scale mode. Broader coverage remains in the attention script.
-- `PagedMqaAvgLogits,data_type:fp4`: four 890P cases cover next_n=1/4/5/6, page32/64/128, both output dtypes across both Q layouts, empty/mixed contexts, page tails and in-CTA request switches.
+- `MqaAvgLogits,data_type:fp4`: six 890P cases cover the required compressed output, all three Q-scale modes, BF16 output, Q/KV tails, active/fallback KV balancing, and multi-MMA-group execution for every Q-scale mode. Broader coverage remains in the attention script.
+- `PagedMqaAvgLogits,data_type:fp4`: four 890P cases cover next_n=1/4/5/6, page32/64/128, BF16 output across both Q layouts, empty/mixed contexts, page tails and in-CTA request switches.
 - `PagedMqaLogits,data_type:fp4,is_varlen:1,varlen_indices:[...]`: grouped
   replay uses flattened query rows with explicit request indices and `next_n=1`.
   Dense consecutive request IDs identify the runs; `context_lens` retains

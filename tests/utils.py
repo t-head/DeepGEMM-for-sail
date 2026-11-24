@@ -2383,6 +2383,10 @@ def test_mqa_logits(args) -> None:
                 logits_dtype = torch.float32
     if is_avg:
         compressed_logits = True
+        if data_type == torch.uint8:
+            logits_dtype = args.get('logits_dtype', torch.bfloat16)
+            if logits_dtype != torch.bfloat16:
+                raise ValueError("FP4 AVG supports bfloat16 output only")
     q_scale_mode = args.get('q_scale', 0) if is_avg else 0
     assert q_scale_mode in (0, 1, 2), "q_scale must be 0 (none), 1 (per-row) or 2 (scalar)"
 
@@ -2448,7 +2452,7 @@ def test_mqa_logits(args) -> None:
                 q=q_in, kv=kv_in,
                 cu_seq_len_k_start=ks, cu_seq_len_k_end=ke,
                 max_seqlen_k=max_seqlen_k,
-                q_scale=q_scale, logits_dtype=logits_dtype,
+                q_scale=q_scale,
             )
         else:
             logits = deep_gemm.fp8_fp4_mqa_logits(
@@ -2546,6 +2550,10 @@ def test_paged_mqa_logits(args) -> None:
         assert run_ids == list(range(len(run_ids))), "UT request IDs must be dense consecutive runs"
     else:
         assert varlen_indices is None and query_contexts is None, "varlen fields require is_varlen=1"
+    if is_avg and data_type == torch.uint8:
+        logits_dtype = args.get('logits_dtype', torch.bfloat16)
+        if logits_dtype != torch.bfloat16:
+            raise ValueError("FP4 AVG supports bfloat16 output only")
     if not is_avg:
         assert next_n == 1, "weighted next_n must be 1"
         if data_type == torch.uint8:
@@ -2692,7 +2700,6 @@ def test_paged_mqa_logits(args) -> None:
                 q=q_in, fused_kv_cache=kv_cache_fp4,
                 context_lens=context_lens, block_table=block_tables,
                 schedule_meta=schedule_metadata, max_context_len=max_model_len,
-                logits_dtype=logits_dtype,
             )
         else:
             logits = deep_gemm.fp8_fp4_paged_mqa_logits(
