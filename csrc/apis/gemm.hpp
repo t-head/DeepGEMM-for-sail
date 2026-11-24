@@ -215,7 +215,7 @@ void bf16_gemm_tt(const torch::Tensor& a,
 // combined with an FP32 FMA before the (optional) BF16 rounding of the final
 // store. Layout support: NT only, contiguous tensors (same contract as
 // bf16_gemm_nt). Exact FP32 router decode may partition K internally within
-// a CTA; the native API exposes no Split-K controls or global workspace.
+// a CTA;
 // -----------------------------------------------------------------------------
 torch::Tensor bf16xfp32_gemm_nt(const torch::Tensor& x,
                                 const torch::Tensor& w_high,
@@ -236,6 +236,9 @@ torch::Tensor bf16xfp32_gemm_nt(const torch::Tensor& x,
     const auto& [n, k_] = get_shape<2>(w_high);
     TORCH_CHECK(k == k_, "x and weights must share the same K, got ", k, " vs ", k_);
     TORCH_CHECK(n % 2 == 0, "BF16xFP32 dense GEMM requires even N, got ", n);
+    // Keep the PPU1.0 implementation for future use; no public API may launch it.
+    TORCH_CHECK(is_ppu1v5_device(),
+                "BF16xFP32 GEMM is disabled on PPU1.0; requires PPU1.5");
 
     // Empty problem: return a correctly shaped (zero-initialized) output.
     if (m == 0 or n == 0)
@@ -2053,7 +2056,7 @@ static void register_apis(pybind11::module_& m) {
           py::arg("c") = std::nullopt, py::arg("compiled_dims") = "nk", py::arg("configs") = std::nullopt);
     m.def("bf16_gemm_tt", &bf16_gemm_tt, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("compiled_dims") = "nk", py::arg("configs") = std::nullopt);
-    // BF16 x FP32 dense GEMM (native API; no Split-K controls)
+    // BF16 x FP32 dense GEMM
     m.def("bf16xfp32_gemm_nt", &bf16xfp32_gemm_nt, py::arg("x"), py::arg("w_high"),
           py::arg("w_low"), py::arg("scale"), py::arg("use_fp32_output") = false,
           py::arg("configs") = std::nullopt);

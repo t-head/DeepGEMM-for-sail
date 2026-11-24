@@ -1,7 +1,7 @@
 #pragma once
 
 // =============================================================================
-// BF16 x FP32 DenseGemm (cute-free dual-B kernel + PPU1.0 fallback).
+// BF16 x FP32 DenseGemm.
 //
 // Computes  D = A @ (W_high + W_low * scale)^T  with FP32 accumulation, where
 // the FP32 weight is supplied as two BF16 matrices:
@@ -19,15 +19,13 @@
 //     Exact FP32 router decode partitions K across two warps within each CTA,
 //     reduces high/low partials in FP32, and stores once without a global workspace.
 // PPU1.0 (810E): fallback composition of two BF16 GEMMs through an FP32
-//     intermediate (still BF16 tensor-core rate, higher precision than
-//     BF16 x BF16 because the low part recovers the residual bits).
+//     intermediate.
 // =============================================================================
 
 #include <torch/python.h>
 #include <cstdint>
 #include <type_traits>
-#include <hggc_fp8.h>
-#include "cute/tensor.hpp"
+#include "cutlass/bfloat16.h"
 #include "../../jit/compiler.hpp"
 #include "../../jit/device_runtime.hpp"
 #include "../../jit/kernel_runtime.hpp"
@@ -35,8 +33,6 @@
 #include "../../utils/format.hpp"
 #include "../../utils/math.hpp"
 #include "../../utils/utils.hpp"
-#include "../../utils/layout_type_name.hpp"
-#include "cute/arch/mma.hpp"
 #include <deep_gemm/common/profiling_interface.cuh>
 #include "../heuristics/common_bf16.hpp"
 #include <deep_gemm/scheduler/densegemm_scheduler_cutlass3.cuh>
@@ -45,10 +41,10 @@
 using namespace deep_gemm_bf16_common;
 namespace deep_gemm {
 
-// JIT runtime for the fused dual-B cute-free kernel. Mirrors
-// DenseBF16GemmCuteFreeRuntimeT; the host-side GemmKernelParams must stay
-// byte-identical to kernel::GemmBf16xFp32Kernel::Params (the kernel receives
-// it by value).
+// JIT runtime for the fused dual-B cute-free kernel.
+// Follows the plain BF16 runtime's source-generation and launch structure;
+// the host-side GemmKernelParams must stay byte-identical to
+// kernel::GemmBf16xFp32Kernel::Params (the kernel receives it by value).
 template <typename ElementOutput>
 class DenseBf16xFp32GemmCuteFreeRuntimeT final : public LaunchRuntime<DenseBf16xFp32GemmCuteFreeRuntimeT<ElementOutput>> {
 public:
