@@ -495,6 +495,40 @@ __device__ __forceinline__ void moe_reduce_impl(
     static_assert(kThreads % 32 == 0);
     static_assert(kHidden % kColumnSplits == 0 && (kHidden / kColumnSplits) % 256 == 0,
                   "each column split must contain complete 256-element warp rows");
+    // Consume each route immediately to keep the TopK16 split-K kernel at three CTAs per CU.
+    if constexpr (kSkipZeroWeight && kTopK == 16 && kThreads == 512 && kColumnSplits == 1) {
+        constexpr int kVector = sizeof(int4) / sizeof(__ppu_bfloat16);
+        for (int column = reduce_thread * kVector; column < kHidden; column += kThreads * kVector) {
+            float accumulator[kVector]{};
+            #pragma unroll 1
+            for (int route = 0; route < kTopK; ++route) {
+                const int offset = token * kTopK + route;
+                const int expert = static_cast<int>(__ldg(topk_indices + offset));
+                const float weight = __ldg(topk_weights + offset);
+                if (expert < 0 || weight == 0.0f) continue;
+
+                const int owner = expert / local_experts;
+                bool remote = kBulkRemote && owner != rank_idx;
+#if DG_MEGAMOE_OWNER_MODE
+                if (remote) remote = ((writer_mask >> owner) & 1) != 0;
+#endif
+                const int64_t slot = static_cast<int64_t>(route) * max_m + token;
+                const int4 packed = moe_reduce_load<kBulkRemote>(input + slot * kHidden + column, remote);
+                const auto* values = reinterpret_cast<const __ppu_bfloat16*>(&packed);
+                #pragma unroll
+                for (int lane = 0; lane < kVector; ++lane)
+                    accumulator[lane] += __bfloat162float(values[lane]) * weight;
+            }
+            int4 packed_output;
+            auto* pairs = reinterpret_cast<__ppu_bfloat162*>(&packed_output);
+            #pragma unroll
+            for (int pair = 0; pair < kVector / 2; ++pair)
+                pairs[pair] = __floats2bfloat162_rn(accumulator[2 * pair], accumulator[2 * pair + 1]);
+            tix::store_bf16x8<kOutputAligned>(
+                output + static_cast<int64_t>(token) * kHidden + column, packed_output);
+        }
+        return;
+    }
     int64_t slots[kTopK];
     float weights[kTopK];
     bool remote_slots[kTopK];

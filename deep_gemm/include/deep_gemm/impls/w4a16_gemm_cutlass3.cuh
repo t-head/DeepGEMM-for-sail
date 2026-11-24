@@ -760,7 +760,7 @@ public:
         }
         };
         if constexpr (!std::is_same_v<Output,std::false_type>) {
-          if constexpr (Output::kIsGemm1 && BlockM==128 && WarpM==64 && WarpsOnK==1) {
+          if constexpr (BlockM==128 && WarpM==64 && WarpsOnK==1) {
             static_assert(decltype(size<1>(accum))::value==4);
             if (residual_m <= 32) run_k(Int<1>{});
             else if (residual_m <= 64) run_k(Int<2>{});
