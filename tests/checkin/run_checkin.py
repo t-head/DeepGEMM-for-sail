@@ -34,7 +34,8 @@ SCRIPT_SUITES = {
         'tests/test_mega_gate.py::test_mega_gate_scoring_modes '
         'tests/test_mega_gate.py::test_mega_gate_sigmoid_infinite_logits '
         'tests/test_mega_gate.py::test_mega_gate_sigmoid_routing_controls '
-        'tests/test_mega_gate.py::test_mega_gate_sigmoid_partial_scores '
+        'tests/test_mega_gate.py::test_mega_gate_partial_score_storage '
+        'tests/test_mega_gate.py::test_mega_gate_nonfinite_scores '
         'tests/test_mega_gate.py::test_mega_gate_api_contract',
     ],
 }
