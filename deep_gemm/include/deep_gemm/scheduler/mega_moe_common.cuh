@@ -77,7 +77,7 @@ struct MegaMoETileOrder {
 };
 
 // Advance monotonically through unpadded expert rows for GEMM2 scatter.
-template <uint32_t GroupSpan, class Scheduler>
+template <uint32_t GroupSpan, bool AlternateExpertMOrder = false, class Scheduler>
 CUTLASS_DEVICE bool fetch_scatter_work(
     Scheduler& state, uint32_t next_block_idx,
     uint32_t& m_block_idx, uint32_t& n_block_idx) {
@@ -99,6 +99,11 @@ CUTLASS_DEVICE bool fetch_scatter_work(
     MegaMoETileOrder<Scheduler::kNumNBlocks, Scheduler::kNumRanks, GroupSpan>::get_block_idx(
         num_m_blocks, next_block_idx - state.curr_cumsum * Scheduler::kNumNBlocks,
         m_block_idx, n_block_idx);
+    if constexpr (AlternateExpertMOrder) {
+        // Start odd experts on the tail tile to balance full and partial tiles across CTAs.
+        if (num_m_blocks == 2 && (state.curr_group_idx & 1u))
+            m_block_idx = 1u - m_block_idx;
+    }
     return true;
 }
 #endif

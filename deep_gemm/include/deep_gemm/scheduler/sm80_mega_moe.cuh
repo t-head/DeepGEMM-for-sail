@@ -18,7 +18,7 @@ template <uint32_t SHAPE_N_, uint32_t SHAPE_K_,
           MegaMoEPhaseKind Stage, uint32_t kNumRanks_,
           uint32_t kKTilesPerFlag_ = 0,
           uint32_t kSourceCapacity_ = 1, uint32_t kNumTopK_ = 1,
-          class Dispatch_ = void>
+          class Dispatch_ = void, bool AlternateExpertMOrder = false>
 struct SM80MegaMoEScheduler {
     using Dispatch = Dispatch_;
     static constexpr uint32_t SHAPE_N = SHAPE_N_;
@@ -105,7 +105,7 @@ struct SM80MegaMoEScheduler {
             n_block_idx = next_block_idx - global_m * kNumNBlocks;
             return true;
         } else {
-            return fetch_scatter_work<kGroupSpan>(*this, next_block_idx, m_block_idx, n_block_idx);
+            return fetch_scatter_work<kGroupSpan, AlternateExpertMOrder>(*this, next_block_idx, m_block_idx, n_block_idx);
         }
     }
 
