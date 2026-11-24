@@ -22,8 +22,6 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 - **DeepSeek V4 normal Mega-mHC**: `mega_mhc` supports hidden sizes 4096 and
   7168 on Zhenwu M890 when both `shifted_prev_mix` and `new_prev_mix` are `None`.
 
-## 1.1.0+v1.1.0
-
 ### Fixed
 
 - **Sparse MQA graph workspace**: captured metadata calls allocate private
@@ -75,6 +73,11 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   and empty C tensors. BF16 dense C accumulation remains supported.
 - **Grouped BF16 GEMV precision**: convert operands to FP32 before multiplying,
   preserving products that were previously rounded to BF16 before accumulation.
+
+## 1.1.0+v1.1.0
+
+### Fixed
+
 - **Device properties and CU budgets**: cache architecture and `set_num_sms`
   overrides per current device, so switching devices does not reuse the first
   device's architecture or scheduling budget.
