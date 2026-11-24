@@ -949,3 +949,8 @@ This code repository is released under [the MIT License](LICENSE).
       howpublished = {\url{https://github.com/deepseek-ai/DeepGEMM}},
 }
 ```
+
+Legacy SGLang-style MXFP4 calls with explicit `clean_logits=False` and
+`logits_dtype` are supported through a Python compatibility adapter; native
+calls are preserved. See [legacy MXFP4 callers](docs/api/indexer.md#legacy-explicit-dtype-mxfp4-callers)
+for dtype, metadata and MTP normalization constraints.

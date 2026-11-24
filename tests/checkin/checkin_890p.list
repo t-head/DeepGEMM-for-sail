@@ -420,3 +420,6 @@ Activation,data_type:bf16,activation:silu_step,quant_mode:MXFP4
 
 # ============ MoE align routing regression ============
 MoeAlign,data_type:bf16,case:invalid_routes
+
+# Legacy explicit-dtype MXFP4 host API, uncompressed logits and MTP row expansion.
+AttentionRegression,data_type:fp4,case:legacy_fp4_api

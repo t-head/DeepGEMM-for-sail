@@ -26,7 +26,7 @@ MXFP4 DSA, AVG and sparse remain restricted to logical D128 (packed D64).
 
 Legacy `clean_logits` parameters default to False and reject True.
 All AVG APIs omit `clean_logits`; nonpaged AVG requires `max_seqlen_k > 0`.
-New weighted MXFP4 APIs have no `clean_logits` or `logits_dtype` parameter.
+Native weighted MXFP4 calls omit `clean_logits` and `logits_dtype`; the Python legacy-keyword adapter is documented below.
 Logits outside the per-query valid window are unspecified: mask or supply
 valid lengths to top-k. The library does not call DeepSelect internally.
 
@@ -793,3 +793,32 @@ and `context_lens` tensors. UTs without varlen fields retain legacy metadata.
 The focused Graph, nonconsecutive-ID, masking and metadata-boundary tests are
 also included in `tests/test_attention.py` as `test_paged_fp4_varlen` and
 `test_paged_fp4_varlen_replay`.
+
+## Legacy explicit-dtype MXFP4 callers
+
+The Python weighted MXFP4 entry points also accept the older
+`clean_logits=False` and `logits_dtype=torch.float32|torch.bfloat16` keywords.
+Calls without either keyword retain the native v1.1 signature and behavior.
+This compatibility route supports FP32 weights, or BF16 weights with BF16
+output, and reuses the native weighted GPU kernels. It rejects
+`clean_logits=True`; invalid-window logits remain unspecified.
+Non-paged legacy output may be uncompressed (`max_seqlen_k=0`).
+
+Legacy paged callers must generate metadata through the public Python
+`get_paged_mqa_logits_metadata` wrapper. For MXFP4 DSA without explicit request
+indices, it generates one request ID per query. Legacy MTP `next_n=2..6` is
+expanded into independent `next_n=1` rows, with repeated block-table rows.
+No query is discarded, and per-query context bounds are retained. This
+normalization allocates IDs and may copy context/block-table views; it is a
+compatibility path, not a claim of equal performance to grouped native MTP.
+Explicit native indices continue to use the native grouped contract.
+
+Use logical D128 and `torch.int8` for MXFP4 metadata. Legacy integer-size
+metadata with D64 is ambiguous between packed FP4 and FP8 and is rejected;
+the adapter does not guess the cache precision from environment variables.
+Legacy element-size tuples with logical D128 are translated to the native
+dtype contract. Native unsupported device/dtype combinations remain errors.
+
+The reused launchers retain their parameter dump/replay instrumentation;
+dumps describe normalized native query rows, rather than the original Python
+legacy keyword spelling. Rebuild the host extension after this change.

@@ -258,3 +258,10 @@ try:
     from . import legacy
 except Exception as e:
     print(f'Failed to load legacy DeepGEMM Triton kernels: {e}')
+
+# Preserve native calls while adapting the older explicit-dtype FP4 keywords.
+from ._legacy_fp4 import (
+    fp8_fp4_mqa_logits,
+    fp8_fp4_paged_mqa_logits,
+    get_paged_mqa_logits_metadata,
+)
