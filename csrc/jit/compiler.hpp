@@ -143,11 +143,13 @@ public:
         if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_JIT_DISABLE_SHORTCUT_CACHE"))
             return build(name, Runtime::generate(args));
 
-        using Key = std::tuple<const Compiler*, std::string, decltype(Runtime::compile_key(args))>;
+        HGcontext context;
+        DG_HGGC_DRIVER_CHECK(lazy_hgCtxGetCurrent(&context));
+        using Key = std::tuple<const Compiler*, HGcontext, std::string, decltype(Runtime::compile_key(args))>;
         // Each calling thread owns its lookup table; hits need no shared-map mutation.
         // The underlying runtime cache already retains every loaded kernel for its lifetime.
         static thread_local std::map<Key, std::shared_ptr<KernelRuntime>> cache;
-        const auto key = std::make_tuple(this, name, Runtime::compile_key(args));
+        const auto key = std::make_tuple(this, context, name, Runtime::compile_key(args));
         if (const auto it = cache.find(key); it != cache.end())
             return it->second;
 

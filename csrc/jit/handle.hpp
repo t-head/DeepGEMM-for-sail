@@ -12,11 +12,11 @@ namespace deep_gemm {
 
 // Lazy loading all driver symbols
 static void* get_driver_handle() {
-    static void* handle = nullptr;
-    if (handle == nullptr) {
-        handle = dlopen("libhggc.so", RTLD_LAZY | RTLD_LOCAL);
+    static void* handle = [] {
+        const auto handle = dlopen("libhggc.so", RTLD_LAZY | RTLD_LOCAL);
         DG_HOST_ASSERT(handle != nullptr and "Failed to load HGGC driver `libhggc.so`");
-    }
+        return handle;
+    }();
     return handle;
 }
 
@@ -25,16 +25,17 @@ static void* get_driver_handle() {
     template <typename... Args>                                                                                        \
     static auto lazy_##name(Args&&... args)->decltype(name(args...)) {                                                 \
         using FuncType = decltype(&name);                                                                              \
-        static FuncType func = nullptr;                                                                                \
-        if (func == nullptr) {                                                                                         \
-            func = reinterpret_cast<FuncType>(dlsym(get_driver_handle(), #name));                                      \
+        static FuncType func = [] {                                                                                   \
+            const auto func = reinterpret_cast<FuncType>(dlsym(get_driver_handle(), #name));                           \
             DG_HOST_ASSERT(func != nullptr and "Failed to load HGGC driver API");                                      \
-        }                                                                                                              \
+            return func;                                                                                              \
+        }();                                                                                                          \
         return func(std::forward<decltype(args)>(args)...);                                                            \
     }
 
 DECL_LAZY_HGGC_DRIVER_FUNCTION(hgGetErrorName);
 DECL_LAZY_HGGC_DRIVER_FUNCTION(hgGetErrorString);
+DECL_LAZY_HGGC_DRIVER_FUNCTION(hgCtxGetCurrent);
 DECL_LAZY_HGGC_DRIVER_FUNCTION(hgFuncGetAttribute);
 DECL_LAZY_HGGC_DRIVER_FUNCTION(hgFuncSetAttribute);
 DECL_LAZY_HGGC_DRIVER_FUNCTION(hgModuleLoad);
