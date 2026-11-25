@@ -343,20 +343,20 @@ def test_gemm_bf16xfp32_tile_cache_is_not_tensor_cache():
 
 
 @pytest.mark.usefixtures("router_ppu1v5")
-@pytest.mark.parametrize("m, tile, stages, grid, smem, reuse", [
-    (8, (16, 16, 128), 4, 48, 65536, 1),
-    (16, (16, 16, 128), 4, 48, 65536, 0),
-    (128, (48, 32, 128), 5, 36, 143360, 1),
-    (256, (96, 32, 128), 6, 36, 245760, 0),
-    (512, (96, 64, 64), 5, 36, 143360, 1),
-    (1024, (192, 64, 64), 4, 36, 163840, 1),
-    (2048, (256, 96, 64), 4, 32, 229376, 1),
-    (4096, (320, 128, 64), 3, 39, 221184, 1),
-    (8192, (320, 128, 64), 3, 39, 221184, 1),
-    (16384, (256, 128, 64), 4, 39, 262144, 1),
+@pytest.mark.parametrize("m, tile, stages, grid, smem", [
+    (8, (16, 16, 128), 4, 48, 65536),
+    (16, (16, 16, 128), 4, 48, 65536),
+    (128, (48, 32, 128), 5, 36, 143360),
+    (256, (96, 32, 128), 6, 36, 245760),
+    (512, (96, 64, 64), 5, 36, 143360),
+    (1024, (192, 64, 64), 4, 36, 163840),
+    (2048, (256, 96, 64), 4, 32, 229376),
+    (4096, (320, 128, 64), 3, 39, 221184),
+    (8192, (320, 128, 64), 3, 39, 221184),
+    (16384, (256, 128, 64), 4, 39, 262144),
 ])
 @pytest.mark.parametrize("shortcut_disabled", [0, 1])
-def test_gemm_bf16xfp32_exact_lut(m, tile, stages, grid, smem, reuse,
+def test_gemm_bf16xfp32_exact_lut(m, tile, stages, grid, smem,
                                  shortcut_disabled, monkeypatch, capfd):
     import ctypes
     if int(os.environ.get("DG_JIT_USE_HGRTC", "0")):
@@ -375,7 +375,7 @@ def test_gemm_bf16xfp32_exact_lut(m, tile, stages, grid, smem, reuse,
             log = capfd.readouterr().out
             assert f"ThreadblockShape{list(tile)}" in log
             assert f"num_stages:{stages}" in log and f"threadblock_count:{grid}" in log
-            assert f"SMSIZE:{smem}," in log and f"dual_b_exact_lut:1, mma_reuse:{reuse}" in log
+            assert f"SMSIZE:{smem}," in log and "dual_b_exact_lut:1," in log
     finally:
         deep_gemm.set_num_sms(previous_sms)
 
@@ -404,7 +404,7 @@ def test_gemm_bf16xfp32_exact_lut_boundaries(change, monkeypatch, capfd):
         _assert_accuracy(actual, computation, quality)
         torch.cuda.synchronize()
         ctypes.CDLL(None).fflush(None)
-        assert "dual_b_exact_lut:0, mma_reuse:-1" in capfd.readouterr().out
+        assert "dual_b_exact_lut:0," in capfd.readouterr().out
     finally:
         deep_gemm.set_num_sms(previous_sms)
 

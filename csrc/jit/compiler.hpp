@@ -26,10 +26,6 @@
 
 namespace deep_gemm {
 
-struct KernelCompileOptions {
-    int mma_reuse = -1;
-};
-
 class Compiler {
 public:
     static std::filesystem::path library_root_path;
@@ -143,30 +139,25 @@ public:
     // the loaded kernel: tensor addresses, launch arguments and streams remain per-call.
     // Compiler instances, their flags and each runtime's include hash are process-stable.
     template <typename Runtime, typename Args>
-    std::shared_ptr<KernelRuntime> build_cached(const std::string& name, const Args& args,
-                                               KernelCompileOptions options = {}) const {
+    std::shared_ptr<KernelRuntime> build_cached(const std::string& name, const Args& args) const {
         if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_JIT_DISABLE_SHORTCUT_CACHE"))
-            return build(name, Runtime::generate(args), options);
+            return build(name, Runtime::generate(args));
 
-        using Key = std::tuple<const Compiler*, std::string, decltype(Runtime::compile_key(args)), int>;
+        using Key = std::tuple<const Compiler*, std::string, decltype(Runtime::compile_key(args))>;
         // Each calling thread owns its lookup table; hits need no shared-map mutation.
         // The underlying runtime cache already retains every loaded kernel for its lifetime.
         static thread_local std::map<Key, std::shared_ptr<KernelRuntime>> cache;
-        const auto key = std::make_tuple(this, name, Runtime::compile_key(args), options.mma_reuse);
+        const auto key = std::make_tuple(this, name, Runtime::compile_key(args));
         if (const auto it = cache.find(key); it != cache.end())
             return it->second;
 
-        const auto runtime = build(name, Runtime::generate(args), options);
+        const auto runtime = build(name, Runtime::generate(args));
         cache.emplace(key, runtime);
         return runtime;
     }
 
-    std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code,
-                                        KernelCompileOptions options = {}) const {
-        DG_HOST_ASSERT(options.mma_reuse >= -1 && options.mma_reuse <= 1);
-        auto kernel_signature = fmt::format("{}$${}$${}$${}", name, signature, flags, code);
-        if (options.mma_reuse != -1)
-            kernel_signature += fmt::format("$$mma_reuse={}", options.mma_reuse);
+    std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code) const {
+        const auto kernel_signature = fmt::format("{}$${}$${}$${}", name, signature, flags, code);
         const auto dir_path = cache_dir_path / "cache" / fmt::format("kernel.{}.{}", name, get_hex_digest(kernel_signature));
 
         // Hit the runtime cache
@@ -181,7 +172,7 @@ public:
 
         // Compile into a temporary HGBIN
         const auto tmp_hgbin_path = tmp_dir_path / "kernel.hgbin";
-        compile(code, tmp_dir_path, tmp_hgbin_path, name, options);
+        compile(code, tmp_dir_path, tmp_hgbin_path, name);
 
         // Disassemble if needed
         if (get_env<int>("DG_JIT_DUMP_ASM") or get_env<int>("DG_JIT_DUMP_SASS")) {
@@ -222,7 +213,7 @@ public:
         }
     }
 
-    virtual void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name, KernelCompileOptions options = {}) const = 0;
+    virtual void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name) const = 0;
 };
 
 DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_root_path);
@@ -280,7 +271,7 @@ public:
         flags += " -x hg";
     }
 
-    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name, KernelCompileOptions options = {}) const override {
+    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name) const override {
         // Write the code into the cache directory
         const auto code_path = dir_path / "kernel.cu";
         put(code_path, code);
@@ -321,8 +312,6 @@ public:
             per_kernel_flags += " -Xllvm -ppu-reassign-subregs=true"
                                 " -Xllvm -ppu-pref-fma-reuse=true"
                                 " -Xllvm -ppu-pref-mma-reuse=true";
-        if (options.mma_reuse != -1)
-            per_kernel_flags += fmt::format(" -Xllvm -ppu-pref-mma-reuse={}", options.mma_reuse ? "true" : "false");
         // Include paths for actlize and DeepGEMM headers
         std::string include_flags;
         for (const auto& path: actlize_include_paths())
@@ -357,7 +346,7 @@ public:
     class RtcOptions {
         public:
         RtcOptions() = delete;
-        RtcOptions(acArch_t arch, const std::string& name = "", KernelCompileOptions options = {}) {
+        RtcOptions(acArch_t arch, const std::string& name = "") {
             opts = {
             "--device-as-default-execution-space",
             "-DHGGC_COMPILER_WRAPPER_MODE",
@@ -445,8 +434,6 @@ public:
             if (get_env<int>("DG_JIT_WITH_LINEINFO", 0)) {
                 opts_insert({"--generate-line-info"});
             }
-            if (options.mma_reuse != -1)
-                opts.emplace_back(fmt::format("--ppu-tuning-options=-ppu-pref-mma-reuse={}", options.mma_reuse ? "true" : "false"));
             std::string standard = "--std=c++17";
             opts.emplace_back(standard);
 
@@ -473,12 +460,12 @@ public:
         signature = fmt::format("RTC{}.{}", major, minor);
     }
 
-    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name, KernelCompileOptions options = {}) const override {
+    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name) const override {
         // Write the code into the cache directory
         const auto code_path = dir_path / "kernel.cu";
         put(code_path, code);
         acArch_t arch = get_ppu_arch();
-        RtcOptions opts(arch, name, options);
+        RtcOptions opts(arch, name);
         // Print HGRTC compile options
         if (get_env<int>("DG_JIT_DEBUG", 0)) {
             printf("HGRTC compile options (%zu):\n", opts.size());

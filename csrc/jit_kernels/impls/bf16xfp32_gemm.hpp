@@ -195,7 +195,6 @@ struct ExactConfig {
     int m, bm, bn, bk, wm, wn, wk, stages, grid;
     unsigned pipeline;
     int decode_split_k, k_order;
-    KernelCompileOptions compile_options;
 
     bool has(Pipeline flag) const { return (pipeline & flag) != 0; }
 };
@@ -207,16 +206,16 @@ static const ExactConfig* exact_config(int m, int n, int k, int sms, double scal
         || !dual_b_no_experimental_overrides())
         return nullptr;
     static constexpr ExactConfig lut[] = {
-        {8,     16,  16, 128, 16, 16, 128, 4, 48, PackedStore | StaticShape | PackedN, 2, 0, {1}},
-        {16,    16,  16, 128, 16, 16, 128, 4, 48, PackedStore | StaticShape | PackedN, 2, 0, {0}},
-        {128,   48,  32, 128, 16, 16, 128, 5, 36, PackedStore | StaticShape | OneTile, 1, 0, {1}},
-        {256,   96,  32, 128, 48, 16,  64, 6, 36, PackedStore | StaticShape | OneTile | CtaK, 1, 0, {0}},
-        {512,   96,  64,  64, 48, 16,  64, 5, 36, PackedStore | StaticShape | OneTile | MmaS2ROverlap, 1, 0, {1}},
-        {1024, 192,  64,  64, 48, 32,  64, 4, 36, PackedStore | StaticShape | OneTile | MmaS2ROverlap, 1, 0, {1}},
-        {2048, 256,  96,  64, 32, 48,  64, 4, 32, PackedStore | StaticShape | OverlapPrologue, 1, 0, {1}},
-        {4096, 320, 128,  64, 80, 32,  64, 3, 39, PackedStore, 1, 0, {1}},
-        {8192, 320, 128,  64, 80, 32,  64, 3, 39, PackedStore | StaticShape | OverlapPrologue | ValidEpilogue, 1, 1, {1}},
-        {16384,256, 128,  64, 64, 32,  64, 4, 39, PackedStore | StaticShape | OverlapPrologue | ValidEpilogue | StaticStages, 1, 6, {1}},
+        {8,     16,  16, 128, 16, 16, 128, 4, 48, PackedStore | StaticShape | PackedN, 2, 0},
+        {16,    16,  16, 128, 16, 16, 128, 4, 48, PackedStore | StaticShape | PackedN, 2, 0},
+        {128,   48,  32, 128, 16, 16, 128, 5, 36, PackedStore | StaticShape | OneTile, 1, 0},
+        {256,   96,  32, 128, 48, 16,  64, 6, 36, PackedStore | StaticShape | OneTile | CtaK, 1, 0},
+        {512,   96,  64,  64, 48, 16,  64, 5, 36, PackedStore | StaticShape | OneTile | MmaS2ROverlap, 1, 0},
+        {1024, 192,  64,  64, 48, 32,  64, 4, 36, PackedStore | StaticShape | OneTile | MmaS2ROverlap, 1, 0},
+        {2048, 256,  96,  64, 32, 48,  64, 4, 32, PackedStore | StaticShape | OverlapPrologue, 1, 0},
+        {4096, 320, 128,  64, 80, 32,  64, 3, 39, PackedStore, 1, 0},
+        {8192, 320, 128,  64, 80, 32,  64, 3, 39, PackedStore | StaticShape | OverlapPrologue | ValidEpilogue, 1, 1},
+        {16384,256, 128,  64, 64, 32,  64, 4, 39, PackedStore | StaticShape | OverlapPrologue | ValidEpilogue | StaticStages, 1, 6},
     };
     for (const auto& entry : lut)
         if (entry.m == m) return &entry;
@@ -672,8 +671,7 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
         .kernel_params = hparams,
     };
 
-    const auto compile_options = exact ? exact->compile_options : KernelCompileOptions{};
-    auto runtime = compiler->build_cached<Runtime>(kernel_name, args, compile_options);
+    auto runtime = compiler->build_cached<Runtime>(kernel_name, args);
     if (is_compile_only())
         return;
     auto kernel = runtime->kernel;
@@ -702,8 +700,8 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
                block_m, block_n, block_k, warp_m, warp_n, warp_k, num_stages);
         printf("SMSIZE:%d, vreg:%d, stack:%d\n", SMSIZE, int(numRegs), int(localSize));
         printf("dual_b_decode_split_k:%d\n", decode_split_k);
-        printf("dual_b_exact_lut:%d, mma_reuse:%d, cta_k:%d, k_order:%d\n",
-               int(exact != nullptr), compile_options.mma_reuse, int(cta_k), args.launch_info.k_order);
+        printf("dual_b_exact_lut:%d, cta_k:%d, k_order:%d\n",
+               int(exact != nullptr), int(cta_k), args.launch_info.k_order);
         printf("dual_b_static_stages:%d, streamed_low:%d\n", int(static_stages), int(streamed_low));
         printf("dual_b_standard_s2:%d\n", int(standard_s2));
         printf("dual_b_streamed_pairs:%d\n", int(streamed_pairs));
