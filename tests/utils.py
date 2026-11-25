@@ -1234,6 +1234,8 @@ def parse_deepgemm_string_re(s):
                 except ValueError:
                     result[key] = value
                     pass
+    if result.get("replayable") == 0:
+        raise ValueError("This profiling record cannot be replayed without the group distribution")
     if "quant_type" not in result:
         quant_type_defaults = {
             torch.float32: 'non_quantized',
@@ -1836,24 +1838,241 @@ def test_k_grouped_gemm_contiguous(args) -> None:
             "measurement_status": "COMPLETE"}), flush=True)
 
 
+_GROUPED_BF16_MODES = ("alias", "alias", "separate")
+
+
+def _exercise_grouped_bf16(lengths, n, k, modes, *, configs=None, c_offset=0,
+                           check=True, device="cpu", benchmark=False, compact=False, transpose_b=False):
+    alignment = 1 if compact else get_m_alignment_for_contiguous_layout()
+    m = sum(round_up(length, alignment) for length in lengths)
+    rng = torch.Generator(device=device).manual_seed(103)
+
+    def values(shape):
+        return torch.randint(-4, 5, shape, dtype=torch.int32, device=device, generator=rng).bfloat16().div_(8)
+
+    a, b, initial = values((m, k)), values((len(lengths), n, k)), values((m, n))
+    if m and k >= 2:
+        # Distinguish FP32 accumulation from rounding the product to BF16 before adding C.
+        expert = next(i for i, length in enumerate(lengths) if length)
+        a[0].zero_()
+        a[0, :2] = a.new_tensor([1, 1 / 256])
+        b[expert, 0].zero_()
+        b[expert, 0, :2] = 1
+        initial[0, 0] = 1 / 256
+
+    ids = torch.full((m,), -1, dtype=torch.int32, device=device)
+    products = []
+    start = 0
+    for expert, length in enumerate(lengths):
+        rows = slice(start, start + length)
+        ids[rows] = expert
+        if check and length:
+            products.append(a[rows].float() @ b[expert].float().T)
+        start += round_up(length, alignment)
+    layout = torch.tensor(lengths, dtype=torch.int32, device="cuda").cumsum(0, dtype=torch.int32) if compact else ids.cuda()
+    a = a.cuda()
+    b = b.transpose(1, 2).contiguous().cuda().transpose(1, 2) if transpose_b else b.cuda()
+
+    c_store = torch.full((m * n + 32 + c_offset,), -117, device="cuda", dtype=torch.bfloat16)
+    d_store = torch.full((m * n + 32,), -117, device="cuda", dtype=torch.bfloat16)
+    c, d = c_store[16 + c_offset:-16].view(m, n), d_store[16:-16].view(m, n)
+    c.copy_(initial)
+    d.copy_(initial)
+    op = deep_gemm.m_grouped_bf16_gemm_nt_contiguous
+    if check:
+        valid = ids >= 0
+        expected = initial_valid = initial[valid]
+        product = torch.cat(products) if products else initial.new_empty((0, n), dtype=torch.float32)
+    for mode in modes:
+        source = {"alias": d, "separate": c}.get(mode)
+        kwargs = {} if mode == "overwrite" else {"c": source}
+        run = functools.partial(op, a, b, d, layout, configs=configs,
+                                use_psum_layout=compact, ensure_zero_padding=not compact or mode == "none", **kwargs)
+        run()
+        if check:
+            addend = expected if mode == "alias" else initial_valid
+            expected = (product + addend.float() if source is not None else product).bfloat16()
+            torch.testing.assert_close(d.to(device)[valid], expected, rtol=0, atol=0)
+        if benchmark:
+            seconds = bench_kineto(run, 'gemm', suppress_kineto_output=True)
+            print(f"Grouped BF16 {mode}: {seconds * 1e6:.2f} us, {2 * sum(lengths) * n * k / seconds / 1e12:.2f} TFLOPS")
+    if check:
+        torch.testing.assert_close(c.to(device), initial, rtol=0, atol=0)
+        for storage, first in ((d_store, 16), (c_store, 16 + c_offset)):
+            assert (storage[:first] == -117).all() and (storage[-16:] == -117).all()
+        if transpose_b and not compact:
+            bad = torch.empty((len(lengths), k, n + 8), device="cuda", dtype=b.dtype)[..., :n].transpose(1, 2)
+            _reject_grouped_bf16(d, a, bad, d, layout, message="packed K-major or packed MN-major")
+
+
+def _reject_grouped_bf16(d, /, *args, error=RuntimeError, message=None, **kwargs):
+    original = d.clone()
+    try:
+        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(*args, **kwargs)
+    except error as exc:
+        if message is not None:
+            assert message in str(exc), str(exc)
+        torch.testing.assert_close(d, original, rtol=0, atol=0)
+    else:
+        raise AssertionError("Invalid grouped BF16 arguments were accepted")
+
+
+def _check_grouped_bf16_graph(a, b, d, ends, replays):
+    op = functools.partial(deep_gemm.m_grouped_bf16_gemm_nt_contiguous, a, b, d, ends, use_psum_layout=True)
+    op()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op()
+    for offsets in replays:
+        ends.copy_(ends.new_tensor(offsets))
+        d.fill_(-117)
+        graph.replay()
+        start = 0
+        for expert, end in enumerate(offsets):
+            assert (d[start:end] == (expert + 1) * a.size(1)).all()
+            start = end
+        assert (d[start:] == -117).all()
+
+
+def _check_grouped_bf16_layout(args, lengths, configs, check):
+    m, n, k = (args[key] for key in ("m", "n", "k"))
+    a_rows, d_rows = (args[key] for key in ("a_rows", "d_rows"))
+    padding = args.get("leading_padding", 0)
+    assert min(a_rows, d_rows) >= m
+    a = torch.ones((a_rows, k), device="cuda", dtype=torch.bfloat16)
+    a[m:].fill_(float("nan"))
+    weights = torch.ones((len(lengths), k, n), device="cuda", dtype=torch.bfloat16)
+    counts = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    experts = torch.arange(len(lengths), device="cuda", dtype=torch.int32)
+    weights.mul_((experts + 1)[:, None, None])
+    b = weights.transpose(1, 2)
+    packed = b.contiguous()
+    ids = torch.repeat_interleave(experts, counts, output_size=m - padding)
+    ids = torch.cat((ids.new_full((padding,), -1), ids))
+    ends = counts.cumsum(0, dtype=torch.int32)
+    d = torch.empty((d_rows, n), device="cuda", dtype=torch.bfloat16)
+
+    op = deep_gemm.m_grouped_bf16_gemm_nt_contiguous
+    modes = (args.get("accumulate", "none"),) if padding or "accumulate" in args else ("none", "alias")
+    layouts = (False,) if padding or n % 8 or k % 8 else (False, True)
+    for compact in layouts:
+        d.fill_(-117)
+        expected = -117
+        for mode in modes:
+            alias = mode == "alias"
+            rhs = b if alias and not padding else packed
+            op(a, rhs, d, ends if compact else ids, use_psum_layout=compact,
+               c=d if alias else None, configs=configs if alias or padding else None)
+            if check:
+                product = (ids[padding:].float() + 1) * k
+                expected = (product + expected if alias else product).bfloat16()
+                assert (d[padding:m] == expected[:, None]).all()
+                assert (d[:padding] == -117).all() and (d[m:] == -117).all()
+
+    if check and not padding:
+        too_many = ids.new_zeros(min(a_rows, d_rows) + 1)
+        _reject_grouped_bf16(d, a, b, d, too_many, message="m_indices row count must fit in A and D")
+        d.fill_(-117)
+        op(a, b, d, ids[:0])
+        assert (d == -117).all()
+        if "graph_ends" in args:
+            _check_grouped_bf16_graph(a, packed, d, ends, args["graph_ends"])
+
+
+def _check_grouped_bf16_interface(m, n, k, configs):
+    a = torch.ones((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.ones((1, n, k), device="cuda", dtype=torch.bfloat16)
+    d = torch.full((m, n), 3, device="cuda", dtype=torch.bfloat16)
+    ids = torch.zeros(m, device="cuda", dtype=torch.int32)
+    op = deep_gemm.m_grouped_bf16_gemm_nt_contiguous
+    op(lhs=a, rhs=b, out=d, m_indices=ids, c=d)
+    assert (d == 3 + k).all()
+    op(a, b, d, ids, "nk", False, True, None, configs, d)
+    assert (d == 3 + 2 * k).all()
+
+    square = torch.ones_like(d)
+    _reject_grouped_bf16(square, square, square.unsqueeze(0), square, ids,
+                         message="out overlaps a grouped GEMM input")
+    _reject_grouped_bf16(d, a=a, b=b, d=d, grouped_layout=ids, error=TypeError)
+
+
+def _run_grouped_bf16_bad_ends(m, out_m, n, k, ends):
+    a = torch.ones((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.ones((len(ends), n, k), device="cuda", dtype=torch.bfloat16)
+    d = torch.empty((out_m, n), device="cuda", dtype=torch.bfloat16)
+    valid = torch.full((len(ends),), min(m, out_m), device="cuda", dtype=torch.int32)
+    op = deep_gemm.m_grouped_bf16_gemm_nt_contiguous
+    op(a, b, d, valid, use_psum_layout=True)
+    torch.cuda.synchronize()
+    print("valid compact layout passed", flush=True)
+    op(a, b, d, valid.new_tensor(ends), use_psum_layout=True)
+    torch.cuda.synchronize()
+
+
+def _check_grouped_bf16_bad_ends(lengths, n, k):
+    import json
+    import sys
+
+    m = sum(lengths)
+    a = torch.ones((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.ones((len(lengths), n, k), device="cuda", dtype=torch.bfloat16)
+    d = torch.full((m, n), -117, device="cuda", dtype=torch.bfloat16)
+    ends = torch.tensor(lengths, device="cuda", dtype=torch.int32).cumsum(0, dtype=torch.int32)
+    _reject_grouped_bf16(d, a, b, d, ends.long(), use_psum_layout=True)
+
+    # A device assert can invalidate the CUDA context, so run each bad offset in a child.
+    child = ("import json, sys; sys.path[:] = json.loads(sys.argv[1]); "
+             "from utils import _run_grouped_bf16_bad_ends; _run_grouped_bf16_bad_ends(*json.loads(sys.argv[2]))")
+    offsets = [sum(lengths[:i + 1]) for i in range(len(lengths))]
+    offsets[-1] += 1
+    for a_rows, d_rows in ((m, m + 2), (m + 2, m)):
+        spec = json.dumps((a_rows, d_rows, n, k, offsets))
+        proc = subprocess.run([sys.executable, "-c", child, json.dumps(sys.path), spec], capture_output=True, text=True)
+        output = proc.stdout + proc.stderr
+        rejected = "cu_seqlens must" in output or "device-side assert" in output
+        assert proc.returncode != 0 and "valid compact layout passed" in proc.stdout and rejected, output
+
+
+def _run_grouped_bf16_case(args):
+    accumulation = args.get("accumulate", "none")
+    b_layout = args.get("b_layout", "k_major")
+    regression = args.get("bf16_regression")
+    part = args.get("regression_part")
+    check = get_acc_check() and not os.environ.get("HGGC_WARM_UP") and deep_gemm.get_compile_mode() != 1
+    if args["data_type"] != torch.bfloat16 or accumulation not in ("none", "alias", "separate"):
+        raise ValueError("Expected a grouped BF16 case")
+    if b_layout not in ("k_major", "mn_major"):
+        raise ValueError(f"Unknown grouped BF16 B layout {b_layout}")
+    lengths = construct_group_m_list(args["distribution"], args["groups"], args["m"])
+    n, k = args["n"], args["k"]
+    configs = (*args["configs"], (0, 0, 0)) if "configs" in args else None
+    if regression and (len(lengths) != args["groups"] or sum(lengths) + args.get("leading_padding", 0) != args["m"]):
+        raise ValueError("Grouped BF16 distribution and leading padding must match groups and m")
+    if regression == "layout" and "a_rows" in args:
+        return _check_grouped_bf16_layout(args, lengths, configs, check)
+    if (regression, part) == ("accumulation", "interface"):
+        if check:
+            _check_grouped_bf16_interface(args["m"], n, k, configs)
+        return
+    if (regression, part) == ("accumulation", "invalid_ends"):
+        if check:
+            _check_grouped_bf16_bad_ends(lengths, n, k)
+        return
+    if part is not None or regression not in (None, "accumulation", "layout"):
+        raise ValueError(f"Unknown grouped BF16 regression {regression}, part {part}")
+
+    modes = tuple(args.get("accumulation_modes", _GROUPED_BF16_MODES)) if regression else (accumulation,)
+    device = "cpu" if regression or (check and get_ref_backend() == "host") else "cuda"
+    _exercise_grouped_bf16(lengths, n, k, modes, configs=configs, c_offset=args.get("c_offset", 0),
+                           check=check, device=device, benchmark=get_benchmark() and not regression,
+                           compact=bool(args.get("use_psum_layout")), transpose_b=b_layout == "mn_major")
+
+
 def test_m_grouped_gemm_contiguous(args) -> None:
-    accumulation = args.get('accumulate', 'none')
-    regression = args.get('bf16_regression')
-    use_psum_layout = bool(args.get('use_psum_layout', False))
-    if regression or accumulation != 'none' or use_psum_layout:
-        if args['data_type'] != torch.bfloat16 or accumulation not in ('none', 'alias', 'separate'):
-            raise ValueError('Expected a grouped BF16 alias or separate accumulation case')
-        from test_m_grouped_bf16_contiguous_accumulate import exercise_grouped_accumulation, run_grouped_accumulation_regression
-        check = get_acc_check() and not os.environ.get('HGGC_WARM_UP') and deep_gemm.get_compile_mode() != 1
-        if regression:
-            if regression != 'accumulation':
-                raise ValueError(f'Unknown grouped BF16 regression {regression}')
-            return run_grouped_accumulation_regression(check=check)
-        lengths = construct_group_m_list(args['distribution'], args['groups'], args['m'])
-        return exercise_grouped_accumulation(
-            lengths, args['n'], args['k'], (accumulation,), check=check,
-            reference_device='cpu' if check and get_ref_backend() == 'host' else 'cuda',
-            benchmark=get_benchmark(), use_psum_layout=use_psum_layout)
+    if ("b_layout" in args or args.get("bf16_regression") or args.get("accumulate", "none") != "none"
+            or args.get("use_psum_layout")):
+        return _run_grouped_bf16_case(args)
 
     print('Testing grouped contiguous GEMM:')
     num_groups, m, n, k, d, distribution = args['groups'], args['m'], args['n'], args['k'], args['data_type'], args['distribution']

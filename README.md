@@ -156,11 +156,18 @@ For training forward passes or inference prefilling, where each expert may proce
 
 On M890P, `m_grouped_bf16_gemm_nt_contiguous` accepts optional BF16 `c`,
 including in-place `c=d`, with FP32 accumulation before BF16 output.
-With `use_psum_layout=True`, `m_indices` contains device int32 exclusive
-expert end offsets. Ends must be nonnegative and nondecreasing, with the last
-equal to the total row count; repeated ends represent empty experts.
-N and K must be divisible by 8. For automatic tile selection with `c` in
-the padded row-ID layout, align each expert's physical row span to 256 rows.
+A and D may have different row capacities as long as both cover the grouped
+rows, including per-expert padding. The GEMM leaves D's tail unchanged.
+The grouped row count is `m_indices.numel()` for row IDs and `m_indices[-1]`
+with `use_psum_layout=True`. Prefix sums are device int32 exclusive expert ends.
+They must be nonnegative and nondecreasing, with repeated ends for empty experts.
+Prefix sums require N and K divisible by 8. For automatic tile selection with
+`c` in the row-ID layout, align each expert's physical row span to 256 rows.
+
+For B of shape `[E, N, K]`, `m_grouped_bf16_gemm_nt_contiguous` accepts packed
+K-major strides `(N*K, K, 1)` and MN-major strides `(N*K, 1, N)`. With the same
+expert row layout, `m_grouped_bf16_gemm_nt_contiguous(dy, w.transpose(1, 2), dx, m_indices)`
+computes input gradients directly from a view of the contiguous forward weights.
 
 For more information, please refer to the `m_grouped_gemm_fp8_fp8_bf16_nt_contiguous` function documentation.
 

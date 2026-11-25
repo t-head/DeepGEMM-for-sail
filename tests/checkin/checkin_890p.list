@@ -244,8 +244,28 @@ GroupedNoPad,data_type:w4a8_nvfp4,groups:6,m:512,n:7168,k:5120,distribution:[86,
 GroupedContiguous,data_type:bf16,groups:16,m:4096,n:4096,k:7168,distribution:gaussian
 GroupedContiguous,data_type:bf16,groups:32,m:8192,n:2048,k:2048,distribution:uniform
 
-# Optional C, including repeated aliasing, source alignment and pipeline boundaries.
-GroupedContiguous,data_type:bf16,groups:4,m:512,n:256,k:192,bf16_regression:accumulation
+# Optional C with row IDs and prefix sums, including repeated in-place accumulation.
+GroupedContiguous,data_type:bf16,groups:4,m:479,n:256,k:256,distribution:[119,0,247,113],bf16_regression:accumulation,configs:[1,128,128,64,32,32,3],c_offset:1
+GroupedContiguous,data_type:bf16,groups:5,m:143,n:456,k:192,distribution:[0,3,139,1,0],bf16_regression:accumulation,configs:[1,128,256,64,32,64,2],use_psum_layout:1
+
+# Transposed B with N/K tails and an empty expert.
+GroupedContiguous,data_type:bf16,groups:3,m:146,n:136,k:72,distribution:[17,0,129],bf16_regression:layout,b_layout:mn_major,c_offset:1,accumulation_modes:["overwrite","separate","alias"]
+GroupedContiguous,data_type:bf16,groups:3,m:146,n:136,k:72,distribution:[17,0,129],bf16_regression:layout,b_layout:mn_major,use_psum_layout:1,accumulation_modes:["overwrite","separate","alias"]
+
+# Independent A/D capacities and Graph replay with dynamic prefix sums.
+GroupedContiguous,data_type:bf16,groups:2,m:392,n:136,k:72,distribution:[256,136],bf16_regression:layout,a_rows:400,d_rows:408,configs:[1,256,256,64,64,64,3],graph_ends:[[128,136],[0,0],[256,392]]
+GroupedContiguous,data_type:bf16,groups:2,m:392,n:136,k:72,distribution:[256,136],bf16_regression:layout,a_rows:408,d_rows:400,configs:[1,256,256,64,64,64,3]
+
+# Odd N no-C writeback must preserve the spare output row.
+GroupedContiguous,data_type:bf16,groups:1,m:1,n:137,k:64,distribution:[1],bf16_regression:layout,a_rows:2,d_rows:2,accumulate:none
+
+# All-padding no-C tile and wide tile spanning experts with C.
+GroupedContiguous,data_type:bf16,groups:1,m:256,n:256,k:64,distribution:[128],bf16_regression:layout,a_rows:384,d_rows:400,leading_padding:128,configs:[1,128,128,64,32,32,3]
+GroupedContiguous,data_type:bf16,groups:2,m:319,n:256,k:192,distribution:[128,63],bf16_regression:layout,a_rows:319,d_rows:319,leading_padding:128,configs:[1,256,256,64,64,64,3],accumulate:alias
+
+# API compatibility and prefix sums exceeding either buffer's capacity.
+GroupedContiguous,data_type:bf16,groups:1,m:128,n:128,k:64,distribution:[128],bf16_regression:accumulation,regression_part:interface,configs:[1,128,128,64,32,32,3]
+GroupedContiguous,data_type:bf16,groups:3,m:5,n:136,k:72,distribution:[0,3,2],bf16_regression:accumulation,regression_part:invalid_ends
 
 # --- GroupedContiguous / int8 ---
 GroupedContiguous,data_type:int8,groups:4,m:128,n:512,k:1024,distribution:uniform

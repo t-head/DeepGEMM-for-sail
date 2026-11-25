@@ -383,21 +383,25 @@ ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
         return x == 0 ? num_sms : x;
     };
 
-    auto get_num_waves = [m, n, num_groups, num_sms](int bm, int bn) -> int {
-        if (bm == 0)
-            return 0;
-        return ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms);
+    auto get_num_tiles = [m, n, num_groups](int bm, int bn) {
+        return ceil_div<int64_t>(m, bm) * ceil_div<int64_t>(n, bn) * num_groups;
     };
 
-    auto get_last_wave_util = [m, n, num_groups, num_sms, &fix_wave_saturate](int bm, int bn) -> int {
-        return fix_wave_saturate((ceil_div(m, bm) * ceil_div(n, bn) * num_groups) % num_sms);
+    auto get_num_waves = [num_sms, &get_num_tiles](int bm, int bn) -> int64_t {
+        if (bm == 0)
+            return 0;
+        return ceil_div<int64_t>(get_num_tiles(bm, bn), num_sms);
+    };
+
+    auto get_last_wave_util = [num_sms, &get_num_tiles, &fix_wave_saturate](int bm, int bn) -> int {
+        return fix_wave_saturate(get_num_tiles(bm, bn) % num_sms);
     };
 
     auto get_block_utils = [](int m, int bm) -> double {
         if (bm == 0)
             return 0.0;
         if (m % bm != 0) {
-            return ((m / double(bm)) / ((m + bm - 1) / bm));
+            return (m / double(bm)) / ceil_div<int64_t>(m, bm);
         } else {
             return 1.0;
         }
@@ -428,8 +432,8 @@ ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
 
         for (int block_n : block_ns_after_filter) {
             bool success = false;
-            int num_waves = get_num_waves(block_m, block_n);
-            int best_num_waves = get_num_waves(best_block_m, best_block_n);
+            const auto num_waves = get_num_waves(block_m, block_n);
+            const auto best_num_waves = get_num_waves(best_block_m, best_block_n);
             double num_utils = get_block_utils(m, block_m) * get_block_utils(n, block_n);
             double best_num_utils = get_block_utils(m, best_block_m) * get_block_utils(n, best_block_n);
             int num_occ = get_smem_occ(block_m, block_n);
@@ -542,8 +546,7 @@ ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
 
     // Recompute the minimal number of SMs required
     // NOTES: less L2 cache usage and less GPU frequency drop
-    int num_waves = get_num_waves(best_block_m, best_block_n);
-    int num_min_sms = ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups;
+    const int num_min_sms = std::min<int64_t>(get_num_tiles(best_block_m, best_block_n), num_sms);
 
     int warp_m = best_block_m / 2;
     int warp_n = best_block_n / 2;
@@ -568,8 +571,8 @@ ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
         warp_n = best_block_n / 4;
     }
 
-    return ConfigResult{std::min(num_min_sms, num_sms), best_block_m, best_block_n,
-                        block_k, warp_m, warp_n, best_num_stages, best_smem_config};
+    return ConfigResult{num_min_sms, best_block_m, best_block_n, block_k,
+                        warp_m, warp_n, best_num_stages, best_smem_config};
 }
 
 // Compare persistent CTA work while keeping the baseline K pipeline.

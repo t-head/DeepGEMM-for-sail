@@ -36,6 +36,10 @@ def device_version_supported(one_case):
     if one_case.get('gemm_type') == 'KGroupedContiguous':
         if get_arch_version() != 89 or 'M890' not in torch.cuda.get_device_name():
             return False, 'KGroupedContiguous currently requires Zhenwu M890P (sm_89)'
+    if (one_case.get('gemm_type') == 'GroupedContiguous'
+            and one_case.get('bf16_regression') in ('accumulation', 'layout')
+            and get_arch_version() != 89):
+        return False, 'Grouped BF16 regression requires PPU1.5 (sm_89)'
     if one_case.get('gemm_type') == 'MegaMhc':
         arch = get_arch_version()
         if arch not in (80, 89):

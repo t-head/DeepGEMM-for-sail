@@ -1246,7 +1246,7 @@ public:
     int thread_idx = int(threadIdx.x);
     auto blk_shape = TileShape{}; // (BLK_M,BLK_N,BLK_K)
     TileScheduler deep_scheduler(params.scheduler);
-    if constexpr (CPolicy::with_c && TileScheduler::GEMM_TYPE == GemmType::MGroupedContiguous) {
+    if constexpr (TileScheduler::GEMM_TYPE == GemmType::MGroupedContiguous) {
       // Contiguous C and D have physical row coordinates and no batch offset.
       deep_scheduler.curr_group_idx = 0;
     }
@@ -1292,7 +1292,7 @@ public:
         offset_cd = int64_t(row) * N;
       } else {
         offset_b = deep_scheduler.curr_offset_b(m_coord);
-        if constexpr (CPolicy::with_c && TileScheduler::GEMM_TYPE == GemmType::MGroupedContiguous) {
+        if constexpr (TileScheduler::GEMM_TYPE == GemmType::MGroupedContiguous) {
           if (uint64_t(offset_b) >= uint64_t(TileScheduler::kNumGroups) * N * K) continue;
         }
       }

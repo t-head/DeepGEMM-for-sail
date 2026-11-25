@@ -963,30 +963,40 @@ void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& lhs, const torch::Te
                                        const std::optional<int>& expected_m_for_psum_layout,
                                        std::optional<ConfigTuple> configs = std::nullopt,
                                        const std::optional<torch::Tensor>& c = std::nullopt) {
+    DG_HOST_ASSERT(lhs.is_cuda() && lhs.dim() == 2 && out.is_cuda() && out.dim() == 2);
     const auto major_a = get_major_type_ab(lhs);
-    const auto major_b = get_major_type_ab(rhs);
     DG_HOST_ASSERT(major_a == MajorType::K);
 
-    const auto& [m, k] = get_shape<2>(lhs);
-    const auto& [num_groups, n, k_] = get_shape<3>(rhs);
-    const auto& [m_, n_] = get_shape<2>(out);
-
-    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+    const auto& [num_groups, n, k] = get_shape<3>(rhs);
+    DG_HOST_ASSERT(out.size(1) == n && lhs.size(1) == k);
+    const auto row_capacity = std::min(lhs.size(0), out.size(0));
     DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
     DG_HOST_ASSERT(lhs.dtype() == torch::kBFloat16);
     DG_HOST_ASSERT(rhs.dtype() == torch::kBFloat16);
     DG_HOST_ASSERT(out.dtype() == torch::kBFloat16);
     DG_HOST_ASSERT(m_indices.dtype() == torch::kInt32);
     TORCH_CHECK(lhs.is_contiguous(), "lhs must be contiguous");
-    TORCH_CHECK(rhs.is_contiguous(), "rhs must be contiguous");
+    // Transposing the last two dimensions creates a view, without copying weights.
+    // Prefer K-major when singleton dimensions make both packed layouts valid.
+    const bool b_is_mn_major = !rhs.is_contiguous();
+    TORCH_CHECK(!b_is_mn_major || rhs.transpose(1, 2).is_contiguous(),
+                "rhs must use packed K-major or packed MN-major layout");
     TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
     TORCH_CHECK(m_indices.is_contiguous(), "m_indices must be contiguous");
 
     TORCH_CHECK(lhs.device() == out.device() && rhs.device() == out.device() &&
                 m_indices.device() == out.device(), "grouped BF16 inputs must be on the same accelerator");
-    TORCH_CHECK(m_indices.dim() == 1 && m_indices.size(0) == (use_psum_layout ? num_groups : m),
-                use_psum_layout ? "grouped_layout must contain one end offset per expert"
-                                : "m_indices must contain one group ID per physical row");
+    TORCH_CHECK(m_indices.dim() == 1, "m_indices must be one-dimensional");
+    if (use_psum_layout) {
+        TORCH_CHECK(m_indices.size(0) == num_groups, "grouped_layout must contain one end offset per expert");
+    } else {
+        TORCH_CHECK(m_indices.size(0) <= row_capacity, "m_indices row count must fit in A and D");
+        TORCH_CHECK(m_indices.size(0) <= std::numeric_limits<int32_t>::max(), "m_indices row count must fit in int32");
+    }
+    // Prefix-sum scheduling uses int32 device offsets, so no expert can end past INT32_MAX.
+    const auto launch_rows = use_psum_layout ? std::min<int64_t>(row_capacity, std::numeric_limits<int32_t>::max())
+                                             : m_indices.size(0);
+    const int launch_m = static_cast<int>(launch_rows);
     const c10::DeviceGuard device_guard(out.device());
     if (c.has_value()) {
         TORCH_CHECK(c->defined() && c->sizes() == out.sizes(), "c must have the same shape as out");
@@ -994,7 +1004,7 @@ void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& lhs, const torch::Te
         TORCH_CHECK(c->device() == out.device(), "c and out must be on the same accelerator");
         TORCH_CHECK(!out.is_neg() && !c->is_neg(), "grouped BF16 accumulation requires resolved C/D views");
     }
-    if (m != 0) {
+    if (launch_m != 0) {
         // Compare byte ranges, including DLPack views backed by distinct StorageImpls.
         const auto dst = reinterpret_cast<uintptr_t>(out.data_ptr());
         const auto overlaps_out = [&](const torch::Tensor& input) {
@@ -1010,21 +1020,34 @@ void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& lhs, const torch::Te
 
     if (use_psum_layout) {
         TORCH_CHECK(n % 8 == 0 && k % 8 == 0, "compact grouped BF16 requires N and K divisible by 8");
-        validate_compact_group_ends(m_indices, m);
+        validate_compact_group_ends(m_indices, row_capacity);
     } else {
         TORCH_CHECK(!expected_m_for_psum_layout.has_value(), "expected_m_for_psum_layout requires prefix sums");
     }
 
     check_major_type_cd(out);
 
-    if (m == 0) {
+    if (launch_m == 0) {
         return;
     }
 
     const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 8) {
-        m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(
-            lhs, rhs, out, m_indices, m, n, k, num_groups, configs, c, use_psum_layout);
+        const auto launch = [&]<bool ScalarNoC>() {
+            if (b_is_mn_major) {
+                m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl<true, ScalarNoC>(
+                    lhs, rhs, out, m_indices, launch_m, n, k, num_groups, configs, c, use_psum_layout);
+            } else {
+                m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl<false, ScalarNoC>(
+                    lhs, rhs, out, m_indices, launch_m, n, k, num_groups, configs, c, use_psum_layout);
+            }
+        };
+        // Odd row strides can leave a single BF16 at the end of a no-C store.
+        if (n % 2 != 0 && !c.has_value() && is_ppu1v5_device()) {
+            launch.operator()<true>();
+        } else {
+            launch.operator()<false>();
+        }
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

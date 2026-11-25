@@ -451,10 +451,6 @@ void distribution() {
         CHECK_HGGC(hggcMemcpyAsync(tmp, grouped_layout_, sizeof(int) * size, hggcMemcpyDeviceToHost, stream_));
         hggcStreamSynchronize(stream_);
 
-        if (gemm_type_ == GemmType::MGroupedContiguousWithPsumLayout) {
-            for (int g = size - 1; g > 0; --g) tmp[g] -= tmp[g - 1];
-        }
-
         if (need_bincount) {
             int* counts = new int[group_];
             for (int i = 0; i < group_; ++i) {
@@ -486,8 +482,8 @@ void distribution() {
 }
 
 bool check_support_dump() {
-    // MegaMoE counts are produced inside the collective; do not read or synchronize here.
-    if (gemm_type_ == GemmType::MegaMoE)
+    // Keep device-generated group lengths on device.
+    if (gemm_type_ == GemmType::MegaMoE || gemm_type_ == GemmType::MGroupedContiguousWithPsumLayout)
         return false;
     if (gemm_type_ == GemmType::KGroupedContiguous) {
         return false;  // Host K lengths were supplied by set_k_grouped_params.
