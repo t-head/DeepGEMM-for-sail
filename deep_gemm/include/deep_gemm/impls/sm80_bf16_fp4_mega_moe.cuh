@@ -113,8 +113,7 @@ __device__ void w4_mega_gemm(const sched::Int8MegaMoESchedulerArguments& routing
         int masters, cutlass::bfloat16_t* d, float limit, float alpha, float beta, float linear_beta,
         char* smem, const int64_t* ids, const float* weights, __ppu_bfloat16* output, int tokens) {
     using Dispatch = Int8FusedDispatch<BK, true>;
-    constexpr bool kAlternateExpertMOrder =
-        !First && BM == 128 && Ranks == 8 && std::is_same_v<ElementB, cutlass::float4_t>;
+    constexpr bool kAlternateExpertMOrder = !First && BM == 128;
     using Scheduler = sched::SM80MegaMoEScheduler<N, K, BM, BN, Groups,
         First ? MegaMoEPhaseKind::Linear1 : MegaMoEPhaseKind::Linear2,
         Ranks, TilesPerFlag, Capacity, TopK, Dispatch, kAlternateExpertMOrder>;

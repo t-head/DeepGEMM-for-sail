@@ -18,6 +18,7 @@
 #include <deep_gemm/impls/dequant_w4a16.cuh>
 #include <deep_gemm/scheduler/scheduler_cutlass3.cuh>
 #include <deep_gemm/scheduler/fused_scheduler.cuh>
+#include <deep_gemm/scheduler/mega_moe_common.cuh>
 #include <deep_gemm/impls/fused_gemm_util.cuh>
 #include <deep_gemm/common/utils_cutlass3.cuh>
 #include <deep_gemm/impls/w4fa16_gemm.cuh>
@@ -131,7 +132,9 @@ public:
   using GmemTiledCopyScale = typename DefaultOperandScale::GmemTiledCopy;
   using SmemLayoutScale = decltype(tile_to_shape(SmemLayoutAtomScale{}, make_shape(Int<GroupsPerBlock>{}, Int<BlockN>{}, Int<kNumStages>{})));
   // custom s2r copy scale
-  using ScaleCopyOp = cute::conditional_t<E8M0_scale, UniversalCopy<cute::uint64_t>, UniversalCopy<cute::uint128_t>>;
+  static constexpr bool kUse64BitScaleCopy =
+      E8M0_scale || (deep_gemm::MegaMoEDispatchTraits<Scheduler>::kIsLinear1 && WarpsOnK == 1);
+  using ScaleCopyOp = cute::conditional_t<kUse64BitScaleCopy, UniversalCopy<cute::uint64_t>, UniversalCopy<cute::uint128_t>>;
   using ScaleCopyTraits = Copy_Traits<ScaleCopyOp>;
   using SmemCopyAtomScale = Copy_Atom<ScaleCopyTraits, ElementScale>;
   using SmemThrLayoutScale = Layout<
@@ -721,6 +724,9 @@ public:
           s2r_prologue();
         }
 
+        // Keep the next fragments out of registers while issuing the shared-memory refill.
+        constexpr bool kDeferFragmentLoad = !cute::is_same_v<Output, std::false_type> &&
+                                            cute::is_same_v<ElementB, cutlass::int4b_t> && WarpsOnK > 1;
         auto run_k = [&](auto row_groups) {
         auto process_kblock_iterations = [&](int k_block) {
           if (k_block == K_BLOCK_MAX - 1) {
@@ -729,7 +735,7 @@ public:
             __syncthreads();
           }
 
-          s2r_next(k_block);
+          if constexpr (!kDeferFragmentLoad) s2r_next(k_block);
 
           if (k_block == 0) {
             if (k_tile_count > 0) {
@@ -743,6 +749,7 @@ public:
             smem_pipe_read = (smem_pipe_read + 1) % kNumStages;
           }
 
+          if constexpr (kDeferFragmentLoad) s2r_next(k_block);
           mix_gemm_rows(k_block, row_groups);
         };
 
