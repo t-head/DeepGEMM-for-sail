@@ -50,15 +50,16 @@ struct KGroupedScheduler {
         if (group_loaded && curr_group_idx == group_idx) {
             return;
         }
-        // Persistent work indices only advance. Like the NoPad row-prefix
-        // cursor, retain the K prefix and read each crossed group once.
-        if (!group_loaded) {
-            current_shape_k = grouped_layout[0];
+        while (!group_loaded || curr_group_idx < group_idx) {
+            if (group_loaded) {
+                current_k_start += current_shape_k;
+                ++curr_group_idx;
+            }
+            // The caller guarantees valid group bounds and per-group host/device agreement.
+            const uint32_t entry = grouped_layout[curr_group_idx];
+            current_shape_k = kGemmType == GemmType::KGroupedContiguousWithPsumLayout
+                ? entry - current_k_start : entry;
             group_loaded = true;
-        }
-        while (curr_group_idx < group_idx) {
-            current_k_start += current_shape_k;
-            current_shape_k = grouped_layout[++curr_group_idx];
         }
     }
 
