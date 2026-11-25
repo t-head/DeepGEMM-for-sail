@@ -330,16 +330,15 @@ __device__ __forceinline__ void metadata_scan_test_sync() {
                            f'exec {compiler} -include {shlex.quote(str(header))} "$@"\n')
         wrapper.chmod(0o700)
         env = os.environ.copy()
-        pythonpath = [str(Path(__file__).resolve().parent)]
-        if env.get('PYTHONPATH'):
-            pythonpath.append(env['PYTHONPATH'])
         env.update(DG_JIT_HGCC_COMPILER=str(wrapper), DG_JIT_USE_HGRTC='0',
-                   DG_JIT_CACHE_DIR=str(root / 'cache'),
-                   PYTHONPATH=os.pathsep.join(pythonpath))
+                   DG_JIT_CACHE_DIR=str(root / 'cache'))
         env.pop('HGGC_WARM_UP', None)
         result = subprocess.run(
             [sys.executable, '-c',
-             'from test_attention import _check_paged_metadata_scan; _check_paged_metadata_scan()'],
+             'import sys; '
+             'sys.path[:] = sys.argv[1:]; '
+             'from test_attention import _check_paged_metadata_scan; _check_paged_metadata_scan()',
+             *sys.path],
             env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
         assert result.returncode == 0, result.stdout
         print(result.stdout, end='')
