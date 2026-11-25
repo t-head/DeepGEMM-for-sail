@@ -349,7 +349,7 @@ struct DualBMainloop {
   ///   S2R prefetch step 2*KPair+1 into buf_next
   ///   MMA step 2*KPair (buf_curr) x2 (high, low)
   ///   S2R prefetch step 2*KPair+2 into buf_curr
-  ///     最后一个 K pair 的这次 S2R 预取会跨到下一个 K tile。
+  ///     In the last K pair, this S2R prefetch crosses into the next K tile.
   ///   MMA step 2*KPair+1 (buf_next) x2 (high, low)
   ///   [G2S at KPair == kKPairs-1: wait + sync + issue + fence]
   template <int KPair>
@@ -1277,7 +1277,7 @@ struct DualBMainloop {
   ///   S2R prefetch step 2*KPair+1 into buf_next
   ///   MMA step 2*KPair (buf_curr) x2 (high, low)
   ///   S2R prefetch step 2*KPair+2 into buf_curr
-  ///     最后一个 K pair 的这次 S2R 预取会跨到下一个 K tile。
+  ///     In the last K pair, this S2R prefetch crosses into the next K tile.
   ///   MMA step 2*KPair+1 (buf_next) x2 (high, low)
   ///   [G2S at KPair == kKPairs-1: wait + sync + issue + fence]
   template <int KPair>
