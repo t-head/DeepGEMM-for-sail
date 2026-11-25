@@ -1,7 +1,9 @@
 #pragma once
 
 #include <type_traits>
+#include <utility>
 #include <deep_gemm/common/types.cuh>
+#include <deep_gemm/common/w4a8_arguments.cuh>
 #include <deep_gemm/epilogue/gated_activation.cuh>
 
 #include "mega_moe_dispatch.hpp"
@@ -38,6 +40,7 @@ struct FP8FP4Linear2Params {
     at::BFloat16* output;
     const int64_t* peer_offsets;
     int capacity, pool_rows, rank_idx;
+    mega_moe::FusedReduceParams reduce{};
 };
 
 template <MegaMoEPhaseKind Stage, GatedActivation Activation = GatedActivation::SwiGLU>
@@ -55,6 +58,8 @@ public:
         LaunchArgs launch_args;
         Params kernel_params{};
         uint64_t routing_bytes = 0;
+        int fused_topk = 0;
+        ReduceConfig reduce_config{};
     };
 
     static std::string generate_impl(const Args& args) {
@@ -69,7 +74,11 @@ public:
             return fmt::format(R"(
 #define DG_MOE_FAST_MATH {}
 #include <deep_gemm/impls/sm89_fp8_fp4_mega_moe.cuh>
-using Builder = deep_gemm::MegaMoEFp8Fp4Gemm1Kernel<{}, {}, {}, {}, {}, {}, deep_gemm::GatedActivation({}), deep_gemm::w4fa8::FragmentPolicy::{}, deep_gemm::w4fa8::ALoadPolicy::{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>;
+using Builder = deep_gemm::MegaMoEFp8Fp4Gemm1Kernel<
+    {}, {}, {}, {}, {}, {}, deep_gemm::GatedActivation({}),
+    deep_gemm::w4fa8::FragmentPolicy::{}, deep_gemm::w4fa8::ALoadPolicy::{},
+    {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+    {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>;
 static_assert(Builder::shared_memory_bytes() == {}, "MegaMoE shared storage size differs from host");
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&deep_gemm::sm89_fp8_fp4_mega_moe_l1<Builder>);
@@ -79,24 +88,32 @@ static void __instantiate_kernel() {{
                 tile.num_stages, int(Activation),
                 c.fragment == w4fa8::FragmentPolicy::FullK ? "FullK" : "RollingK32",
                 !w4fa8::uses_ring_a(tile.warp_m) ? "Bulk" : "Ring2", dispatch.num_experts, c.num_threads,
-                dispatch.num_ranks, c.num_ctas, dispatch.num_experts_per_rank, dispatch.num_topk, c.n, dispatch.pull_ctas,
+                dispatch.num_ranks, dispatch.num_experts_per_rank, dispatch.num_topk, c.n, dispatch.pull_ctas,
                 dispatch.pull_group_size, c.metadata.block_m, c.metadata.valid_rows, inputs.topk_idx, inputs.input_tokens,
                 inputs.input_scales, inputs.dispatched_tokens, inputs.dispatched_scales, inputs.gemm2_metadata,
-                dispatch.nmtpr, args.routing_bytes, args.launch_args.smem_size);
+                dispatch.nmtpr, args.routing_bytes, c.work_batch, int(c.batch_decode),
+                c.batch_decode ? std::max(1, c.num_ctas / tile.num_sms) : 1,
+                args.launch_args.smem_size);
         } else {
+            const char* a_load = "Bulk";
+            if (c.a_load == w4fa8::ALoadPolicy::Ring2)
+                a_load = "Ring2";
+            else if (c.a_load == w4fa8::ALoadPolicy::Ring3)
+                a_load = "Ring3";
             return fmt::format(R"(
 #include <deep_gemm/impls/sm89_fp8_fp4_mega_moe.cuh>
 using Builder = deep_gemm::MegaMoEFp8Fp4Gemm2Kernel<{}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::w4fa8::FragmentPolicy::{}, deep_gemm::w4fa8::ALoadPolicy::{}, {}, {}>;
 using Kernel = typename Builder::Kernel;
 static_assert(Builder::shared_memory_bytes() == {}, "MegaMoE shared storage size differs from host");
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&deep_gemm::sm89_fp8_fp4_mega_moe_l2<Builder>);
+    auto ptr = reinterpret_cast<void*>(&deep_gemm::sm89_fp8_fp4_mega_moe_l2<Builder, {}, {}, {}>);
 }}
 )",
                 c.n, c.k, c.block_m, c.block_n, c.warp_m, c.warp_n, c.num_groups, c.num_stages,
                 c.fragment == w4fa8::FragmentPolicy::FullK ? "FullK" : "RollingK32",
-                !w4fa8::uses_ring_a(c.warp_m) ? "Bulk" : "Ring2", c.num_threads, c.num_ranks,
-                args.launch_args.smem_size);
+                a_load, c.num_threads, c.num_ranks,
+                args.launch_args.smem_size, args.fused_topk,
+                args.reduce_config.column_splits, args.reduce_config.group_threads);
         }
     }
 
@@ -111,7 +128,7 @@ static void __instantiate_kernel() {{
             DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config,
                 p.acts, p.act_scales, p.weights, p.scales, p.inv_scale, p.replicas, p.replica_scales,
                 p.replica_inv_scale, p.master_experts, p.rows, p.valid_rows, p.routes, p.output,
-                p.peer_offsets, p.capacity, p.pool_rows, p.rank_idx));
+                p.peer_offsets, p.capacity, p.pool_rows, p.rank_idx, p.reduce));
         }
     }
 };
@@ -175,16 +192,24 @@ inline void fp8_fp4_mega_moe_impl(
     auto config = configs.l1;
     config.fast_math = fast_math;
     const int rows = buffer.dispatch.num_max_pool_tokens;
-    const auto l2_args = make_fp8_fp4_linear2_args(
+    auto l2_args = make_fp8_fp4_linear2_args(
         l2_weights, l2_weights_replicas, base, buffer, rank_idx, config.dispatch, configs.l2);
     auto launch_linear1 = [&](auto activation_tag) {
         constexpr auto kind = decltype(activation_tag)::value;
         using Runtime = FP8FP4MegaMoEGemmRuntime<MegaMoEPhaseKind::Linear1, kind>;
-        const auto args = make_fp8_fp4_linear1_args<kind>(
+        auto args = make_fp8_fp4_linear1_args<kind>(
             l1_weights, l1_weights_replicas, base, buffer, sym_buffer, num_tokens,
             activation_clamp, activation_alpha, situ_beta, situ_linear_beta, config);
-        launch_mega_moe_kernel<Runtime, true>(
-            args, gemm_profile("w4fa8_mma", rows, configs.expected_m, config));
+        const auto runtime = compiler->build(args.kernel_name, Runtime::generate(args));
+        const int occupancy = get_kernel_occupancy(runtime, args.launch_args.block_dim.x, args.launch_args.smem_size);
+        const auto resident = static_cast<unsigned>(device_runtime->get_prop()->multiProcessorCount * occupancy);
+        // The dispatch barriers count gridDim.x, so the same binary can use any resident grid.
+        args.launch_args.grid_dim.x = std::min(args.launch_args.grid_dim.x, resident);
+        TORCH_CHECK(args.launch_args.grid_dim.x > static_cast<unsigned>(config.dispatch.pull_ctas),
+                    "W4A8 GEMM1 resident grid must leave at least one compute CTA after the pull CTAs");
+        const auto profile = gemm_profile("w4fa8_mma", rows, configs.expected_m, config);
+        launch_profiled<Runtime>(runtime, args, profile);
+        log_gemm(runtime, args.kernel_name, args.launch_args, profile, occupancy);
     };
     if (activation == GatedActivation::SiTU)
         launch_linear1(std::integral_constant<GatedActivation, GatedActivation::SiTU>{});
@@ -196,9 +221,27 @@ inline void fp8_fp4_mega_moe_impl(
         launch_linear1(std::integral_constant<GatedActivation, GatedActivation::SwiGLU>{});
     fp8_channelwise_mega_moe_quantize_local_pool_kernel(config, sym_buffer, base, buffer);
     update_recv_stats(base, buffer, config.dispatch.num_experts_per_rank, cumulative_local_expert_recv_stats);
+    // Keep the grid resident while its CTAs wait for scatter completion.
+    // The occupancy-limited launch below expands at most one device-wide wave.
+    const bool fused = get_env<int>("DG_MEGAMOE_SPLIT_SYNC", 0) == 0;
+    if (fused) {
+        DG_HOST_ASSERT(configs.l2.num_sms <= device_runtime->get_prop()->multiProcessorCount);
+        auto reduce_args = make_mega_moe_combine_args(base, buffer, config.dispatch, sym_buffer, y, rank_idx, num_tokens);
+        const auto& p = reduce_args.kernel_params;
+        l2_args.fused_topk = config.dispatch.num_topk;
+        l2_args.reduce_config = select_w4a8_reduce_config(num_tokens, configs.l2.n,
+                                                       configs.l2.num_threads, configs.l2.num_sms);
+        l2_args.kernel_name = "w4a8_mega_moe_scatter_reduce";
+        l2_args.kernel_params.reduce = {sym_buffer, p.topk_weights, p.topk_idx, p.y,
+            p.signals, num_tokens, p.num_experts};
+        if (get_compile_mode() == static_cast<int>(CompileMode::COMPILE_AND_RUN) &&
+            get_env<std::string>("HGGC_WARM_UP").empty())
+            DG_HGGC_RUNTIME_CHECK(hggcMemsetAsync(&p.signals->combine_done, 0, 2 * sizeof(int32_t), current_stream()));
+    }
     launch_mega_moe_kernel<Linear2Runtime, false, 8>(
         l2_args, gemm_profile("w4fa8_mma", rows, configs.expected_m, configs.l2));
-    combine_mega_moe(base, buffer, config.dispatch, sym_buffer, y, rank_idx, num_tokens);
+    if (!fused)
+        combine_mega_moe(base, buffer, config.dispatch, sym_buffer, y, rank_idx, num_tokens);
 }
 
 } // namespace deep_gemm::mega

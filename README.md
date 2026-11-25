@@ -552,6 +552,12 @@ example uses MXFP4 (W4A4). Both `mma_type="fp4xfp4"` and
 name `fp4xfp4`; either spelling can be used for pre-dispatch, including with
 a workspace created using the other spelling.
 
+Enqueue pre-dispatch and compute for each MegaMoE invocation on the same stream.
+Concurrent MegaMoE invocations on different streams on the same device are
+unsupported, even with separate symmetric workspaces. When switching streams,
+order the next invocation after the previous one completes. This also applies
+to Graph replay.
+
 ```python
 import torch
 import deep_gemm

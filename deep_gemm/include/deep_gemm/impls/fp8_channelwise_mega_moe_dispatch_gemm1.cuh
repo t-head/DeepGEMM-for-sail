@@ -151,7 +151,8 @@ template <
     uint32_t kBlockN, uint32_t kBlockK, uint32_t kWarpM,
     uint32_t kWarpN, uint32_t kStages, uint32_t kNumPullCTAs,
     GatedActivation Activation = GatedActivation::SwiGLU, class Gemm1Backend = void,
-    uint32_t kPullGroupSize = kNumPullCTAs / 3, uint32_t kGemm2BlockM = 0, bool kGemm2ValidRows = true>
+    uint32_t kPullGroupSize = kNumPullCTAs / 3, uint32_t kGemm2BlockM = 0, bool kGemm2ValidRows = true,
+    uint32_t kWorkBatch = 1>
 CUTLASS_DEVICE void dispatch_gemm1_device(
         void* workspace_base,
         const layout::SymBuffer<>& sym_buffer,
@@ -186,13 +187,16 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
                   "GEMM1 K must be divisible by BLOCK_K");
     static_assert(kNumThreads == (kBlockM / kWarpM) * (kBlockN / kWarpN) * 32,
                   "CTA threads must match the GEMM TiledMMA");
-    static_assert(kNumPullCTAs > 0 && kNumPullCTAs < kNumCTAs,
+    static_assert(kNumPullCTAs > 0 && (kNumCTAs == 0 || kNumPullCTAs < kNumCTAs),
                   "overlap requires separate pull and GEMM CTAs");
     static_assert(kPullGroupSize > 0 && kNumPullCTAs % kPullGroupSize == 0,
                   "pull groups must have equal producer counts");
+    static_assert(kWorkBatch > 0 && (kWorkBatch == 1 || !cute::is_same_v<Gemm1Backend, void>),
+                  "batched work requires a backend with epilogue ticket prefetch");
 
     extern __shared__ __align__(16) unsigned char smem_buf[];
     const uint32_t cta_idx = blockIdx.x;
+    const uint32_t num_ctas = kNumCTAs > 0 ? kNumCTAs : gridDim.x;
     const uint32_t thread_idx = threadIdx.x;
     const uint32_t warp_idx = thread_idx / 32;
     const uint32_t lane_idx = thread_idx % 32;
@@ -206,12 +210,12 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
     if (cta_idx == 0 && thread_idx == 0)
         *workspace.get_gemm1_work_count_ptr() = 0;
     for (uint32_t g = cta_idx * kNumThreads + thread_idx;
-         g < workspace.num_max_pool_tokens / kBlockM; g += kNumCTAs * kNumThreads)
+         g < workspace.num_max_pool_tokens / kBlockM; g += num_ctas * kNumThreads)
         *workspace.get_l1_arrival_count_ptr(g) = 0;
 
     mega_moe::detail::dispatch_handshake<
         kNumRanks, kNumCTAs, kNumThreads, kNumExperts, kNumExpertsPerRank,
-        kNumTopk, cute::is_same_v<Gemm1Backend, void>>(
+        kNumTopk, true>(
         workspace, sym_buffer, input_topk_idx, smem_expert_count, num_tokens,
         cta_idx, thread_idx);
 
@@ -338,9 +342,47 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
                     workspace.get_l1_arrival_count_ptr(g), 1u);
         }
     }
-    {
+    if constexpr (!cute::is_same_v<Gemm1Backend, void> && kBlockM >= 80) {
+        // Keep the wide W4A8 mainloop resident across work queue entries.
+        // Each entry uses the actual arrival count and valid rows of its dispatch tile.
+        struct PersistentScheduler {
+            const sched::DistributedMegaMoEBlocks<kNumExpertsPerRank, kBlockM>& blocks;
+            mega_moe::WorkQueue queue;
+            const uint32_t* arrivals;
+            sched::MegaMoEGemm1Scheduler route;
+            mega_moe::ArrivalCache ready;
+            uint32_t curr_group_idx = 0, curr_group_m = 0, pool_base = 0;
+
+            CUTLASS_DEVICE int64_t curr_offset_a() const { return int64_t(pool_base) * kTokenBytes; }
+            CUTLASS_DEVICE int64_t curr_offset_c() const { return 0; }
+
+            CUTLASS_DEVICE bool fetch_next_work(uint32_t& m, uint32_t& n) {
+                // Retire the epilogue before publishing another ticket in shared memory.
+                __syncthreads();
+                queue.prime(threadIdx.x);
+                uint32_t tile_m;
+                const uint32_t ticket = queue.current();
+                if (!route.select_work<kBlockM, kNumNBlocks>(ticket, tile_m, n, blocks))
+                    return false;
+                const uint32_t block = route.curr_global_block_m_idx;
+                curr_group_idx = route.curr_group_idx;
+                curr_group_m = mega_moe::detail::umin(kBlockM, route.curr_group_m - tile_m * kBlockM);
+                pool_base = block * kBlockM;
+                m = 0;
+                ready.wait(arrivals, block, block, blocks.total_blocks, kPullGroupSize);
+                return true;
+            }
+        };
+        PersistentScheduler scheduler{blocks, queue, workspace.get_l1_arrival_count_ptr(0)};
+        Gemm1Backend::template run_persistent<kGemm1N>(scheduler, token_pool, scale_pool,
+            reinterpret_cast<const uint8_t*>(gemm1_weight), reinterpret_cast<const uint8_t*>(gemm1_weight_scale),
+            reinterpret_cast<const uint8_t*>(gemm1_weight_replicas),
+            reinterpret_cast<const uint8_t*>(gemm1_weight_scale_replicas),
+            num_master_experts, swiglu_output, reinterpret_cast<char*>(smem_buf), swiglu_limit,
+            activation_alpha, weight_inv_scale, replica_inv_scale, situ_beta, situ_linear_beta);
+    } else {
         mega_moe::ArrivalCache ready;
-        queue.prime(thread_idx);
+        queue.prime(thread_idx, kWorkBatch);
         uint32_t prefetched_work = queue.current();
         __syncthreads(); // first claim only: every warp retires the shared word
         // Consumer CTAs schedule the complete grouped-GEMM work list while
@@ -356,8 +398,9 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
                 kBlockM, scheduler.curr_group_m - m_block * kBlockM);
             const uint32_t global_m_block = scheduler.curr_global_block_m_idx;
 
-            ready.wait(workspace.get_l1_arrival_count_ptr(0), global_m_block, global_m_block,
-                       total_m_blocks, kPullGroupSize);
+            if constexpr (cute::is_same_v<Gemm1Backend, void>)
+                ready.wait(workspace.get_l1_arrival_count_ptr(0), global_m_block, global_m_block,
+                           total_m_blocks, kPullGroupSize);
 
             const bool use_replica =
                 current_expert >= num_master_experts;
@@ -369,6 +412,10 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
             const auto* weight_scale_base = use_replica
                 ? gemm1_weight_scale_replicas : gemm1_weight_scale;
             if constexpr (!cute::is_same_v<Gemm1Backend, void>) {
+                const auto wait_for_input = [&ready, arrivals = workspace.get_l1_arrival_count_ptr(0),
+                                             global_m_block, total_m_blocks] {
+                    ready.wait(arrivals, global_m_block, global_m_block, total_m_blocks, kPullGroupSize);
+                };
                 Gemm1Backend::run(
                     token_pool + uint64_t(pool_base) * kTokenBytes, scale_pool + pool_base,
                     reinterpret_cast<const uint8_t*>(weight_base)
@@ -379,8 +426,12 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
                     kGemm1N / 2, valid_m, reinterpret_cast<char*>(smem_buf),
                     swiglu_limit, activation_alpha, use_replica ? replica_inv_scale : weight_inv_scale,
                     situ_beta, situ_linear_beta,
-                    queue_counter, &queue_ticket);
-                prefetched_work = queue.current();
+                    prefetched_work % kWorkBatch == kWorkBatch - 1 ? queue_counter : nullptr, &queue_ticket,
+                    wait_for_input);
+                // Finish consecutive tiles locally before consuming the next
+                // shared ticket prefetched by the final tile's epilogue.
+                prefetched_work = prefetched_work % kWorkBatch == kWorkBatch - 1
+                    ? queue.current() : prefetched_work + 1;
             } else {
                 mega_moe::fp8_channelwise::gemm1_swiglu_mma_block<Cfg, Activation>(
                     reinterpret_cast<const typename Cfg::ElementA*>(

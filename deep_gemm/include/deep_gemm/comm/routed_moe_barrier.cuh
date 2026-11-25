@@ -8,18 +8,19 @@
 
 namespace deep_gemm::comm {
 
-// Grid-wide barrier across all SMs of one rank, driven by a global counter.
-template <uint32_t kNumSMs, uint32_t kGridSyncIndex = 0,
+// Grid-wide barrier across all CTAs of one rank. Zero uses the launch grid.
+template <uint32_t kNumCTAs, uint32_t kGridSyncIndex = 0,
           uint32_t kPollBackoffCycles = 0, typename sync_scope_t>
 CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace,
                               const uint32_t& sm_idx, const uint32_t& thread_idx,
                               const sync_scope_t& sync_scope) {
     static constexpr uint32_t kFinishSumTag = 0x80000000u;
+    const uint32_t num_ctas = kNumCTAs > 0 ? kNumCTAs : gridDim.x;
     sync_scope();
     if (thread_idx == 0) {
         const auto count_ptr = workspace.get_grid_sync_count_ptr<kGridSyncIndex>();
         const auto old_value = tix::atomic_add_rel(
-            count_ptr, sm_idx == 0 ? (kFinishSumTag - (kNumSMs - 1)) : 1);
+            count_ptr, sm_idx == 0 ? (kFinishSumTag - (num_ctas - 1)) : 1);
         uint32_t new_value;
         const uint32_t poll_backoff_cycles =
             kPollBackoffCycles + ((sm_idx * 37u) & 255u);

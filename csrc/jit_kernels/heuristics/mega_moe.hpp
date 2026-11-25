@@ -81,6 +81,25 @@ static constexpr ReduceConfig select_reduce_config(int tokens, int hidden, int c
     return config;
 }
 
+static constexpr ReduceConfig select_w4a8_reduce_config(int tokens, int hidden, int cta_threads, int num_sms) {
+    auto config = select_reduce_config(tokens, hidden, cta_threads, num_sms);
+    if (tokens <= 128 && config.column_splits == 1) {
+        // The W4A8 reader can use any 256-column aligned partition. Keep the
+        // short-token split even when the first candidate does not divide N.
+        const int first = ceil_div(hidden, 8 * cta_threads);
+        for (int parts = first; parts <= hidden / 256; ++parts) {
+            if (hidden % parts == 0 && (hidden / parts) % 256 == 0) {
+                config.column_splits = parts;
+                break;
+            }
+        }
+        if (cta_threads > 128 && cta_threads % 128 == 0 &&
+            int64_t(tokens) * config.column_splits >= int64_t(num_sms) * (cta_threads / 128))
+            config.group_threads = 128;
+    }
+    return config;
+}
+
 template <class Config>
 static MegaMoEPhaseConfig make_phase_config(const Config& config) {
     const auto [num_sms, bm, bn, bk, wm, wn, stages, smem] = config;
@@ -301,6 +320,8 @@ struct Gemm1Config {
     bool fast_math = true;
     GatedActivation activation = GatedActivation::SwiGLU;
     w4fa8::FragmentPolicy fragment = w4fa8::FragmentPolicy::FullK;
+    int work_batch = 1;
+    bool batch_decode = false;
 };
 
 struct PreDispatchConfig {
@@ -330,6 +351,7 @@ struct ScatterConfig {
     int warp_n = 0;
     int num_sms = 0, warp_k = 0;
     w4fa8::FragmentPolicy fragment = w4fa8::FragmentPolicy::FullK;
+    w4fa8::ALoadPolicy a_load = w4fa8::ALoadPolicy::Bulk;
 };
 
 inline int fp8_gemm1_smem_size(const Gemm1Config& c, bool blockwise) {
@@ -663,26 +685,193 @@ inline int fp8_gemm1_ctas(const Gemm1Config& c, int tokens, int pulls) {
 }
 
 inline w4fa8::NativeKernelConfig w4a8_gemm_config(int expected, int n, int k, int groups,
-                                                 const std::optional<Tile>& tile) {
-    // Direct activation/scatter epilogues consume complete N256 tiles.
+                                                 const std::optional<Tile>& tile, bool scatter) {
+    // Activation consumes N128 groups; remote scatter requires N256 groups.
     // Keep these constraints inside selection, including shared-memory fitting.
     auto c = w4fa8::get_default_tile(expected, n, k, groups, GemmType::MGroupedNoPad, 256, false);
     if (!tile && expected <= std::numeric_limits<int>::max() / groups && w4fa8::supports_native_strategy() &&
         w4fa8::wide_tile_eligible(groups, expected * groups, n, k, GemmType::MGroupedNoPad))
         c = w4fa8::default_wide_config(expected, k, GemmType::MGroupedNoPad);
+    if (!tile && scatter && c.block_m == 32 && c.warp_n == 32) {
+        // Use the deeper K pipeline when shared memory and threads leave room
+        // for four CTAs per CU.
+        auto candidate = c;
+        candidate.warp_n = 64;
+        candidate.num_stages = 3;
+        const auto prop = device_runtime->get_prop();
+        constexpr int resident_ctas = 4;
+        if (w4fa8::fits_strategy(candidate, k) &&
+            w4fa8::get_num_threads(candidate) <= prop->maxThreadsPerMultiProcessor / resident_ctas &&
+            w4a8_scatter_smem_size(candidate, k) <= prop->sharedMemPerMultiprocessor / resident_ctas)
+            c = candidate;
+    }
+    // Two dense M tiles amortize the deeper K pipeline. Preserve room for two CTAs.
+    if (!tile && c.num_stages == 2 && c.block_m >= 128 && w4fa8::uses_ring_a(c.warp_m) &&
+        int64_t(expected) * 4 >= int64_t(c.block_m) * 7 && expected <= 2 * c.block_m) {
+        auto candidate = c;
+        candidate.num_stages = 3;
+        const auto prop = device_runtime->get_prop();
+        const int smem = scatter ? w4a8_scatter_smem_size(candidate, k) : w4fa8::get_smem_size(candidate, k);
+        if (w4fa8::fits_strategy(candidate, k) && smem <= prop->sharedMemPerMultiprocessor / 2 &&
+            w4fa8::get_num_threads(candidate) <= prop->maxThreadsPerMultiProcessor / 2)
+            c = candidate;
+    }
     if (tile) {
         const auto& [bm, bn, bk, wm, wn, stages] = *tile;
         c.block_m = bm; c.block_n = bn; c.block_k = bk;
         c.warp_m = wm; c.warp_n = wn; c.warp_k = bk; c.num_stages = stages;
     }
+    // Persistent M192 GEMM1 uses substantial local memory across activations
+    // and expert counts. Fall back to the next smaller tile for automatic selection.
+    if (!tile && !scatter && c.block_m == 192)
+        c.block_m = c.warp_m = 176;
+
     c.n_expand = 1;
     const auto spec = w4fa8::resolve_native_config(c, n, k);
     w4fa8::check_native_kernel(spec, n, k, groups, GemmType::MGroupedNoPad);
-    TORCH_CHECK(c.block_n % 256 == 0 && n % c.block_n == 0 && c.warp_k == c.block_k,
-                "W4A8 MegaMoE requires complete 256-column tiles and one K warp");
-    TORCH_CHECK(w4a8_scatter_smem_size(c, k) <= 256 * 1024,
+    const int alignment = scatter ? 256 : 128;
+    TORCH_CHECK(c.block_n % alignment == 0 && n % c.block_n == 0 && c.warp_k == c.block_k,
+                "W4A8 MegaMoE requires complete ", alignment, "-column tiles and one K warp");
+    TORCH_CHECK((scatter ? w4a8_scatter_smem_size(c, k) : w4fa8::get_smem_size(c, k)) <= 256 * 1024,
                 "W4A8 MegaMoE tile exceeds shared memory capacity");
     return spec;
+}
+
+inline void configure_w4a8_prefill_pull(Gemm1Config& c, int expected, const Gemm1Tuning& tuning) {
+    constexpr int max_teams = 3;
+    auto& dispatch = c.dispatch;
+    const auto& tile = c.tile;
+    dispatch.pull_ctas = tuning.pull_ctas.value_or(std::min(6, c.num_ctas - 1));
+    dispatch.pull_group_size = dispatch.pull_ctas >= max_teams && dispatch.pull_ctas % max_teams == 0
+        ? channel_pull_group_size(c, expected) : 1;
+    if (tuning.pull_ctas)
+        return;
+
+    const bool full_k_m64 = tile.block_m == 64 && tile.warp_m == 64 && tile.warp_n == 64 &&
+                            tile.num_stages == 2 && c.fragment == w4fa8::FragmentPolicy::FullK &&
+                            dispatch.token_bytes >= 512;
+    const bool rolling_k = w4fa8::uses_ring_a(tile.warp_m) &&
+                           c.fragment == w4fa8::FragmentPolicy::RollingK32 &&
+                           int64_t(expected) * 4 >= tile.block_m * 3;
+    if (!full_k_m64 && !rolling_k)
+        return;
+
+    const int64_t m_blocks = int64_t(dispatch.num_experts_per_rank) * ceil_div(expected, tile.block_m);
+    const int64_t jobs = m_blocks * (c.n / tile.block_n);
+    const int teams = std::min<int64_t>({max_teams, c.num_ctas - 1, m_blocks});
+    // Reserve more of the resident grid for compute in long queues, where
+    // each ready M block fans out over many N tiles.
+    const bool long_queue = rolling_k && jobs > int64_t(c.num_ctas) * 6;
+    const int budget = std::min(tile.num_sms - 1, c.num_ctas / (full_k_m64 ? 4 : long_queue ? 6 : 3));
+    if (rolling_k && (teams < max_teams || budget < 2 * teams || (tuning.tile && !long_queue)))
+        return;
+
+    const int warps = c.num_threads / 32;
+    // Four batches per pull CTA reduce transport setup in long queues.
+    int batches = 1;
+    if (long_queue)
+        batches = 4;
+    else if (rolling_k && (tile.block_m >= 128 || expected > tile.block_m || jobs > int64_t(c.num_ctas) * 4))
+        batches = 2;
+    dispatch.pull_group_size = std::min(ceil_div(std::min(expected, tile.block_m), warps * batches),
+                                        std::max(1, budget / teams));
+    dispatch.pull_ctas = teams * dispatch.pull_group_size;
+}
+
+inline Gemm1Config w4a8_gemm1_config(Gemm1Config c, int n, int expected, const Gemm1Tuning& tuning) {
+    const int hidden = c.dispatch.token_bytes;
+    auto spec = w4a8_gemm_config(expected, n, hidden, c.dispatch.num_experts_per_rank,
+                                tuning.tile, /*scatter=*/false);
+    const auto prop = device_runtime->get_prop();
+    const auto storage = [&](const w4fa8::W4A8Config& tile) {
+        const int64_t pull = int64_t(w4fa8::get_num_threads(tile) / 32) * hidden +
+                             ceil_div(int64_t(c.dispatch.num_experts) * 4, int64_t(16)) * 16;
+        return std::max<int64_t>(w4fa8::get_smem_size(tile, hidden), pull);
+    };
+    const auto residency = [&](const w4fa8::W4A8Config& tile) {
+        return std::min({8, prop->maxThreadsPerMultiProcessor / w4fa8::get_num_threads(tile),
+                         int(prop->sharedMemPerMultiprocessor / storage(tile))});
+    };
+    constexpr int narrow_pull_teams = 3;
+    int narrow_pull_group = 0;
+    if (!tuning.tile && !tuning.pull_ctas && spec.tile.block_m == 32 && spec.tile.warp_n == 32 &&
+        c.dispatch.num_experts_per_rank >= narrow_pull_teams) {
+        auto candidate = spec.tile;
+        candidate.block_n = 128;
+        // The narrower tile has fewer producer warps. Give each team enough
+        // warps to stage three quarters of the rows in one batch.
+        const int warps = w4fa8::get_num_threads(candidate) / 32;
+        const int group = ceil_div(3 * candidate.block_m / 4, warps);
+        const int pulls = narrow_pull_teams * group;
+        if (c.tile.num_sms > pulls && int64_t(c.tile.num_sms) * residency(candidate) >= 4 * pulls &&
+            storage(candidate) <= prop->sharedMemPerBlockOptin) {
+            w4fa8::check_native_kernel({candidate, spec.fragment}, n, hidden,
+                                       c.dispatch.num_experts_per_rank, GemmType::MGroupedNoPad);
+            spec.tile = candidate;
+            narrow_pull_group = group;
+        }
+    }
+    // A wider N tile amortizes setup. Require complete tiles, enough work for
+    // four CTAs per configured CU, and no loss of the shared-memory warp budget.
+    if (!tuning.tile && spec.tile.block_m == 16 && spec.tile.warp_n == 64 && hidden >= 512 &&
+        n % 384 == 0 && int64_t(c.dispatch.num_experts_per_rank) * (n / 384) >= int64_t(c.tile.num_sms) * 4) {
+        auto candidate = spec.tile;
+        candidate.block_n = 384;
+        if (storage(candidate) <= prop->sharedMemPerBlockOptin &&
+            residency(candidate) * w4fa8::get_num_threads(candidate) >=
+                residency(spec.tile) * w4fa8::get_num_threads(spec.tile)) {
+            w4fa8::check_native_kernel({candidate, spec.fragment}, n, hidden,
+                                       c.dispatch.num_experts_per_rank, GemmType::MGroupedNoPad);
+            spec.tile = candidate;
+        }
+    }
+    const auto& tile = spec.tile;
+    c.n = n;
+    c.k = hidden;
+    c.dispatch.block_m = tile.block_m;
+    c.tile.block_m = tile.block_m; c.tile.block_n = tile.block_n; c.tile.block_k = tile.block_k;
+    c.tile.warp_m = tile.warp_m; c.tile.warp_n = tile.warp_n; c.warp_k = tile.warp_k;
+    c.tile.num_stages = tile.num_stages;
+    c.fragment = spec.fragment;
+    c.num_threads = w4fa8::get_num_threads(tile);
+    const int64_t smem = storage(tile);
+    TORCH_CHECK(smem <= prop->sharedMemPerBlockOptin, "W4A8 GEMM1 exceeds shared memory capacity");
+    c.tile.smem_size = int(smem);
+    const int resident = residency(tile);
+    TORCH_CHECK(resident > 0, "W4A8 GEMM1 cannot keep a CTA resident");
+    c.num_ctas = c.tile.num_sms * resident;
+    TORCH_CHECK(c.num_ctas > 1, "W4A8 GEMM1 requires pull and compute CTAs");
+    const bool small_full = tile.block_m == 16 && tile.warp_n == 64 && tile.num_stages == 2 &&
+                            spec.fragment == w4fa8::FragmentPolicy::FullK && hidden >= 512;
+    if (small_full) {
+        // Each warp stages one row. Use the host estimate only for budgeting;
+        // the device still handles every expert's actual rows and M blocks.
+        const int warps = c.num_threads / 32;
+        const int max_pulls = std::min(c.num_ctas, prop->multiProcessorCount) - 1;
+        const int group = std::min(max_pulls, ceil_div(std::min(expected, tile.block_m), warps));
+        const int m_blocks = c.dispatch.num_experts_per_rank * ceil_div(expected, tile.block_m);
+        const int budget = std::max(group, std::min({max_pulls, c.tile.num_sms, c.num_ctas / 4}));
+        const int teams = std::max(1, std::min(m_blocks, budget / group));
+        c.dispatch.pull_group_size = group;
+        c.dispatch.pull_ctas = tuning.pull_ctas.value_or(teams * group);
+        TORCH_CHECK(c.dispatch.pull_ctas % group == 0, "W4A8 pull CTAs must form complete row groups");
+        c.batch_decode = true;
+        const int n_tiles = n / tile.block_n;
+        const int64_t jobs = int64_t(m_blocks) * n_tiles;
+        // Pairing tasks must not add a whole tile wave at the end of a call.
+        const int64_t waves = ceil_div(jobs, int64_t(c.num_ctas));
+        c.work_batch = n_tiles % 2 == 0 && waves % 2 == 0 &&
+                       jobs >= int64_t(c.num_ctas - c.dispatch.pull_ctas) * 2 ? 2 : 1;
+    } else if (narrow_pull_group > 0) {
+        c.dispatch.pull_group_size = narrow_pull_group;
+        c.dispatch.pull_ctas = narrow_pull_teams * narrow_pull_group;
+    } else {
+        configure_w4a8_prefill_pull(c, expected, tuning);
+    }
+    TORCH_CHECK(c.dispatch.pull_ctas > 0 && c.dispatch.pull_ctas < c.num_ctas &&
+                c.dispatch.pull_ctas % c.dispatch.pull_group_size == 0,
+                "W4A8 GEMM1 requires complete pull groups and compute CTAs");
+    return c;
 }
 
 struct MegaMoEPrecisionConfigs {
@@ -718,24 +907,9 @@ inline const MegaMoEPrecisionConfigs& get_mega_moe_precision_configs(
         g2.num_threads = deep_gemm_w4a16_common::get_num_threads(tile, true);
         g2.smem_size = w4a16_scatter_smem_size(tile);
     } else if (precision == Precision::W4A8) {
-        const auto g1 = w4a8_gemm_config(expected, 2 * intermediate, hidden, groups, tuning.gemm1.tile);
         auto c = make_gemm1_config(ranks, experts, topk, capacity, hidden, sizeof(float));
-        c.dispatch.block_m = g1.tile.block_m;
-        c.tile.block_m = g1.tile.block_m; c.tile.block_n = g1.tile.block_n; c.tile.block_k = g1.tile.block_k;
-        c.tile.warp_m = g1.tile.warp_m; c.tile.warp_n = g1.tile.warp_n; c.warp_k = g1.tile.warp_k;
-        c.tile.num_stages = g1.tile.num_stages;
-        c.fragment = g1.fragment;
-        c.num_threads = w4fa8::get_num_threads(g1.tile);
-        const int64_t pull_smem = int64_t(c.num_threads / 32) * hidden + ((int64_t(experts) * 4 + 15) / 16 * 16);
-        TORCH_CHECK(pull_smem <= 256 * 1024, "W4A8 pull staging exceeds shared memory capacity");
-        c.dispatch.pull_ctas = tuning.gemm1.pull_ctas.value_or(6);
-        TORCH_CHECK(c.dispatch.pull_ctas > 0 && c.dispatch.pull_ctas < c.tile.num_sms && c.dispatch.pull_ctas % 3 == 0,
-                    "W4A8 pull CTAs must be a positive multiple of 3 below num_sms");
-        c.tile.smem_size = std::max<int64_t>(w4fa8::get_smem_size(g1.tile, hidden), pull_smem);
-        const int resident = int(device_runtime->get_prop()->sharedMemPerMultiprocessor / c.tile.smem_size);
-        c.num_ctas = c.tile.num_sms * std::clamp(resident, 1, 8);
-        result.l1 = c;
-        const auto g2 = w4a8_gemm_config(expected, hidden, intermediate, groups, tuning.gemm2.tile);
+        result.l1 = w4a8_gemm1_config(c, 2 * intermediate, expected, tuning.gemm1);
+        const auto g2 = w4a8_gemm_config(expected, hidden, intermediate, groups, tuning.gemm2.tile, /*scatter=*/true);
         auto& scatter = result.l2;
         scatter.num_sms = g2.tile.num_sms;
         scatter.block_m = g2.tile.block_m; scatter.block_n = g2.tile.block_n; scatter.block_k = g2.tile.block_k;
@@ -744,6 +918,13 @@ inline const MegaMoEPrecisionConfigs& get_mega_moe_precision_configs(
         scatter.num_threads = w4fa8::get_num_threads(g2.tile);
         scatter.smem_size = w4a8_scatter_smem_size(g2.tile, intermediate);
         scatter.fragment = g2.fragment;
+        scatter.a_load = g2.a_load();
+        // Ring3 avoids spilling the M128 scatter epilogue even when most
+        // experts fit in one tile. M112 benefits on the multi-tile path.
+        if (!tuning.gemm2.tile &&
+            (g2.tile.block_m == 128 || (g2.tile.block_m == 112 && g2.tile.num_stages == 2 &&
+                                      expected > g2.tile.block_m)))
+            scatter.a_load = w4fa8::ALoadPolicy::Ring3;
     } else {
         const bool blockwise = precision == Precision::FP8Blockwise;
         auto c = make_fp8_gemm1_config(ranks, experts, topk, hidden, capacity, std::nullopt, blockwise);
@@ -768,7 +949,7 @@ inline const MegaMoEPrecisionConfigs& get_mega_moe_precision_configs(
     auto& g2 = result.l2;
     g2.n = hidden; g2.k = intermediate;
     g2.num_ranks = ranks; g2.num_groups = groups; g2.num_master_groups = masters;
-    if (precision == Precision::FP8Channelwise || precision == Precision::W4A8)
+    if (precision == Precision::FP8Channelwise)
         g1.dispatch.pull_group_size = channel_pull_group_size(g1, expected);
     if (groups >= 128) {
         g1.metadata.block_m = g2.block_m;

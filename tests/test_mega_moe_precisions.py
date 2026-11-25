@@ -104,6 +104,8 @@ CASES = (
                precision="w4a8", routing="random", reference_tokens=129),
     MegaMoECase("smoke_w4a8_situ", 512, 512, 16, 2, 129, tokens=(1, 0, 33, 129, 8),
                activation="situ", precision="w4a8", routing="random", reference_tokens=129),
+    MegaMoECase("w4a8_n384_boundary", 512, 2304, 128, 2, 129, tokens=(1, 128, 120, 8, 0),
+               worlds=(8,), precision="w4a8", routing="random", reference_tokens=129),
     MegaMoECase("deepseek_v4_pro_w4a8", 7168, 3072, 384, 6, 4096, tokens=(32, *MODEL_TOKENS),
                worlds=(8,), precision="w4a8", routing="random", reference_tokens=8),
     MegaMoECase("kimi_k3_w4a8", 3584, 3072, 896, 16, 4096,

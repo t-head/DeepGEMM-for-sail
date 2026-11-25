@@ -108,10 +108,14 @@ struct RoutedMoESignals {
     alignas(16) int64_t peer_offsets[kNumMaxRanks];
     alignas(128) int32_t combine_flag;
     alignas(128) int32_t combine_done;
+    int32_t combine_cta_count;  // Reset together with combine_done for fused scatter/reduce.
     alignas(128) uint64_t expert_send_count[kNumMaxExperts];
     alignas(128) uint64_t expert_recv_count[kNumMaxExperts];
     alignas(128) uint64_t expert_recv_count_sum[kNumMaxExpertsPerRank];
 };
+
+static_assert(offsetof(RoutedMoESignals, combine_cta_count) ==
+              offsetof(RoutedMoESignals, combine_done) + sizeof(int32_t));
 
 struct Workspace {
     void* base;
