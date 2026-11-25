@@ -127,7 +127,7 @@ int dual_b_checks() {
     i.block_m = 128; i.block_n = 128; i.block_k = 64;
     i.warp_m = 32; i.warp_n = 64; i.warp_k = 64; i.num_stages = 4;
     i.gemm_type = "Normal"; i.kernel_name = "test_dual_b";
-    i.min_blocks = 1; i.kloop_unroll = 1; i.decode_split_k = 1;
+    i.decode_split_k = 1;
     i.packed_store = true;
     args.kernel_params.M = 256; args.kernel_params.N = 384; args.kernel_params.K = 7168;
     int count = tile_checks<Runtime>(args);
@@ -135,22 +135,13 @@ int dual_b_checks() {
     count += check_change<Runtime>(args, [](auto& a) { a.launch_info.field = value; }, #field)
     CHECK_DUAL(warp_k, 32);
     CHECK_DUAL(gemm_type, "MGroupedContiguous");
-    CHECK_DUAL(full_k_prefetch, true);
     CHECK_DUAL(early_g2s, true);
     CHECK_DUAL(mma_s2r_overlap, true);
-    CHECK_DUAL(bounded_kloop, true);
-    CHECK_DUAL(kloop_unroll, 2);
-    CHECK_DUAL(kloop_chunk, true);
     CHECK_DUAL(overlap_prologue, true);
     CHECK_DUAL(valid_epilogue, true);
     CHECK_DUAL(packed_dual_n, true);
     CHECK_DUAL(static_router, true);
     CHECK_DUAL(static_stages, true);
-    CHECK_DUAL(streamed_low, true);
-    CHECK_DUAL(standard_s2, true);
-    CHECK_DUAL(streamed_pairs, true);
-    CHECK_DUAL(min_blocks, 2);
-    CHECK_DUAL(pairs_m_first, true);
     CHECK_DUAL(decode_split_k, 2);
     CHECK_DUAL(packed_store, false);
     CHECK_DUAL(cta_k, true);
@@ -169,40 +160,147 @@ int dual_b_checks() {
     count += check_change<Runtime>(args, [](auto& a) { a.kernel_params.M += 1; }, "static M");
     count += check_change<Runtime>(args, [](auto& a) { a.kernel_params.N += 128; }, "static N");
     count += check_change<Runtime>(args, [](auto& a) { a.kernel_params.K += 64; }, "static K");
+    const auto source = Runtime::generate_impl(args);
+    for (const char* fixed : {
+        "#define DG_DUAL_B_FULL_K_PREFETCH 0\n", "#define DG_DUAL_B_BOUNDED_KLOOP 0\n",
+        "#define DG_DUAL_B_KLOOP_UNROLL 1\n", "#define DG_DUAL_B_KLOOP_CHUNK 0\n",
+        "#define DG_DUAL_B_STREAMED_LOW 0\n", "#define DG_DUAL_B_STREAMED_PAIRS 0\n",
+        "#define DG_DUAL_B_PAIRS_M_FIRST 0\n",
+        "__launch_bounds__(deep_gemm::Kernel::MaxThreadsPerBlock, 1)",
+        "BF16xFp32GemmCuteFreeKernel<128, 128, 64, 32, 64, 64, 4, true, true,"}) {
+        if (source.find(fixed) == std::string::npos)
+            throw std::runtime_error("fixed dual-B codegen default mismatch");
+        ++count;
+    }
     return count;
 }
 
 int dual_b_lut_checks() {
+    using namespace dual_b;
     int count = 0;
-    const int shapes[] = {8,16,128,256,512,1024,2048,4096,8192,16384};
-    const int smem[] = {65536,65536,143360,245760,143360,163840,229376,221184,221184,262144};
-    for (int index = 0; index < 10; ++index) {
-        const dual_b::ExactKey key{shapes[index],384,7168,at::kBFloat16,AC_PPU0015};
-        const auto* cfg = dual_b::exact_config(key,39,1.0/256,false);
-        if (!cfg || !(cfg->key == key)
-            || dual_b::shared_storage_bytes(cfg->bm,cfg->bn,cfg->bk,cfg->wm,cfg->wn,cfg->wk,
-                cfg->stages,cfg->has(dual_b::PackedN),cfg->decode_split_k,cfg->has(dual_b::CtaK)) != smem[index])
-            throw std::runtime_error("exact LUT key or resource mismatch");
+    struct Expected {
+        int m, n, k;
+        at::ScalarType dtype;
+        int bm, bn, bk, wm, wn, wk, stages, fixed_grid, grid, smem;
+        unsigned pipeline;
+        int split_k, k_order;
+    };
+    const Expected cases[] = {
+        {8,384,7168,at::kBFloat16,16,16,128,16,16,128,4,48,48,65536,PackedStore|StaticShape|PackedN,2,0},
+        {16,384,7168,at::kBFloat16,16,16,128,16,16,128,4,48,48,65536,PackedStore|StaticShape|PackedN,2,0},
+        {128,384,7168,at::kBFloat16,48,32,128,16,16,128,5,36,36,143360,PackedStore|StaticShape|OneTile,1,0},
+        {256,384,7168,at::kBFloat16,96,32,128,48,16,64,6,36,36,245760,PackedStore|StaticShape|OneTile|CtaK,1,0},
+        {512,384,7168,at::kBFloat16,96,64,64,48,16,64,5,36,36,143360,PackedStore|StaticShape|OneTile|MmaS2ROverlap,1,0},
+        {1024,384,7168,at::kBFloat16,192,64,64,48,32,64,4,36,36,163840,PackedStore|StaticShape|OneTile|MmaS2ROverlap,1,0},
+        {2048,384,7168,at::kBFloat16,256,96,64,32,48,64,4,32,32,229376,PackedStore|StaticShape|OverlapPrologue,1,0},
+        {4096,384,7168,at::kBFloat16,320,128,64,80,32,64,3,39,39,221184,PackedStore,1,0},
+        {8192,384,7168,at::kBFloat16,320,128,64,80,32,64,3,39,39,221184,PackedStore|StaticShape|OverlapPrologue|ValidEpilogue,1,1},
+        {16384,384,7168,at::kBFloat16,256,128,64,64,32,64,4,39,39,262144,PackedStore|StaticShape|OverlapPrologue|ValidEpilogue|StaticStages,1,6},
+        {32768,384,7168,at::kBFloat16,256,128,64,64,16,64,4,0,39,262144,0,1,0},
+        {8,384,7168,at::kFloat,16,16,128,16,16,128,4,0,48,65536,StaticShape|PackedN,2,0},
+        {16,384,7168,at::kFloat,16,16,128,16,16,128,4,0,48,65536,StaticShape|PackedN,2,0},
+        {128,384,7168,at::kFloat,64,32,128,16,16,128,4,0,24,131072,StaticShape|EarlyG2S,1,0},
+        {256,384,7168,at::kFloat,96,32,64,32,16,64,7,0,36,143360,StaticShape|EarlyG2S,1,0},
+        {512,384,7168,at::kFloat,128,64,64,32,16,64,4,0,24,131072,StaticShape,1,0},
+        {1024,384,7168,at::kFloat,192,64,64,32,16,64,4,0,36,163840,0,1,0},
+        {2048,384,7168,at::kFloat,128,192,64,32,32,64,4,0,32,262144,0,1,0},
+        {4096,384,7168,at::kFloat,320,128,64,80,32,64,2,0,39,147456,StaticShape|ValidEpilogue,1,0},
+        {8192,384,7168,at::kFloat,320,128,64,80,32,64,3,0,39,221184,0,1,0},
+        {16384,384,7168,at::kFloat,256,128,64,64,32,64,4,0,39,262144,StaticShape|OverlapPrologue|ValidEpilogue,1,0},
+        {32768,384,7168,at::kFloat,256,128,64,64,16,64,4,0,39,262144,0,1,0},
+        {512,2048,4096,at::kBFloat16,128,256,64,64,32,64,3,0,32,245760,0,1,0},
+        {512,2048,4096,at::kFloat,128,256,64,64,32,64,3,0,32,245760,0,1,0},
+    };
+    for (const auto& e : cases) {
+        const ExactKey key{e.m,e.n,e.k,e.dtype,AC_PPU0015,39};
+        const auto* cfg = exact_config(key,false,false);
+        if (!cfg || !(cfg->key == key))
+            throw std::runtime_error("exact LUT key mismatch");
+        const auto geometry = std::make_tuple(cfg->bm,cfg->bn,cfg->bk,cfg->wm,cfg->wn,cfg->wk,cfg->stages);
+        const auto wanted = std::make_tuple(e.bm,e.bn,e.bk,e.wm,e.wn,e.wk,e.stages);
+        if (geometry != wanted || cfg->grid != e.fixed_grid || cfg->pipeline != e.pipeline
+            || cfg->decode_split_k != e.split_k || cfg->k_order != e.k_order)
+            throw std::runtime_error("LUT geometry or pipeline mismatch");
+        const int smem = shared_storage_bytes(cfg->bm,cfg->bn,cfg->bk,cfg->wm,cfg->wn,cfg->wk,
+            cfg->stages,cfg->has(PackedN),cfg->decode_split_k,cfg->has(CtaK));
+        if (smem != e.smem || smem > 256 * 1024)
+            throw std::runtime_error("LUT shared storage mismatch");
+        const int output_tiles = ceil_div(key.m,cfg->bm) * ceil_div(key.n,cfg->has(PackedN) ? cfg->bn/2 : cfg->bn);
+        const int grid = cfg->grid > 0 ? cfg->grid : std::min((256 * 1024 / smem) * key.num_sms,output_tiles);
+        if (grid != e.grid || grid > output_tiles || (cfg->has(OneTile) && grid != output_tiles))
+            throw std::runtime_error("LUT launch grid mismatch");
         ++count;
-        const dual_b::ExactKey misses[] = {
-            {key.m+1,key.n,key.k,key.output_dtype,key.soc},
-            {key.m,key.n+2,key.k,key.output_dtype,key.soc},
-            {key.m,key.n,key.k+64,key.output_dtype,key.soc},
-            {key.m,key.n,key.k,at::kFloat,key.soc},
-            {key.m,key.n,key.k,at::kHalf,key.soc},
-            {key.m,key.n,key.k,key.output_dtype,AC_PPU0010},
-            {key.m,key.n,key.k,key.output_dtype,AC_PPU_MAX_ARCH},
+        const ExactKey misses[] = {
+            {key.m+1,key.n,key.k,key.output_dtype,key.soc,key.num_sms},
+            {key.m,key.n+2,key.k,key.output_dtype,key.soc,key.num_sms},
+            {key.m,key.n,key.k+64,key.output_dtype,key.soc,key.num_sms},
+            {key.m,key.n,key.k,at::kHalf,key.soc,key.num_sms},
+            {key.m,key.n,key.k,key.output_dtype,AC_PPU0010,key.num_sms},
+            {key.m,key.n,key.k,key.output_dtype,AC_PPU_MAX_ARCH,key.num_sms},
+            {key.m,key.n,key.k,key.output_dtype,key.soc,20},
+            {key.m,key.n,key.k,key.output_dtype,key.soc,38},
+            {key.m,key.n,key.k,key.output_dtype,key.soc,40},
+            {key.m,key.n,key.k,key.output_dtype,key.soc,64},
         };
         for (const auto& other : misses) {
-            if (key == other || other == key || dual_b::exact_config(other,39,1.0/256,false))
+            if (key == other || other == key || exact_config(other,false,false) || exact_config(other,false,true))
                 throw std::runtime_error("non-exact LUT key hit");
             ++count;
         }
-        if (dual_b::exact_config(key,20,1.0/256,false)
-            || dual_b::exact_config(key,39,std::nextafter(1.0/256,1.0),false)
-            || dual_b::exact_config(key,39,1.0/256,true))
-            throw std::runtime_error("LUT eligibility guard bypassed");
+        auto other_dtype = key;
+        other_dtype.output_dtype = key.output_dtype == at::kFloat ? at::kBFloat16 : at::kFloat;
+        const auto* other_cfg = exact_config(other_dtype,false,false);
+        bool other_expected = false;
+        for (const auto& candidate : cases)
+            other_expected |= candidate.m == key.m && candidate.n == key.n && candidate.k == key.k
+                && candidate.dtype == other_dtype.output_dtype;
+        if (key == other_dtype || other_dtype == key || bool(other_cfg) != other_expected
+            || (other_cfg && (other_cfg == cfg || !(other_cfg->key == other_dtype))))
+            throw std::runtime_error("LUT output dtype mismatch");
         ++count;
+        if (exact_config(key,true,false) || exact_config(key,true,true))
+            throw std::runtime_error("explicit config priority bypassed");
+        const auto* rtc_cfg = exact_config(key,false,true);
+        if (rtc_cfg != (cfg->has(PackedStore) ? nullptr : cfg))
+            throw std::runtime_error("LUT backend eligibility mismatch");
+        ++count;
+        auto check_codegen = [&](auto output) {
+            using Runtime = DenseBf16xFp32GemmCuteFreeRuntimeT<decltype(output)>;
+            typename Runtime::Args args{};
+            args.launch_info = {cfg->bm,cfg->bn,cfg->bk,cfg->wm,cfg->wn,cfg->wk,cfg->stages,
+                "Normal","test_dual_b_lut",cfg->has(EarlyG2S),cfg->has(MmaS2ROverlap),
+                cfg->has(OverlapPrologue),cfg->has(ValidEpilogue),cfg->has(PackedN),cfg->has(StaticShape),
+                cfg->has(StaticStages),cfg->decode_split_k,cfg->has(PackedStore),cfg->has(CtaK),
+                cfg->has(OneTile),cfg->k_order};
+            args.kernel_params.M = key.m; args.kernel_params.N = key.n; args.kernel_params.K = key.k;
+            const auto source = Runtime::generate_impl(args);
+            const std::pair<const char*,int> macros[] = {
+                {"DG_DUAL_B_EARLY_G2S",cfg->has(EarlyG2S)},
+                {"DG_DUAL_B_MMA_S2R_OVERLAP",cfg->has(MmaS2ROverlap)},
+                {"DG_DUAL_B_OVERLAP_PROLOGUE",cfg->has(OverlapPrologue)},
+                {"DG_DUAL_B_VALID_EPILOGUE",cfg->has(ValidEpilogue)},
+                {"DG_DUAL_B_PACKED_N",cfg->has(PackedN)},
+                {"DG_DUAL_B_ROUTER_M",cfg->has(StaticShape) ? key.m : 0},
+                {"DG_DUAL_B_ROUTER_N",cfg->has(StaticShape) ? key.n : 0},
+                {"DG_DUAL_B_ROUTER_K",cfg->has(StaticShape) ? key.k : 0},
+                {"DG_DUAL_B_STATIC_STAGES",cfg->has(StaticStages)},
+                {"DG_DUAL_B_DECODE_SPLIT_K",cfg->decode_split_k},
+            };
+            for (const auto& [name,value] : macros) {
+                if (source.find(fmt::format("#define {} {}\n",name,value)) == std::string::npos)
+                    throw std::runtime_error("LUT codegen macro mismatch");
+                ++count;
+            }
+            const auto packed = fmt::format("#define DG_BFOUT_PACKED_STORE 1\n#define DG_BFOUT_CTA_K {}\n"
+                "#define DG_BFOUT_ONE_TILE {}\n#define DG_DUAL_B_K_ORDER {}\n",
+                int(cfg->has(CtaK)),int(cfg->has(OneTile)),cfg->k_order);
+            if ((source.find(packed) != std::string::npos) != cfg->has(PackedStore)
+                || source.find(fmt::format("Kernel::SharedStorageSize == {}",e.smem)) == std::string::npos)
+                throw std::runtime_error("LUT codegen storage mismatch");
+            ++count;
+        };
+        if (key.output_dtype == at::kFloat) check_codegen(float{});
+        else check_codegen(cutlass::bfloat16_t{});
     }
     return count;
 }

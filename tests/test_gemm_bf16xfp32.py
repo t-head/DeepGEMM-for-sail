@@ -188,10 +188,6 @@ def router_ppu1v5(monkeypatch, ppu1v5):
     if torch.cuda.get_device_capability() != (8, 9):
         pytest.skip("router fusion regression requires PPU1.5")
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
-    # Exercise automatic defaults without inherited tuning overrides.
-    for name in tuple(os.environ):
-        if name.startswith("DG_BF16XFP32_"):
-            monkeypatch.delenv(name)
 
 
 def _check_bf16xfp32_router_case(m, use_fp32_output, api):
@@ -298,31 +294,6 @@ def test_gemm_bf16xfp32_exact_and_guard(shape, use_fp32_output, api):
 
 
 @pytest.mark.usefixtures("router_ppu1v5")
-@pytest.mark.parametrize("m, expected", [(1024, "ThreadblockShape[192, 64, 64]"),
-                                       (2048, "ThreadblockShape[128, 192, 64]")])
-def test_gemm_bf16xfp32_measured_lut_and_explicit_priority(m, expected, monkeypatch, capfd):
-    import ctypes
-    libc = ctypes.CDLL(None)
-    previous_sms = deep_gemm.get_num_sms()
-    monkeypatch.setenv("show_log", "1")
-    try:
-        deep_gemm.set_num_sms(39)
-        x, high, low, scale, gt = _make_case(m, 384, 7168)
-        actual = _call_api("default", x, high, low, scale, True)
-        torch.cuda.synchronize()
-        _assert_accuracy(actual, *gt)
-        libc.fflush(None)
-        assert expected in capfd.readouterr().out
-        actual = _call_api("explicit", x, high, low, scale, True)
-        torch.cuda.synchronize()
-        _assert_accuracy(actual, *gt)
-        libc.fflush(None)
-        assert "ThreadblockShape[64, 64, 64]" in capfd.readouterr().out
-    finally:
-        deep_gemm.set_num_sms(previous_sms)
-
-
-@pytest.mark.usefixtures("router_ppu1v5")
 def test_gemm_bf16xfp32_tile_cache_is_not_tensor_cache():
     previous_sms = deep_gemm.get_num_sms()
     try:
@@ -343,45 +314,74 @@ def test_gemm_bf16xfp32_tile_cache_is_not_tensor_cache():
 
 
 @pytest.mark.usefixtures("router_ppu1v5")
-@pytest.mark.parametrize("m, tile, stages, grid, smem", [
-    (8, (16, 16, 128), 4, 48, 65536),
-    (16, (16, 16, 128), 4, 48, 65536),
-    (128, (48, 32, 128), 5, 36, 143360),
-    (256, (96, 32, 128), 6, 36, 245760),
-    (512, (96, 64, 64), 5, 36, 143360),
-    (1024, (192, 64, 64), 4, 36, 163840),
-    (2048, (256, 96, 64), 4, 32, 229376),
-    (4096, (320, 128, 64), 3, 39, 221184),
-    (8192, (320, 128, 64), 3, 39, 221184),
-    (16384, (256, 128, 64), 4, 39, 262144),
+@pytest.mark.parametrize(
+    "m, n, k, use_fp32_output, tile, warp, stages, grid, smem, pipeline, static_router, static_stages, split_k, cta_k, k_order", [
+    (8,384,7168,False,(16,16,128),(16,16,128),4,48,65536,"packed_dual_n",1,0,2,0,0),
+    (16,384,7168,False,(16,16,128),(16,16,128),4,48,65536,"packed_dual_n",1,0,2,0,0),
+    (128,384,7168,False,(48,32,128),(16,16,128),5,36,143360,"double_buffer",1,0,1,0,0),
+    (256,384,7168,False,(96,32,128),(48,16,64),6,36,245760,"double_buffer",1,0,1,1,0),
+    (512,384,7168,False,(96,64,64),(48,16,64),5,36,143360,"mma_s2r_overlap",1,0,1,0,0),
+    (1024,384,7168,False,(192,64,64),(48,32,64),4,36,163840,"mma_s2r_overlap",1,0,1,0,0),
+    (2048,384,7168,False,(256,96,64),(32,48,64),4,32,229376,"overlap_prologue",1,0,1,0,0),
+    (4096,384,7168,False,(320,128,64),(80,32,64),3,39,221184,"double_buffer",0,0,1,0,0),
+    (8192,384,7168,False,(320,128,64),(80,32,64),3,39,221184,"overlap_valid",1,0,1,0,1),
+    (16384,384,7168,False,(256,128,64),(64,32,64),4,39,262144,"overlap_valid",1,1,1,0,6),
+    (32768,384,7168,False,(256,128,64),(64,16,64),4,39,262144,"double_buffer",0,0,1,0,0),
+    (8,384,7168,True,(16,16,128),(16,16,128),4,48,65536,"packed_dual_n",1,0,2,0,0),
+    (16,384,7168,True,(16,16,128),(16,16,128),4,48,65536,"packed_dual_n",1,0,2,0,0),
+    (128,384,7168,True,(64,32,128),(16,16,128),4,24,131072,"early_g2s",1,0,1,0,0),
+    (256,384,7168,True,(96,32,64),(32,16,64),7,36,143360,"early_g2s",1,0,1,0,0),
+    (512,384,7168,True,(128,64,64),(32,16,64),4,24,131072,"double_buffer",1,0,1,0,0),
+    (1024,384,7168,True,(192,64,64),(32,16,64),4,36,163840,"double_buffer",0,0,1,0,0),
+    (2048,384,7168,True,(128,192,64),(32,32,64),4,32,262144,"double_buffer",0,0,1,0,0),
+    (4096,384,7168,True,(320,128,64),(80,32,64),2,39,147456,"valid_epilogue",1,0,1,0,0),
+    (8192,384,7168,True,(320,128,64),(80,32,64),3,39,221184,"double_buffer",0,0,1,0,0),
+    (16384,384,7168,True,(256,128,64),(64,32,64),4,39,262144,"overlap_valid",1,0,1,0,0),
+    (32768,384,7168,True,(256,128,64),(64,16,64),4,39,262144,"double_buffer",0,0,1,0,0),
+    (512,2048,4096,False,(128,256,64),(64,32,64),3,32,245760,"double_buffer",0,0,1,0,0),
+    (512,2048,4096,True,(128,256,64),(64,32,64),3,32,245760,"double_buffer",0,0,1,0,0),
 ])
 @pytest.mark.parametrize("shortcut_disabled", [0, 1])
-def test_gemm_bf16xfp32_exact_lut(m, tile, stages, grid, smem,
-                                 shortcut_disabled, monkeypatch, capfd):
+def test_gemm_bf16xfp32_exact_lut_and_explicit_priority(
+        m, n, k, use_fp32_output, tile, warp, stages, grid, smem, pipeline,
+        static_router, static_stages, split_k, cta_k, k_order, shortcut_disabled, monkeypatch, capfd):
     import ctypes
-    if int(os.environ.get("DG_JIT_USE_HGRTC", "0")):
-        pytest.skip("exact LUT is validated with HGCC")
+    if (int(os.environ.get("DG_JIT_USE_HGRTC", "0")) and not use_fp32_output
+            and n == 384 and m != 32768):
+        pytest.skip("packed-store LUT configurations require HGRTC validation")
     previous_sms = deep_gemm.get_num_sms()
     monkeypatch.setenv("show_log", "1")
     monkeypatch.setenv("DG_JIT_DISABLE_SHORTCUT_CACHE", str(shortcut_disabled))
     try:
         deep_gemm.set_num_sms(39)
-        x, high, low, scale, gt = _make_case(m, 384, 7168)
+        x, high, low, scale, gt = _make_case(m, n, k)
         for multiplier in (1, 2):
-            actual = _call_api("default", x * multiplier, high.clone(), low.clone(), scale, False)
+            actual = _call_api("default", x * multiplier, high.clone(), low.clone(), scale, use_fp32_output)
             _assert_accuracy(actual, *(r * multiplier for r in gt))
             torch.cuda.synchronize()
             ctypes.CDLL(None).fflush(None)
             log = capfd.readouterr().out
-            assert f"ThreadblockShape{list(tile)}" in log
-            assert f"num_stages:{stages}" in log and f"threadblock_count:{grid}" in log
-            assert f"SMSIZE:{smem}," in log and "dual_b_exact_lut:1," in log
+            assert f"ThreadblockShape{list(tile)}, WarpShape{list(warp)}, num_stages:{stages}\n" in log
+            assert f"threadblock_count:{grid}\n" in log and f"SMSIZE:{smem}," in log
+            assert f"dual_b_exact_lut:1, cta_k:{cta_k}, k_order:{k_order}\n" in log
+            assert f"dual_b_pipeline:{pipeline}\n" in log
+            assert f"dual_b_static_router:{static_router}, static_stages:{static_stages}\n" in log
+            assert f"dual_b_decode_split_k:{split_k}\n" in log
+        actual = _call_api("explicit", x, high, low, scale, use_fp32_output)
+        _assert_accuracy(actual, *gt)
+        torch.cuda.synchronize()
+        ctypes.CDLL(None).fflush(None)
+        log = capfd.readouterr().out
+        assert "ThreadblockShape[64, 64, 64], WarpShape[16, 16, 64], num_stages:2\n" in log
+        assert "dual_b_exact_lut:0, cta_k:0, k_order:0\n" in log
+        assert "dual_b_static_router:0, static_stages:0\n" in log
+        assert "dual_b_decode_split_k:1\n" in log and "dual_b_pipeline:double_buffer\n" in log
     finally:
         deep_gemm.set_num_sms(previous_sms)
 
 
 @pytest.mark.usefixtures("router_ppu1v5")
-@pytest.mark.parametrize("change", ["m", "n", "k", "sms", "scale", "near_scale", "fp32", "configs", "override"])
+@pytest.mark.parametrize("change", ["m", "n", "k", "sms", "sms64", "scale", "near_scale", "fp32", "configs"])
 def test_gemm_bf16xfp32_exact_lut_boundaries(change, monkeypatch, capfd):
     import ctypes
     import math
@@ -394,8 +394,13 @@ def test_gemm_bf16xfp32_exact_lut_boundaries(change, monkeypatch, capfd):
     if change == "k": k += 64
     scale = math.nextafter(1 / 256, 1) if change == "near_scale" else (1 / 128 if change == "scale" else 1 / 256)
     try:
-        deep_gemm.set_num_sms(20 if change == "sms" else 39)
-        if change == "override": monkeypatch.setenv("DG_BF16XFP32_STATIC_ROUTER", "0")
+        requested_sms = 20 if change == "sms" else 64 if change == "sms64" else 39
+        if requested_sms > torch.cuda.get_device_properties(0).multi_processor_count:
+            # 超出物理 SM 数时应由公共接口拒绝，不进入 LUT 选参。
+            with pytest.raises(RuntimeError, match="new_num_sms"):
+                deep_gemm.set_num_sms(requested_sms)
+            return
+        deep_gemm.set_num_sms(requested_sms)
         x, high, low, _, _ = _make_case(m, n, k)
         computation = x.float() @ high.float().t() + scale * (x.float() @ low.float().t())
         quality = x.float() @ (high.float() + scale * low.float()).t()
@@ -404,7 +409,55 @@ def test_gemm_bf16xfp32_exact_lut_boundaries(change, monkeypatch, capfd):
         _assert_accuracy(actual, computation, quality)
         torch.cuda.synchronize()
         ctypes.CDLL(None).fflush(None)
-        assert "dual_b_exact_lut:0," in capfd.readouterr().out
+        expected_lut = change == "fp32" or (
+            change in ("scale", "near_scale") and not int(os.environ.get("DG_JIT_USE_HGRTC", "0")))
+        log = capfd.readouterr().out
+        assert f"dual_b_exact_lut:{int(expected_lut)}," in log
+        if not expected_lut:
+            assert "dual_b_static_router:0, static_stages:0\n" in log
+            assert "dual_b_decode_split_k:1\n" in log and "dual_b_pipeline:double_buffer\n" in log
+    finally:
+        deep_gemm.set_num_sms(previous_sms)
+
+
+@pytest.mark.usefixtures("router_ppu1v5")
+@pytest.mark.parametrize("mode", ["lut", "whitebox", "explicit"])
+@pytest.mark.parametrize("use_fp32_output", [False, True])
+def test_gemm_bf16xfp32_removed_overrides_are_ignored(mode, use_fp32_output, monkeypatch, capfd):
+    import ctypes
+    removed = (
+        "PACKED_DUAL_N", "STATIC_ROUTER", "DECODE_SPLIT_K", "FULL_K_PREFETCH", "EARLY_G2S",
+        "MMA_S2R_OVERLAP", "BOUNDED_KLOOP", "OVERLAP_PROLOGUE", "VALID_EPILOGUE", "STATIC_STAGES",
+        "STREAMED_LOW", "STANDARD_S2", "STREAMED_PAIRS", "LAUNCH_BOUNDS2", "PAIRS_M_FIRST",
+        "KLOOP_UNROLL", "KLOOP_CHUNK",
+    )
+    for name in removed:
+        monkeypatch.delenv(f"DG_BF16XFP32_{name}", raising=False)
+    monkeypatch.setenv("show_log", "1")
+    previous_sms = deep_gemm.get_num_sms()
+    api = "explicit" if mode == "explicit" else "default"
+
+    def config_log():
+        ctypes.CDLL(None).fflush(None)
+        lines = tuple(line for line in capfd.readouterr().out.splitlines()
+                      if line.startswith(("num_sms:", "ThreadblockShape[", "SMSIZE:", "dual_b_")))
+        assert lines
+        return lines
+
+    try:
+        deep_gemm.set_num_sms(20 if mode == "whitebox" else 39)
+        x, high, low, scale, gt = _make_case(8, 384, 7168)
+        baseline = _call_api(api, x, high, low, scale, use_fp32_output)
+        _assert_accuracy(baseline, *gt)
+        torch.cuda.synchronize()
+        baseline_log = config_log()
+        for value in ("1", "invalid"):
+            for name in removed:
+                monkeypatch.setenv(f"DG_BF16XFP32_{name}", value)
+            actual = _call_api(api, x, high, low, scale, use_fp32_output)
+            _assert_exact(actual, baseline)
+            torch.cuda.synchronize()
+            assert config_log() == baseline_log
     finally:
         deep_gemm.set_num_sms(previous_sms)
 
