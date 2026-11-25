@@ -417,7 +417,7 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
                    && (block_m / 16) * (block_n / 16) * decode_split_k <= 32));
 
     // Budget the full dual-B SMEM footprint while preserving stage pruning for explicit configs.
-    constexpr int kSmemPerCU = 256 * 1024;
+    const int kSmemPerCU = static_cast<int>(device_runtime->get_prop()->sharedMemPerMultiprocessor);
     constexpr int kElemBytes = static_cast<int>(sizeof(cutlass::bfloat16_t));
     DG_HOST_ASSERT(block_m > 0 && block_n > 0 && block_k > 0
         && warp_m > 0 && warp_n > 0 && warp_k > 0);
