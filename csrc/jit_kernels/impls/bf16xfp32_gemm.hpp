@@ -35,6 +35,7 @@
 #include "../../utils/math.hpp"
 #include "../../utils/utils.hpp"
 #include <deep_gemm/common/profiling_interface.cuh>
+#include <deep_gemm/common/dual_b_resources.hpp>
 #include "../heuristics/common_bf16.hpp"
 #include <deep_gemm/scheduler/densegemm_scheduler_cutlass3.cuh>
 #include "bf16_gemm.hpp"
@@ -72,6 +73,8 @@ public:
         int min_blocks;
         bool pairs_m_first;
         int decode_split_k;
+        bool packed_store, cta_k, one_tile;
+        int k_order;
     };
 
     struct Args {
@@ -79,6 +82,19 @@ public:
         LaunchArgs launch_args;
         GemmKernelParams kernel_params;
     };
+
+    static auto compile_key(const Args& args) {
+        const auto& i = args.launch_info;
+        const auto& p = args.kernel_params;
+        return std::make_tuple(i.block_m, i.block_n, i.block_k, i.warp_m, i.warp_n, i.warp_k,
+            i.num_stages, i.gemm_type, i.kernel_name, i.full_k_prefetch, i.early_g2s,
+            i.mma_s2r_overlap, i.bounded_kloop, i.kloop_unroll, i.kloop_chunk,
+            i.overlap_prologue, i.valid_epilogue, i.packed_dual_n, i.static_router,
+            i.static_stages, i.streamed_low, i.standard_s2, i.streamed_pairs,
+            i.min_blocks, i.pairs_m_first, i.decode_split_k, i.packed_store, i.cta_k,
+            i.one_tile, i.k_order, p.N % i.block_n == 0,
+            i.static_router ? p.M : 0, i.static_router ? p.N : 0, i.static_router ? p.K : 0);
+    }
 
     static std::string generate_impl(const Args& args) {
         const auto& info = args.launch_info;
@@ -105,7 +121,7 @@ public:
 #define DG_DUAL_B_STREAMED_PAIRS {28}
 #define DG_DUAL_B_PAIRS_M_FIRST {30}
 #define DG_DUAL_B_DECODE_SPLIT_K {31}
-#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
+{32}#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
 
 namespace deep_gemm {{
 
@@ -131,7 +147,9 @@ __global__ void {10}(typename deep_gemm::Kernel::Params params) {{
             is_aligned_n ? "true" : "false",
             std::is_same_v<ElementOutput, float> ? ", float" : "",
             info.kernel_name, sizeof(GemmKernelParams),
-            (info.decode_split_k * info.num_stages * (info.block_m + (info.packed_dual_n ? 1 : 2) * info.block_n) * info.block_k * 2 + 127) & ~127,
+            dual_b::shared_storage_bytes(info.block_m, info.block_n, info.block_k,
+                info.warp_m, info.warp_n, info.warp_k, info.num_stages,
+                info.packed_dual_n, info.decode_split_k, info.cta_k),
             info.full_k_prefetch ? 1 : 0, info.early_g2s ? 1 : 0, info.mma_s2r_overlap ? 1 : 0,
             info.bounded_kloop ? 1 : 0, info.kloop_unroll, info.kloop_chunk ? 1 : 0,
             info.overlap_prologue ? 1 : 0, info.valid_epilogue ? 1 : 0, info.packed_dual_n ? 1 : 0,
@@ -140,7 +158,11 @@ __global__ void {10}(typename deep_gemm::Kernel::Params params) {{
             info.static_router ? args.kernel_params.K : 0,
             info.static_stages ? 1 : 0, info.streamed_low ? 1 : 0,
             info.standard_s2 ? "false" : "true", info.streamed_pairs ? 1 : 0, info.min_blocks,
-            info.pairs_m_first ? 1 : 0, info.decode_split_k);
+            info.pairs_m_first ? 1 : 0, info.decode_split_k,
+            info.packed_store ? fmt::format(
+                "#define DG_BFOUT_PACKED_STORE 1\n#define DG_BFOUT_CTA_K {}\n"
+                "#define DG_BFOUT_ONE_TILE {}\n#define DG_DUAL_B_K_ORDER {}\n",
+                int(info.cta_k), int(info.one_tile), info.k_order) : "");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -149,395 +171,7 @@ __global__ void {10}(typename deep_gemm::Kernel::Params params) {{
 };
 
 
-// Exact BF16-output defaults contain only independently accepted frozen candidates.
-// No shared input/output/workspace cache is used; allocations belong to the current PyTorch stream.
-struct BFOutFrozenSpec {
-    int m, grid, block, smem;
-    bool mma_reuse;
-    const char* code;
-};
-static const BFOutFrozenSpec* bfout_frozen_spec(int m) {
-    switch (m) {
-        case 8: {
-            static const BFOutFrozenSpec spec{8, 48, 64, 65536,
-                true, R"BFOUT(#define DG_BFOUT_CTA_K 0
-#define DG_BFOUT_PARTIAL 0
-#define DG_BFOUT_PACKED_STORE 1
-#define DG_BFOUT_ONE_TILE 0
-#define DG_DUAL_B_PACKED_N 1
-#define DG_DUAL_B_DECODE_SPLIT_K 2
-#define DG_DUAL_B_ROUTER_M 8
-#define DG_DUAL_B_ROUTER_N 384
-#define DG_DUAL_B_ROUTER_K 7168
-#define DG_DUAL_B_EARLY_G2S 0
-#define DG_DUAL_B_MMA_S2R_OVERLAP 0
-#define DG_DUAL_B_OVERLAP_PROLOGUE 0
-#define DG_DUAL_B_VALID_EPILOGUE 0
-#define DG_DUAL_B_BOUNDED_KLOOP 0
-#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
-
-using Tag = std::integral_constant<deep_gemm::GemmType, deep_gemm::GemmType::Normal>;
-using Kernel = deep_gemm::BF16xFp32GemmCuteFreeKernel<
-    16, 16, 128, 16, 16, 128, 4, true, true, Tag, cutlass::bfloat16_t>;
-static_assert(sizeof(Kernel::Params) == 88);
-static_assert(offsetof(Kernel::Params, scheduler) == 64);
-static_assert(Kernel::SharedStorageSize == 65536);
-
-extern "C"
-__launch_bounds__(Kernel::MaxThreadsPerBlock, 1)
-__global__ void bfout_candidate(Kernel::Params params) {
-    extern __shared__ char smem[];
-    Kernel kernel;
-    kernel(params, smem);
-}
-)BFOUT"};
-            return &spec;
-        }
-        case 16: {
-            static const BFOutFrozenSpec spec{16, 48, 64, 65536,
-                false, R"BFOUT(#define DG_BFOUT_CTA_K 0
-#define DG_BFOUT_PARTIAL 0
-#define DG_BFOUT_PACKED_STORE 1
-#define DG_BFOUT_ONE_TILE 0
-#define DG_DUAL_B_PACKED_N 1
-#define DG_DUAL_B_DECODE_SPLIT_K 2
-#define DG_DUAL_B_ROUTER_M 16
-#define DG_DUAL_B_ROUTER_N 384
-#define DG_DUAL_B_ROUTER_K 7168
-#define DG_DUAL_B_EARLY_G2S 0
-#define DG_DUAL_B_MMA_S2R_OVERLAP 0
-#define DG_DUAL_B_OVERLAP_PROLOGUE 0
-#define DG_DUAL_B_VALID_EPILOGUE 0
-#define DG_DUAL_B_BOUNDED_KLOOP 0
-#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
-
-using Tag = std::integral_constant<deep_gemm::GemmType, deep_gemm::GemmType::Normal>;
-using Kernel = deep_gemm::BF16xFp32GemmCuteFreeKernel<
-    16, 16, 128, 16, 16, 128, 4, true, true, Tag, cutlass::bfloat16_t>;
-static_assert(sizeof(Kernel::Params) == 88);
-static_assert(offsetof(Kernel::Params, scheduler) == 64);
-static_assert(Kernel::SharedStorageSize == 65536);
-
-extern "C"
-__launch_bounds__(Kernel::MaxThreadsPerBlock, 1)
-__global__ void bfout_candidate(Kernel::Params params) {
-    extern __shared__ char smem[];
-    Kernel kernel;
-    kernel(params, smem);
-}
-)BFOUT"};
-            return &spec;
-        }
-        case 128: {
-            static const BFOutFrozenSpec spec{128, 36, 192, 143360,
-                true, R"BFOUT(#define DG_BFOUT_CTA_K 0
-#define DG_BFOUT_PARTIAL 0
-#define DG_BFOUT_PACKED_STORE 1
-#define DG_BFOUT_ONE_TILE 1
-#define DG_DUAL_B_PACKED_N 0
-#define DG_DUAL_B_DECODE_SPLIT_K 1
-#define DG_DUAL_B_ROUTER_M 128
-#define DG_DUAL_B_ROUTER_N 384
-#define DG_DUAL_B_ROUTER_K 7168
-#define DG_DUAL_B_EARLY_G2S 0
-#define DG_DUAL_B_MMA_S2R_OVERLAP 0
-#define DG_DUAL_B_OVERLAP_PROLOGUE 0
-#define DG_DUAL_B_VALID_EPILOGUE 0
-#define DG_DUAL_B_BOUNDED_KLOOP 0
-#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
-
-using Tag = std::integral_constant<deep_gemm::GemmType, deep_gemm::GemmType::Normal>;
-using Kernel = deep_gemm::BF16xFp32GemmCuteFreeKernel<
-    48, 32, 128, 16, 16, 128, 5, true, true, Tag, cutlass::bfloat16_t>;
-static_assert(sizeof(Kernel::Params) == 88);
-static_assert(offsetof(Kernel::Params, scheduler) == 64);
-static_assert(Kernel::SharedStorageSize == 143360);
-
-extern "C"
-__launch_bounds__(Kernel::MaxThreadsPerBlock, 1)
-__global__ void bfout_candidate(Kernel::Params params) {
-    extern __shared__ char smem[];
-    Kernel kernel;
-    kernel(params, smem);
-}
-)BFOUT"};
-            return &spec;
-        }
-        case 256: {
-            static const BFOutFrozenSpec spec{256, 36, 256, 245760,
-                false, R"BFOUT(#define DG_BFOUT_CTA_K 1
-#define DG_BFOUT_PARTIAL 0
-#define DG_BFOUT_PACKED_STORE 1
-#define DG_BFOUT_ONE_TILE 1
-#define DG_DUAL_B_PACKED_N 0
-#define DG_DUAL_B_DECODE_SPLIT_K 1
-#define DG_DUAL_B_ROUTER_M 256
-#define DG_DUAL_B_ROUTER_N 384
-#define DG_DUAL_B_ROUTER_K 7168
-#define DG_DUAL_B_EARLY_G2S 0
-#define DG_DUAL_B_MMA_S2R_OVERLAP 0
-#define DG_DUAL_B_OVERLAP_PROLOGUE 0
-#define DG_DUAL_B_VALID_EPILOGUE 0
-#define DG_DUAL_B_BOUNDED_KLOOP 0
-#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
-
-using Tag = std::integral_constant<deep_gemm::GemmType, deep_gemm::GemmType::Normal>;
-using Kernel = deep_gemm::BF16xFp32GemmCuteFreeKernel<
-    96, 32, 128, 48, 16, 64, 6, true, true, Tag, cutlass::bfloat16_t>;
-static_assert(sizeof(Kernel::Params) == 88);
-static_assert(offsetof(Kernel::Params, scheduler) == 64);
-static_assert(Kernel::SharedStorageSize == 245760);
-
-extern "C"
-__launch_bounds__(Kernel::MaxThreadsPerBlock, 1)
-__global__ void bfout_candidate(Kernel::Params params) {
-    extern __shared__ char smem[];
-    Kernel kernel;
-    kernel(params, smem);
-}
-)BFOUT"};
-            return &spec;
-        }
-        case 512: {
-            static const BFOutFrozenSpec spec{512, 36, 256, 143360,
-                true, R"BFOUT(#define DG_BFOUT_CTA_K 0
-#define DG_BFOUT_PARTIAL 0
-#define DG_BFOUT_PACKED_STORE 1
-#define DG_BFOUT_ONE_TILE 1
-#define DG_DUAL_B_PACKED_N 0
-#define DG_DUAL_B_DECODE_SPLIT_K 1
-#define DG_DUAL_B_ROUTER_M 512
-#define DG_DUAL_B_ROUTER_N 384
-#define DG_DUAL_B_ROUTER_K 7168
-#define DG_DUAL_B_EARLY_G2S 0
-#define DG_DUAL_B_MMA_S2R_OVERLAP 1
-#define DG_DUAL_B_OVERLAP_PROLOGUE 0
-#define DG_DUAL_B_VALID_EPILOGUE 0
-#define DG_DUAL_B_BOUNDED_KLOOP 0
-#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
-
-using Tag = std::integral_constant<deep_gemm::GemmType, deep_gemm::GemmType::Normal>;
-using Kernel = deep_gemm::BF16xFp32GemmCuteFreeKernel<
-    96, 64, 64, 48, 16, 64, 5, true, true, Tag, cutlass::bfloat16_t>;
-static_assert(sizeof(Kernel::Params) == 88);
-static_assert(offsetof(Kernel::Params, scheduler) == 64);
-static_assert(Kernel::SharedStorageSize == 143360);
-
-extern "C"
-__launch_bounds__(Kernel::MaxThreadsPerBlock, 1)
-__global__ void bfout_candidate(Kernel::Params params) {
-    extern __shared__ char smem[];
-    Kernel kernel;
-    kernel(params, smem);
-}
-)BFOUT"};
-            return &spec;
-        }
-        case 1024: {
-            static const BFOutFrozenSpec spec{1024, 36, 256, 163840,
-                true, R"BFOUT(#define DG_BFOUT_CTA_K 0
-#define DG_BFOUT_PARTIAL 0
-#define DG_BFOUT_PACKED_STORE 1
-#define DG_BFOUT_ONE_TILE 1
-#define DG_DUAL_B_PACKED_N 0
-#define DG_DUAL_B_DECODE_SPLIT_K 1
-#define DG_DUAL_B_ROUTER_M 1024
-#define DG_DUAL_B_ROUTER_N 384
-#define DG_DUAL_B_ROUTER_K 7168
-#define DG_DUAL_B_EARLY_G2S 0
-#define DG_DUAL_B_MMA_S2R_OVERLAP 1
-#define DG_DUAL_B_OVERLAP_PROLOGUE 0
-#define DG_DUAL_B_VALID_EPILOGUE 0
-#define DG_DUAL_B_BOUNDED_KLOOP 0
-#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
-
-using Tag = std::integral_constant<deep_gemm::GemmType, deep_gemm::GemmType::Normal>;
-using Kernel = deep_gemm::BF16xFp32GemmCuteFreeKernel<
-    192, 64, 64, 48, 32, 64, 4, true, true, Tag, cutlass::bfloat16_t>;
-static_assert(sizeof(Kernel::Params) == 88);
-static_assert(offsetof(Kernel::Params, scheduler) == 64);
-static_assert(Kernel::SharedStorageSize == 163840);
-
-extern "C"
-__launch_bounds__(Kernel::MaxThreadsPerBlock, 1)
-__global__ void bfout_candidate(Kernel::Params params) {
-    extern __shared__ char smem[];
-    Kernel kernel;
-    kernel(params, smem);
-}
-)BFOUT"};
-            return &spec;
-        }
-        case 2048: {
-            static const BFOutFrozenSpec spec{2048, 32, 512, 229376,
-                true, R"BFOUT(#define DG_BFOUT_CTA_K 0
-#define DG_BFOUT_PARTIAL 0
-#define DG_BFOUT_PACKED_STORE 1
-#define DG_BFOUT_ONE_TILE 0
-#define DG_DUAL_B_PACKED_N 0
-#define DG_DUAL_B_DECODE_SPLIT_K 1
-#define DG_DUAL_B_ROUTER_M 2048
-#define DG_DUAL_B_ROUTER_N 384
-#define DG_DUAL_B_ROUTER_K 7168
-#define DG_DUAL_B_EARLY_G2S 0
-#define DG_DUAL_B_MMA_S2R_OVERLAP 0
-#define DG_DUAL_B_OVERLAP_PROLOGUE 1
-#define DG_DUAL_B_VALID_EPILOGUE 0
-#define DG_DUAL_B_BOUNDED_KLOOP 0
-#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
-
-using Tag = std::integral_constant<deep_gemm::GemmType, deep_gemm::GemmType::Normal>;
-using Kernel = deep_gemm::BF16xFp32GemmCuteFreeKernel<
-    256, 96, 64, 32, 48, 64, 4, true, true, Tag, cutlass::bfloat16_t>;
-static_assert(sizeof(Kernel::Params) == 88);
-static_assert(offsetof(Kernel::Params, scheduler) == 64);
-static_assert(Kernel::SharedStorageSize == 229376);
-
-extern "C"
-__launch_bounds__(Kernel::MaxThreadsPerBlock, 1)
-__global__ void bfout_candidate(Kernel::Params params) {
-    extern __shared__ char smem[];
-    Kernel kernel;
-    kernel(params, smem);
-}
-)BFOUT"};
-            return &spec;
-        }
-        case 4096: {
-            static const BFOutFrozenSpec spec{4096, 39, 512, 221184,
-                true, R"BFOUT(#define DG_BFOUT_CTA_K 0
-#define DG_BFOUT_PARTIAL 0
-#define DG_BFOUT_PACKED_STORE 1
-#define DG_BFOUT_ONE_TILE 0
-#define DG_DUAL_B_PACKED_N 0
-#define DG_DUAL_B_DECODE_SPLIT_K 1
-#define DG_DUAL_B_ROUTER_M 0
-#define DG_DUAL_B_ROUTER_N 0
-#define DG_DUAL_B_ROUTER_K 0
-#define DG_DUAL_B_EARLY_G2S 0
-#define DG_DUAL_B_MMA_S2R_OVERLAP 0
-#define DG_DUAL_B_OVERLAP_PROLOGUE 0
-#define DG_DUAL_B_VALID_EPILOGUE 0
-#define DG_DUAL_B_BOUNDED_KLOOP 0
-#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
-
-using Tag = std::integral_constant<deep_gemm::GemmType, deep_gemm::GemmType::Normal>;
-using Kernel = deep_gemm::BF16xFp32GemmCuteFreeKernel<
-    320, 128, 64, 80, 32, 64, 3, true, true, Tag, cutlass::bfloat16_t>;
-static_assert(sizeof(Kernel::Params) == 88);
-static_assert(offsetof(Kernel::Params, scheduler) == 64);
-static_assert(Kernel::SharedStorageSize == 221184);
-
-extern "C"
-__launch_bounds__(Kernel::MaxThreadsPerBlock, 1)
-__global__ void bfout_candidate(Kernel::Params params) {
-    extern __shared__ char smem[];
-    Kernel kernel;
-    kernel(params, smem);
-}
-)BFOUT"};
-            return &spec;
-        }
-        case 8192: {
-            static const BFOutFrozenSpec spec{8192, 39, 512, 221184,
-                true, R"BFOUT(#define DG_DUAL_B_K_ORDER 1
-#define DG_BFOUT_CTA_K 0
-#define DG_BFOUT_PARTIAL 0
-#define DG_BFOUT_PACKED_STORE 1
-#define DG_BFOUT_ONE_TILE 0
-#define DG_DUAL_B_PACKED_N 0
-#define DG_DUAL_B_DECODE_SPLIT_K 1
-#define DG_DUAL_B_ROUTER_M 8192
-#define DG_DUAL_B_ROUTER_N 384
-#define DG_DUAL_B_ROUTER_K 7168
-#define DG_DUAL_B_EARLY_G2S 0
-#define DG_DUAL_B_MMA_S2R_OVERLAP 0
-#define DG_DUAL_B_OVERLAP_PROLOGUE 1
-#define DG_DUAL_B_VALID_EPILOGUE 1
-#define DG_DUAL_B_BOUNDED_KLOOP 0
-#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
-
-using Tag = std::integral_constant<deep_gemm::GemmType, deep_gemm::GemmType::Normal>;
-using Kernel = deep_gemm::BF16xFp32GemmCuteFreeKernel<
-    320, 128, 64, 80, 32, 64, 3, true, true, Tag, cutlass::bfloat16_t>;
-static_assert(sizeof(Kernel::Params) == 88);
-static_assert(offsetof(Kernel::Params, scheduler) == 64);
-static_assert(Kernel::SharedStorageSize == 221184);
-
-extern "C"
-__launch_bounds__(Kernel::MaxThreadsPerBlock, 1)
-__global__ void bfout_candidate(Kernel::Params params) {
-    extern __shared__ char smem[];
-    Kernel kernel;
-    kernel(params, smem);
-}
-)BFOUT"};
-            return &spec;
-        }
-        case 16384: {
-            static const BFOutFrozenSpec spec{16384, 39, 512, 262144,
-                true, R"BFOUT(#define DG_DUAL_B_STATIC_STAGES 1
-#define DG_DUAL_B_K_ORDER 6
-#define DG_BFOUT_CTA_K 0
-#define DG_BFOUT_PARTIAL 0
-#define DG_BFOUT_PACKED_STORE 1
-#define DG_BFOUT_ONE_TILE 0
-#define DG_DUAL_B_PACKED_N 0
-#define DG_DUAL_B_DECODE_SPLIT_K 1
-#define DG_DUAL_B_ROUTER_M 16384
-#define DG_DUAL_B_ROUTER_N 384
-#define DG_DUAL_B_ROUTER_K 7168
-#define DG_DUAL_B_EARLY_G2S 0
-#define DG_DUAL_B_MMA_S2R_OVERLAP 0
-#define DG_DUAL_B_OVERLAP_PROLOGUE 1
-#define DG_DUAL_B_VALID_EPILOGUE 1
-#define DG_DUAL_B_BOUNDED_KLOOP 0
-#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
-
-using Tag = std::integral_constant<deep_gemm::GemmType, deep_gemm::GemmType::Normal>;
-using Kernel = deep_gemm::BF16xFp32GemmCuteFreeKernel<
-    256, 128, 64, 64, 32, 64, 4, true, true, Tag, cutlass::bfloat16_t>;
-static_assert(sizeof(Kernel::Params) == 88);
-static_assert(offsetof(Kernel::Params, scheduler) == 64);
-static_assert(Kernel::SharedStorageSize == 262144);
-
-extern "C"
-__launch_bounds__(Kernel::MaxThreadsPerBlock, 1)
-__global__ void bfout_candidate(Kernel::Params params) {
-    extern __shared__ char smem[];
-    Kernel kernel;
-    kernel(params, smem);
-}
-)BFOUT"};
-            return &spec;
-        }
-        default: return nullptr;
-    }
-}
-static std::shared_ptr<const Compiler> bfout_frozen_compiler(bool reuse) {
-    // Construct each private compiler once; never mutate the shared compiler singleton.
-    static const auto on = []() -> std::shared_ptr<const Compiler> {
-        auto c = std::make_shared<HGCCCompiler>();
-        c->flags += " -Xllvm -ppu-pref-mma-reuse=true";
-        return c;
-    }();
-    static const auto off = []() -> std::shared_ptr<const Compiler> {
-        auto c = std::make_shared<HGCCCompiler>();
-        c->flags += " -Xllvm -ppu-pref-mma-reuse=false";
-        return c;
-    }();
-    return reuse ? on : off;
-}
-static std::shared_ptr<KernelRuntime> bfout_frozen_runtime(const BFOutFrozenSpec& spec) {
-    static thread_local std::map<int, std::shared_ptr<KernelRuntime>> cache;
-    if (const auto it = cache.find(spec.m); it != cache.end()) return it->second;
-    const std::string raw = spec.code;
-    const auto code = fmt::format("// Includes' hash value: {}\n{}", include_parser->get_hash_value(raw), raw);
-    const auto runtime = bfout_frozen_compiler(spec.mma_reuse)->build("bfout_candidate", code);
-    cache.emplace(spec.m, runtime);
-    return runtime;
-}
-static bool bfout_no_experimental_overrides() {
+static bool dual_b_no_experimental_overrides() {
     for (const char* name : {
         "DG_BF16XFP32_PACKED_DUAL_N", "DG_BF16XFP32_STATIC_ROUTER", "DG_BF16XFP32_DECODE_SPLIT_K",
         "DG_BF16XFP32_FULL_K_PREFETCH", "DG_BF16XFP32_EARLY_G2S", "DG_BF16XFP32_MMA_S2R_OVERLAP",
@@ -549,36 +183,46 @@ static bool bfout_no_experimental_overrides() {
     }
     return true;
 }
-static void bfout_launch_frozen(const BFOutFrozenSpec& spec, const torch::Tensor& lhs,
-    const torch::Tensor& high, const torch::Tensor& low, const torch::Tensor& out, float scale, int m, int n, int k) {
-    const auto runtime = bfout_frozen_runtime(spec);
-    if (is_compile_only()) return;
 
-    using Params = DenseBf16xFp32GemmCuteFreeRuntimeT<cutlass::bfloat16_t>::GemmKernelParams;
-    static_assert(sizeof(Params) == 88 && offsetof(Params, scheduler) == 64);
-    Params params{
-        reinterpret_cast<const cutlass::bfloat16_t*>(lhs.data_ptr()),
-        reinterpret_cast<const cutlass::bfloat16_t*>(high.data_ptr()),
-        reinterpret_cast<const cutlass::bfloat16_t*>(low.data_ptr()),
-        reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr()),
-        scale, m, n, k, k, k, n,
-        DenseGemmTileSchedulerArguments{uint32_t(m), uint32_t(n), uint32_t(k), nullptr}};
-    const auto& stream = current_stream();
-    const auto config = construct_launch_config(runtime->kernel, stream, spec.smem,
-        dim3(spec.grid), dim3(spec.block));
-    DgProfParam prof;
-    if (profiling_enabled()) {
-        prof.set_params(GemmType::Normal, false, std::string("bf16xfp32"), 1, m, n, k, 0, nullptr, stream);
-    }
-    {
-        auto guard = show_gemm_ut(prof);
-        DG_HGGC_UNIFIED_CHECK(launch_kernel(runtime->kernel, config, params));
-    }
-    if (const char* log = std::getenv("show_log"); log && isdigit(*log)) {
-        printf("bfout_frozen:M=%d,N=%d,K=%d,grid=%d,block=%d,smem=%d,splits=1,mma_reuse=%d,workspace=0\n",
-            m, n, k, spec.grid, spec.block, spec.smem, int(spec.mma_reuse));
-    }
+namespace dual_b {
+enum Pipeline : unsigned {
+    PackedStore = 1 << 0, StaticShape = 1 << 1, PackedN = 1 << 2,
+    OneTile = 1 << 3, CtaK = 1 << 4, MmaS2ROverlap = 1 << 5,
+    OverlapPrologue = 1 << 6, ValidEpilogue = 1 << 7, StaticStages = 1 << 8
+};
+
+struct ExactConfig {
+    int m, bm, bn, bk, wm, wn, wk, stages, grid;
+    unsigned pipeline;
+    int decode_split_k, k_order;
+    KernelCompileOptions compile_options;
+
+    bool has(Pipeline flag) const { return (pipeline & flag) != 0; }
+};
+
+static const ExactConfig* exact_config(int m, int n, int k, int sms, double scale,
+                                       bool fp32_output, bool explicit_config) {
+    if (fp32_output || explicit_config || n != 384 || k != 7168 || sms != 39
+        || scale != 1.0 / 256.0 || get_env<int>("DG_JIT_USE_HGRTC", 0)
+        || !dual_b_no_experimental_overrides())
+        return nullptr;
+    static constexpr ExactConfig lut[] = {
+        {8,     16,  16, 128, 16, 16, 128, 4, 48, PackedStore | StaticShape | PackedN, 2, 0, {1}},
+        {16,    16,  16, 128, 16, 16, 128, 4, 48, PackedStore | StaticShape | PackedN, 2, 0, {0}},
+        {128,   48,  32, 128, 16, 16, 128, 5, 36, PackedStore | StaticShape | OneTile, 1, 0, {1}},
+        {256,   96,  32, 128, 48, 16,  64, 6, 36, PackedStore | StaticShape | OneTile | CtaK, 1, 0, {0}},
+        {512,   96,  64,  64, 48, 16,  64, 5, 36, PackedStore | StaticShape | OneTile | MmaS2ROverlap, 1, 0, {1}},
+        {1024, 192,  64,  64, 48, 32,  64, 4, 36, PackedStore | StaticShape | OneTile | MmaS2ROverlap, 1, 0, {1}},
+        {2048, 256,  96,  64, 32, 48,  64, 4, 32, PackedStore | StaticShape | OverlapPrologue, 1, 0, {1}},
+        {4096, 320, 128,  64, 80, 32,  64, 3, 39, PackedStore, 1, 0, {1}},
+        {8192, 320, 128,  64, 80, 32,  64, 3, 39, PackedStore | StaticShape | OverlapPrologue | ValidEpilogue, 1, 1, {1}},
+        {16384,256, 128,  64, 64, 32,  64, 4, 39, PackedStore | StaticShape | OverlapPrologue | ValidEpilogue | StaticStages, 1, 6, {1}},
+    };
+    for (const auto& entry : lut)
+        if (entry.m == m) return &entry;
+    return nullptr;
 }
+} // namespace dual_b
 
 // Composition fallback: out = x@w_high^T + scale * x@w_low^T via two plain BF16
 // GEMMs through an FP32 intermediate (BF16 tensor-core rate, FP32 accumulation;
@@ -739,9 +383,12 @@ static DualBPolicyTile get_dual_b_policy_tile(int m, int n, int k, int num_sms, 
 template <typename ElementOutput>
 static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch::Tensor& w_high,
                                           const torch::Tensor& w_low, const torch::Tensor& out,
-                                          const float& scale, const int& m, const int& n, const int& k,
+                                          const double& scale, const int& m, const int& n, const int& k,
                                           std::optional<ConfigTuple> configs = std::nullopt) {
     int num_sms = get_num_sms();
+    const auto* exact = dual_b::exact_config(m, n, k, num_sms, scale,
+        std::is_same_v<ElementOutput, float>, configs.has_value());
+    const bool cta_k = exact && exact->has(dual_b::CtaK);
     static constexpr GemmType kGemmType = GemmType::Normal;
     const char* packed_env = std::getenv("DG_BF16XFP32_PACKED_DUAL_N");
     DG_HOST_ASSERT(packed_env == nullptr || std::string(packed_env) == "0" || std::string(packed_env) == "1");
@@ -757,7 +404,7 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
         || enabled("DG_BF16XFP32_STREAMED_PAIRS") || enabled("DG_BF16XFP32_LAUNCH_BOUNDS2")
         || enabled("DG_BF16XFP32_PAIRS_M_FIRST");
     // Auto-enable only validated router defaults; explicit configs keep their kernel, 0 disables, and 1 opts into the experiment.
-    const bool packed_dual_n = (packed_env != nullptr && *packed_env == '1')
+    const bool packed_dual_n = exact ? exact->has(dual_b::PackedN) : (packed_env != nullptr && *packed_env == '1')
         || (packed_env == nullptr && !other_pipeline && !configs.has_value()
             && std::is_same_v<ElementOutput, float> && (m == 8 || m == 16)
             && n == 384 && k == 7168);
@@ -766,7 +413,7 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
     // Add M16 specialization only to the packed default path; explicit configs retain their behavior unless the experiment is enabled.
     const char* static_env = std::getenv("DG_BF16XFP32_STATIC_ROUTER");
     DG_HOST_ASSERT(static_env == nullptr || std::string(static_env) == "0" || std::string(static_env) == "1");
-    const bool static_router = (static_env == nullptr || *static_env == '1')
+    const bool static_router = exact ? exact->has(dual_b::StaticShape) : (static_env == nullptr || *static_env == '1')
         && std::is_same_v<ElementOutput, float>
         && (m == 8 || (m == 16 && packed_dual_n
             && (!configs.has_value() || (static_env != nullptr && *static_env == '1')))
@@ -779,9 +426,10 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
                    || std::string(split_env) == "4" || std::string(split_env) == "8");
     const bool split_default = !configs.has_value() && !other_pipeline && packed_dual_n && static_router
         && std::is_same_v<ElementOutput, float> && (m == 8 || m == 16) && n == 384 && k == 7168;
-    const int decode_split_k = split_env == nullptr ? (split_default ? 2 : 1) : *split_env - '0';
+    const int decode_split_k = exact ? exact->decode_split_k
+        : split_env == nullptr ? (split_default ? 2 : 1) : *split_env - '0';
     DG_HOST_ASSERT(decode_split_k == 1 || (packed_dual_n && static_router
-                   && std::is_same_v<ElementOutput, float> && (m == 8 || m == 16)
+                   && (std::is_same_v<ElementOutput, float> || exact) && (m == 8 || m == 16)
                    && n == 384 && k == 7168));
 
     using Config = std::tuple<int, int, int, int, int, int, int, int, std::tuple<int, int, int>>;
@@ -793,6 +441,9 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
         auto [ns, bm, bn, bk, wm, wn, nst, _sc] = *configs;
         cfg = std::make_tuple(ns, bm, bn, bk, wm, wn, /*warp_k=*/bk, nst,
             deep_gemm_bf16_common::get_smem_config(nst, k, bm, bn, bk, 2));
+    } else if (exact) {
+        cfg = std::make_tuple(num_sms, exact->bm, exact->bn, exact->bk,
+            exact->wm, exact->wn, exact->wk, exact->stages, std::make_tuple(0, 0, 0));
     } else if (std::is_same_v<ElementOutput, float> && (m == 8 || m == 16)
                && n == 384 && k == 7168) {
         // Two K partitions with BK128/stage4 reduce decode latency in both hot and 64-layer rotation.
@@ -840,7 +491,7 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
     }
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, warp_k, num_stages, smem_config] = cfg;
     (void)smem_config;
-    DG_HOST_ASSERT(!packed_dual_n || (std::is_same_v<ElementOutput, float>
+    DG_HOST_ASSERT(!packed_dual_n || ((std::is_same_v<ElementOutput, float> || exact)
                    && (m == 8 || m == 16 || m == 128 || m == 256) && n == 384 && k == 7168
                    && block_m > 0 && block_n > 0 && block_k >= 64 && block_k % 64 == 0
                    && block_m % 16 == 0 && block_n % 16 == 0 && warp_m == 16 && warp_n == 16
@@ -849,13 +500,16 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
     // Budget the full dual-B SMEM footprint while preserving stage pruning for explicit configs.
     constexpr int kSmemPerCU = 256 * 1024;
     constexpr int kElemBytes = static_cast<int>(sizeof(cutlass::bfloat16_t));
+    DG_HOST_ASSERT(block_m > 0 && block_n > 0 && block_k > 0
+        && warp_m > 0 && warp_n > 0 && warp_k > 0);
+    DG_HOST_ASSERT(block_m % warp_m == 0 && block_n % warp_n == 0 && block_k % warp_k == 0);
     auto dual_smem_bytes = [&](int stages) {
-        int bytes = decode_split_k * stages * (block_m + (packed_dual_n ? 1 : 2) * block_n) * block_k * kElemBytes;
-        return (bytes + 127) & ~127;
+        return dual_b::shared_storage_bytes(block_m, block_n, block_k, warp_m, warp_n,
+            warp_k, stages, packed_dual_n, decode_split_k, cta_k, kElemBytes);
     };
-    while (num_stages > 2 && dual_smem_bytes(num_stages) > kSmemPerCU)
+    while (!exact && num_stages > 2 && dual_smem_bytes(num_stages) > kSmemPerCU)
         --num_stages;
-    if (!configs.has_value() && dual_smem_bytes(num_stages) > kSmemPerCU) {
+    if (!exact && !configs.has_value() && dual_smem_bytes(num_stages) > kSmemPerCU) {
         // Single-B configs may use excessive BK; select a valid fused default rather than rejecting a supported shape.
         block_k = std::min(block_k, 128);
         if (dual_smem_bytes(num_stages) > kSmemPerCU) block_k = 64;
@@ -865,7 +519,7 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
     // Never disguise composition as fusion; report explicit configs that exceed the budget as unsupported.
     DG_HOST_ASSERT(num_sms_new > 0 && num_stages >= 2);
     DG_HOST_ASSERT(SMSIZE <= kSmemPerCU);
-    DG_HOST_ASSERT(warp_k == block_k);
+    DG_HOST_ASSERT(cta_k || warp_k == block_k);
 
     cutlass::bfloat16_t* input_a = reinterpret_cast<cutlass::bfloat16_t*>(lhs.data_ptr<at::BFloat16>());
     cutlass::bfloat16_t* input_b_high = reinterpret_cast<cutlass::bfloat16_t*>(w_high.data_ptr<at::BFloat16>());
@@ -897,8 +551,9 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
 
     dim3 grid;
     // Cap the persistent grid at the output-tile count to avoid idle CTAs.
-    grid.x = std::min(blocks_per_cu * num_sms_new,
-                      ceil_div(m, block_m) * ceil_div(n, packed_dual_n ? block_n / 2 : block_n));
+    const int output_tiles = ceil_div(m, block_m) * ceil_div(n, packed_dual_n ? block_n / 2 : block_n);
+    grid.x = exact ? exact->grid : std::min(blocks_per_cu * num_sms_new, output_tiles);
+    DG_HOST_ASSERT(!exact || (grid.x <= output_tiles && (!exact->has(dual_b::OneTile) || grid.x == output_tiles)));
 
     // Output dtype is part of the JIT cache key (separate kernel name).
     std::string kernel_name = "bf16xfp32_gemm_cute_free";
@@ -909,9 +564,9 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
     // Exact long-prefill experiment: specialize only outer stage indices; each chain still advances through full K in order.
     const char* stages_env = std::getenv("DG_BF16XFP32_STATIC_STAGES");
     DG_HOST_ASSERT(stages_env == nullptr || std::string(stages_env) == "0" || std::string(stages_env) == "1");
-    const bool static_stages = stages_env != nullptr && *stages_env == '1';
+    const bool static_stages = exact ? exact->has(dual_b::StaticStages) : stages_env != nullptr && *stages_env == '1';
     DG_HOST_ASSERT(!static_stages || (static_router && !packed_dual_n
-        && std::is_same_v<ElementOutput, float> && m == 16384 && n == 384 && k == 7168));
+        && (std::is_same_v<ElementOutput, float> || exact) && m == 16384 && n == 384 && k == 7168));
     if (static_stages) kernel_name += "_static_stages";
     // Load low fragments on demand without preconverting or premerging weights; both FP32 accumulators cover full K.
     const char* low_env = std::getenv("DG_BF16XFP32_STREAMED_LOW");
@@ -965,7 +620,7 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
     if (early_g2s) kernel_name += "_early_g2s";
     const char* overlap_env = std::getenv("DG_BF16XFP32_MMA_S2R_OVERLAP");
     DG_HOST_ASSERT(overlap_env == nullptr || std::string(overlap_env) == "0" || std::string(overlap_env) == "1");
-    const bool mma_s2r_overlap = overlap_env != nullptr && *overlap_env == '1';
+    const bool mma_s2r_overlap = exact ? exact->has(dual_b::MmaS2ROverlap) : overlap_env != nullptr && *overlap_env == '1';
     DG_HOST_ASSERT(!mma_s2r_overlap || (!early_g2s && !full_k_prefetch));
     if (mma_s2r_overlap) kernel_name += "_mma_s2r_overlap";
     const char* kloop_env = std::getenv("DG_BF16XFP32_BOUNDED_KLOOP");
@@ -994,11 +649,11 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
     // Exact long-prefill default experiment: overlap the next tile's stage0 with output merging; preserve explicit-config behavior.
     const bool router_overlap = !other_pipeline && !packed_dual_n && !configs.has_value()
         && std::is_same_v<ElementOutput, float> && m == 16384 && n == 384 && k == 7168;
-    const bool overlap_prologue = (prologue_env != nullptr && *prologue_env == '1')
+    const bool overlap_prologue = exact ? exact->has(dual_b::OverlapPrologue) : (prologue_env != nullptr && *prologue_env == '1')
         || (prologue_env == nullptr && router_overlap);
     const bool router_valid_epilogue = !other_pipeline && !packed_dual_n && !configs.has_value()
         && std::is_same_v<ElementOutput, float> && m == 4096 && n == 384 && k == 7168;
-    const bool valid_epilogue = (epilogue_env != nullptr && *epilogue_env == '1')
+    const bool valid_epilogue = exact ? exact->has(dual_b::ValidEpilogue) : (epilogue_env != nullptr && *epilogue_env == '1')
         || (epilogue_env == nullptr && (router_overlap || router_valid_epilogue));
     DG_HOST_ASSERT(!(overlap_prologue || valid_epilogue)
                    || (!full_k_prefetch && !early_g2s && !mma_s2r_overlap && !bounded_kloop));
@@ -1010,19 +665,20 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
     auto args = typename Runtime::Args{
         .launch_info = {block_m, block_n, block_k, warp_m, warp_n, warp_k, num_stages,
                         "Normal", kernel_name, full_k_prefetch, early_g2s, mma_s2r_overlap, bounded_kloop, kloop_unroll, kloop_chunk,
-                        overlap_prologue, valid_epilogue, packed_dual_n, static_router, static_stages, streamed_low, standard_s2, streamed_pairs, min_blocks, pairs_m_first, decode_split_k},
+                        overlap_prologue, valid_epilogue, packed_dual_n, static_router, static_stages, streamed_low, standard_s2, streamed_pairs, min_blocks, pairs_m_first, decode_split_k,
+                        exact && exact->has(dual_b::PackedStore), cta_k,
+                        exact && exact->has(dual_b::OneTile), exact ? exact->k_order : 0},
         .launch_args = {grid, block, SMSIZE},
         .kernel_params = hparams,
     };
 
-    std::string code = Runtime::generate(args);
-    auto runtime = compiler->build(kernel_name, code);
+    const auto compile_options = exact ? exact->compile_options : KernelCompileOptions{};
+    auto runtime = compiler->build_cached<Runtime>(kernel_name, args, compile_options);
     if (is_compile_only())
         return;
     auto kernel = runtime->kernel;
 
     const auto& stream = current_stream();
-    auto config = construct_launch_config(kernel, stream, SMSIZE, grid, block);
 
     DgProfParam dg_prof_params;
     if (deep_gemm::profiling_enabled()) {
@@ -1030,7 +686,7 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
     }
     {
         auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
-        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, hparams));
+        Runtime::launch(runtime, args);
     }
 
     char* pEnv_params = std::getenv("show_log");
@@ -1046,6 +702,8 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
                block_m, block_n, block_k, warp_m, warp_n, warp_k, num_stages);
         printf("SMSIZE:%d, vreg:%d, stack:%d\n", SMSIZE, int(numRegs), int(localSize));
         printf("dual_b_decode_split_k:%d\n", decode_split_k);
+        printf("dual_b_exact_lut:%d, mma_reuse:%d, cta_k:%d, k_order:%d\n",
+               int(exact != nullptr), compile_options.mma_reuse, int(cta_k), args.launch_info.k_order);
         printf("dual_b_static_stages:%d, streamed_low:%d\n", int(static_stages), int(streamed_low));
         printf("dual_b_standard_s2:%d\n", int(standard_s2));
         printf("dual_b_streamed_pairs:%d\n", int(streamed_pairs));
@@ -1074,17 +732,9 @@ static void bf16xfp32_gemm(const torch::Tensor& lhs, const torch::Tensor& w_high
                           std::optional<ConfigTuple> configs = std::nullopt) {
     if (is_ppu1v5_device()) {
         if (out.scalar_type() == torch::kFloat)
-            bf16xfp32_gemm_cute_free_impl<float>(lhs, w_high, w_low, out, static_cast<float>(scale),
-                                                 m, n, k, configs);
-        else {
-            const auto* spec = bfout_frozen_spec(m);
-            if (spec && n == 384 && k == 7168 && scale == 1.0 / 256.0 && get_num_sms() == 39
-                && !configs.has_value() && !get_env<int>("DG_JIT_USE_HGRTC", 0) && bfout_no_experimental_overrides())
-                bfout_launch_frozen(*spec, lhs, w_high, w_low, out, static_cast<float>(scale), m, n, k);
-            else
-                bf16xfp32_gemm_cute_free_impl<cutlass::bfloat16_t>(lhs, w_high, w_low, out, static_cast<float>(scale),
-                                                                  m, n, k, configs);
-        }
+            bf16xfp32_gemm_cute_free_impl<float>(lhs, w_high, w_low, out, scale, m, n, k, configs);
+        else
+            bf16xfp32_gemm_cute_free_impl<cutlass::bfloat16_t>(lhs, w_high, w_low, out, scale, m, n, k, configs);
         return;
     }
 

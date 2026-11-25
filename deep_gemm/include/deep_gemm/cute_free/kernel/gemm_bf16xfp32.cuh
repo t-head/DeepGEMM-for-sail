@@ -12,6 +12,7 @@
 #include <deep_gemm/cute_free/mainloop/dual_b_mainloop.cuh>
 #include <deep_gemm/scheduler/densegemm_scheduler_cutlass3.cuh>
 #include <deep_gemm/common/utils_cutlass3.cuh>
+#include <deep_gemm/common/dual_b_resources.hpp>
 
 #ifndef DG_DUAL_B_OVERLAP_PROLOGUE
 #define DG_DUAL_B_OVERLAP_PROLOGUE 0
@@ -151,9 +152,10 @@ struct GemmBf16xFp32Kernel {
   // ([A stages | B_high stages | B_low stages]). The host launcher sizes
   // dynamic shared memory from the same formula.
   struct SharedStorage {
-    static constexpr int kOperandElements = STAGES * (BLOCK_M + 2 * BLOCK_N) * BLOCK_K;
-    static constexpr int kPartialElements = DG_BFOUT_CTA_K ? kThreads * kMmasPerWarpM * kMmasPerWarpN * kAccumPerThread * 4 : 0;
-    alignas(128) Element smem[kOperandElements > kPartialElements ? kOperandElements : kPartialElements];
+    static_assert(!DG_BFOUT_CTA_K || (kMmaM * kMmaN == kAccumPerThread * 32));
+    alignas(128) Element smem[dual_b::shared_storage_bytes(
+        BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K,
+        STAGES, false, 1, DG_BFOUT_CTA_K, sizeof(Element)) / sizeof(Element)];
   };
 
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
@@ -344,7 +346,9 @@ struct PackedDualNRouterKernel {
     DenseGemmTileSchedulerArguments scheduler;
   };
   struct SharedStorage {
-    alignas(128) Element smem[kSplitK * STAGES * (BLOCK_M + BLOCK_N) * BLOCK_K];
+    alignas(128) Element smem[dual_b::shared_storage_bytes(
+        BLOCK_M, BLOCK_N, BLOCK_K, 16, 16, BLOCK_K,
+        STAGES, true, kSplitK, false, sizeof(Element)) / sizeof(Element)];
   };
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
@@ -524,6 +528,7 @@ struct PackedDualNRouterKernel {
 #include <deep_gemm/cute_free/mainloop/dual_b_mainloop.cuh>
 #include <deep_gemm/scheduler/densegemm_scheduler_cutlass3.cuh>
 #include <deep_gemm/common/utils_cutlass3.cuh>
+#include <deep_gemm/common/dual_b_resources.hpp>
 
 #ifndef DG_DUAL_B_OVERLAP_PROLOGUE
 #define DG_DUAL_B_OVERLAP_PROLOGUE 0
@@ -651,7 +656,9 @@ struct GemmBf16xFp32Kernel {
   // ([A stages | B_high stages | B_low stages]). The host launcher sizes
   // dynamic shared memory from the same formula.
   struct SharedStorage {
-    alignas(128) Element smem[STAGES * (BLOCK_M + 2 * BLOCK_N) * BLOCK_K];
+    alignas(128) Element smem[dual_b::shared_storage_bytes(
+        BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K,
+        STAGES, false, 1, false, sizeof(Element)) / sizeof(Element)];
   };
 
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
@@ -804,7 +811,9 @@ struct PackedDualNRouterKernel {
     DenseGemmTileSchedulerArguments scheduler;
   };
   struct SharedStorage {
-    alignas(128) Element smem[kSplitK * STAGES * (BLOCK_M + BLOCK_N) * BLOCK_K];
+    alignas(128) Element smem[dual_b::shared_storage_bytes(
+        BLOCK_M, BLOCK_N, BLOCK_K, 16, 16, BLOCK_K,
+        STAGES, true, kSplitK, false, sizeof(Element)) / sizeof(Element)];
   };
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 

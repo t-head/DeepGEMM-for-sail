@@ -16,6 +16,7 @@ from torch.utils.cpp_extension import load_inline
 CPP_SOURCE = r'''
 // Exercise the actual host code generators, without compiling or launching GEMMs.
 #include "jit_kernels/impls/bf16_gemm.hpp"
+#include "jit_kernels/impls/bf16xfp32_gemm.hpp"
 #include "jit_kernels/impls/fp4_gemm.hpp"
 #include "jit_kernels/impls/fp8_gemm.hpp"
 
@@ -115,6 +116,81 @@ int bf16_checks() {
         using Element = std::remove_pointer_t<std::remove_reference_t<decltype(ptr_d)>>;
         ptr_d = reinterpret_cast<std::remove_reference_t<decltype(ptr_d)>>(uintptr_t(sizeof(Element)));
     }, "output pointer alignment changes packed-store eligibility");
+    return count;
+}
+
+template <typename Output>
+int dual_b_checks() {
+    using Runtime = DenseBf16xFp32GemmCuteFreeRuntimeT<Output>;
+    typename Runtime::Args args{};
+    auto& i = args.launch_info;
+    i.block_m = 128; i.block_n = 128; i.block_k = 64;
+    i.warp_m = 32; i.warp_n = 64; i.warp_k = 64; i.num_stages = 4;
+    i.gemm_type = "Normal"; i.kernel_name = "test_dual_b";
+    i.min_blocks = 1; i.kloop_unroll = 1; i.decode_split_k = 1;
+    i.packed_store = true;
+    args.kernel_params.M = 256; args.kernel_params.N = 384; args.kernel_params.K = 7168;
+    int count = tile_checks<Runtime>(args);
+#define CHECK_DUAL(field, value) \
+    count += check_change<Runtime>(args, [](auto& a) { a.launch_info.field = value; }, #field)
+    CHECK_DUAL(warp_k, 32);
+    CHECK_DUAL(gemm_type, "MGroupedContiguous");
+    CHECK_DUAL(full_k_prefetch, true);
+    CHECK_DUAL(early_g2s, true);
+    CHECK_DUAL(mma_s2r_overlap, true);
+    CHECK_DUAL(bounded_kloop, true);
+    CHECK_DUAL(kloop_unroll, 2);
+    CHECK_DUAL(kloop_chunk, true);
+    CHECK_DUAL(overlap_prologue, true);
+    CHECK_DUAL(valid_epilogue, true);
+    CHECK_DUAL(packed_dual_n, true);
+    CHECK_DUAL(static_router, true);
+    CHECK_DUAL(static_stages, true);
+    CHECK_DUAL(streamed_low, true);
+    CHECK_DUAL(standard_s2, true);
+    CHECK_DUAL(streamed_pairs, true);
+    CHECK_DUAL(min_blocks, 2);
+    CHECK_DUAL(pairs_m_first, true);
+    CHECK_DUAL(decode_split_k, 2);
+    CHECK_DUAL(packed_store, false);
+    CHECK_DUAL(cta_k, true);
+    CHECK_DUAL(one_tile, true);
+    CHECK_DUAL(k_order, 6);
+#undef CHECK_DUAL
+    count += check_change<Runtime>(args, [](auto& a) { a.kernel_params.N = 386; }, "N alignment");
+    count += check_change<Runtime>(args, [](auto& a) {
+        a.kernel_params.M = 512; a.kernel_params.N = 512; a.kernel_params.K = 8192;
+        a.kernel_params.low_scale = 0.5f; a.kernel_params.lda = 8192;
+        a.kernel_params.ptr_A = reinterpret_cast<const cutlass::bfloat16_t*>(uintptr_t(0x1000));
+        a.kernel_params.ptr_D = reinterpret_cast<Output*>(uintptr_t(0x2000));
+        a.launch_args.grid_dim = dim3(20); a.launch_args.smem_size = 65536;
+    }, "dynamic dimensions, scale, strides, addresses and launch", false);
+    args.launch_info.static_router = true;
+    count += check_change<Runtime>(args, [](auto& a) { a.kernel_params.M += 1; }, "static M");
+    count += check_change<Runtime>(args, [](auto& a) { a.kernel_params.N += 128; }, "static N");
+    count += check_change<Runtime>(args, [](auto& a) { a.kernel_params.K += 64; }, "static K");
+    return count;
+}
+
+int dual_b_lut_checks() {
+    int count = 0;
+    const int shapes[] = {8,16,128,256,512,1024,2048,4096,8192,16384};
+    const int smem[] = {65536,65536,143360,245760,143360,163840,229376,221184,221184,262144};
+    for (int index = 0; index < 10; ++index) {
+        const auto* cfg = dual_b::exact_config(shapes[index],384,7168,39,1.0/256,false,false);
+        if (!cfg || dual_b::shared_storage_bytes(cfg->bm,cfg->bn,cfg->bk,cfg->wm,cfg->wn,cfg->wk,
+                cfg->stages,cfg->has(dual_b::PackedN),cfg->decode_split_k,cfg->has(dual_b::CtaK)) != smem[index])
+            throw std::runtime_error("exact LUT resource mismatch");
+        ++count;
+    }
+    if (dual_b::exact_config(9,384,7168,39,1.0/256,false,false)
+        || dual_b::exact_config(8,386,7168,39,1.0/256,false,false)
+        || dual_b::exact_config(8,384,7232,39,1.0/256,false,false)
+        || dual_b::exact_config(8,384,7168,20,1.0/256,false,false)
+        || dual_b::exact_config(8,384,7168,39,std::nextafter(1.0/256,1.0),false,false)
+        || dual_b::exact_config(8,384,7168,39,1.0/256,true,false)
+        || dual_b::exact_config(8,384,7168,39,1.0/256,false,true))
+        throw std::runtime_error("non-exact LUT hit");
     return count;
 }
 
@@ -222,6 +298,7 @@ int gemv_checks() {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("bf16_cute_free", [] { return bf16_checks<deep_gemm::DenseBF16GemmCuteFreeRuntimeT<cutlass::bfloat16_t>>()
                                     + bf16_checks<deep_gemm::DenseBF16GemmCuteFreeRuntimeT<float>>(); });
+    m.def("dual_b", [] { return dual_b_checks<cutlass::bfloat16_t>() + dual_b_checks<float>() + dual_b_lut_checks(); });
     m.def("int8_and_fp8_channel", int8_checks);
     m.def("fp8_block", fp8_checks);
     m.def("fp4", fp4_checks);
@@ -257,6 +334,9 @@ class CompileKeyTests(unittest.TestCase):
 
     def test_bf16_cute_free_both_output_types(self):
         self.assertGreater(self.native.bf16_cute_free(), 0)
+
+    def test_dual_b_lut_and_codegen_keys(self):
+        self.assertGreater(self.native.dual_b(), 0)
 
     def test_int8_and_fp8_channel(self):
         self.assertGreater(self.native.int8_and_fp8_channel(), 0)
