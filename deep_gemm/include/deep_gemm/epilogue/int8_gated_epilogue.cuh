@@ -8,7 +8,7 @@
 #include <deep_gemm/epilogue/epilogue_traits.cuh>
 
 namespace deep_gemm::epilogue {
-// Keep dequantized GEMM1 values and activation arithmetic in FP32.
+// Activation arithmetic uses FP32.
 template <GatedActivation Kind, bool ApplyClamp, bool HasLinearBeta, bool FastMath = true>
 __device__ __forceinline__ float int8_gated_value(
         float gate, float up, float limit, float beta, float linear_beta, float alpha) {
@@ -27,7 +27,7 @@ __device__ __forceinline__ float int8_gated_value(
 template <class StrideC, class StrideD, class ThreadOp, bool Clamp, int GateGroup,
           uint32_t LimitBits = 0xffffffffu,
           GatedActivation Kind = GatedActivation::SwiGLU, uint32_t BetaBits = 0,
-          uint32_t LinearBetaBits = 0, uint32_t AlphaBits = 0, bool FastMath = true>
+          uint32_t LinearBetaBits = 0, uint32_t AlphaBits = 0, bool FastMath = true, bool BF16ActivationInput = false>
 class Int8GatedEpilogue : public cutlass::epilogue::collective::DefaultEpilogueNoTsm<
         StrideC, StrideD, ThreadOp, cutlass::gemm::EpilogueDefault, true> {
     using Base = cutlass::epilogue::collective::DefaultEpilogueNoTsm<
@@ -40,6 +40,11 @@ public:
         else return __uint_as_float(LimitBits);
     }
     CUTLASS_DEVICE static float activate(float gate, float up, float runtime) {
+        // Unfused W4A8 GEMM1 outputs BF16 before the activation reads gate and up.
+        if constexpr (BF16ActivationInput) {
+            gate = float(ElementD(gate));
+            up = float(ElementD(up));
+        }
         return int8_gated_value<Kind, Clamp, Kind != GatedActivation::SiTU || LinearBetaBits != 0, FastMath>(
             gate, up, resolved_limit(runtime), __uint_as_float(BetaBits),
             __uint_as_float(LinearBetaBits), __uint_as_float(AlphaBits));

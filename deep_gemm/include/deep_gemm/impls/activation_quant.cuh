@@ -142,8 +142,8 @@ __device__ void activation_tiled(const ActivationParams& p) {
 
 namespace deep_gemm {
 // FP32 activations are rounded once when stored to the BF16 scratch.
-// Quantize each complete row with truncation; input dispatch uses nearest-even.
-template <int Intermediate, int Threads = 256, bool WarpRows = false>
+// W4A8 follows SGLang per_token_quant_int8 (ties away from zero). W8A8 uses truncation.
+template <int Intermediate, int Threads = 256, bool WarpRows = false, bool RoundToNearest = false>
 __device__ __forceinline__ void int8_quant_activated(
         const __ppu_bfloat16* input, int8_t* output, float* scales, const uint32_t* rows) {
     constexpr int RowThreads = WarpRows ? 32 : Threads;
@@ -176,7 +176,14 @@ __device__ __forceinline__ void int8_quant_activated(
         } else {
             amax = tix::block_reduce_max<Threads>(amax, warp_max, 1.0e-10f);
         }
-        const float scale = amax / 127.0f;
+        float scale, inverse;
+        if constexpr (RoundToNearest) {
+            // Match SGLang's FP32 division on both sides of half-integer bin boundaries.
+            asm("ppu.div.full.f32 %0, %1, %2;" : "=f"(scale) : "f"(amax), "f"(127.0f));
+            asm("ppu.div.full.f32 %0, %1, %2;" : "=f"(inverse) : "f"(127.0f), "f"(amax));
+        } else {
+            scale = amax / 127.0f;
+        }
         if (lane == 0) scales[row] = scale;
         #pragma unroll
         for (int i = 0; i < Intermediate / (RowThreads * Vector); ++i) {
@@ -185,8 +192,12 @@ __device__ __forceinline__ void int8_quant_activated(
             auto* target = WarpRows ? reinterpret_cast<int8_t*>(&packed) : output + offset;
             #pragma unroll
             for (int j = 0; j < Vector; ++j) {
-                const float quantized = values[i * Vector + j] / scale;
-                target[j] = static_cast<int8_t>(fminf(127.0f, fmaxf(-128.0f, quantized)));
+                const float value = values[i * Vector + j];
+                if constexpr (RoundToNearest) {
+                    target[j] = static_cast<int8_t>(roundf(value * inverse));
+                } else {
+                    target[j] = static_cast<int8_t>(fminf(127.0f, fmaxf(-128.0f, value / scale)));
+                }
             }
             if constexpr (WarpRows) *reinterpret_cast<uint2*>(output + offset) = packed;
         }

@@ -73,6 +73,7 @@ public:
         uint32_t beta_bits = 0, linear_beta_bits = 0, alpha_bits = 0;
         const char* kernel_name = kName;
         bool split_sync = false;
+        bool packed_int4 = false;
     };
 
     static std::string generate_impl(const Args& a) {
@@ -86,12 +87,12 @@ public:
             else return 0;
         }();
         const auto linear = fmt::format(
-            "deep_gemm::MegaMoEInt8Kernel<{},{},{},{},{},{},{},{},{},{},deep_gemm::MegaMoEPhaseKind::{},{},{},{},{},{},{}u,deep_gemm::GatedActivation::{},{}u,{}u,{}u,{}>",
+            "deep_gemm::MegaMoEInt8Kernel<{},{},{},{},{},{},{},{},{},{},deep_gemm::MegaMoEPhaseKind::{},{},{},{},{},{},{}u,deep_gemm::GatedActivation::{},{}u,{}u,{}u,{},{}>",
             kIsLinear1 ? a.intermediate * 2 : a.hidden, kIsLinear1 ? a.hidden : a.intermediate,
             c.block_m, c.block_n, c.block_k, c.warp_m, c.warp_n, a.groups, c.num_stages, Ranks,
             kIsLinear1 ? "Linear1" : "Linear2", a.capacity, a.topk, ktpf, wait_scatter_pair,
             a.apply_clamp, a.activation_limit_bits, activation, a.beta_bits, a.linear_beta_bits,
-            a.alpha_bits, a.fast_math);
+            a.alpha_bits, a.fast_math, a.packed_int4);
         mega::ReduceConfig reduce;
         if constexpr (!kIsLinear1) {
             reduce = mega::select_reduce_config(
@@ -108,6 +109,12 @@ public:
             "deep_gemm::mega_moe_int8_scatter_impl<Kernel,{},{},{},{},{},{},{}>(params, smem, ids, weights, output, tokens);",
             a.hidden, a.topk, a.groups, Ranks, is_bf16x8_aligned(a.reduce_output),
             reduce.column_splits, reduce.group_threads);
+        // A8W4's native collective owns the TSM layout and its padding.
+        const auto smem_check = a.packed_int4 ? std::string{} :
+            fmt::format("static_assert(Kernel::SharedStorageSize == {});", a.launch_args.smem_size);
+        const char* smem = a.packed_int4 && !reduce_only
+            ? "alignas(128) __shared__ char smem[Kernel::SharedStorageSize];"
+            : "extern __shared__ char smem[];";
         return fmt::format(R"(
 #define DG_MEGAMOE_OWNER_MODE 1
 #define DG_MEGAMOE_SITU_USE_RCP {}
@@ -119,19 +126,19 @@ static_assert(sizeof(Kernel::Params) == {});
 static_assert(offsetof(Kernel::Params, mainloop) == {});
 static_assert(offsetof(Kernel::Params, epilogue) == {});
 static_assert(offsetof(Kernel::Params, scheduler) == {});
-static_assert(Kernel::SharedStorageSize == {});
+{}
 extern "C" __global__ __launch_bounds__(Kernel::MaxThreadsPerBlock) void {}(
     Kernel::Params params{}) {{
-    extern __shared__ char smem[];
+    {}
     {}
 }}
 )", static_cast<int>(kIsLinear1 && a.activation == GatedActivation::SiTU),
             static_cast<int>(a.split_sync),
             linear, sizeof(Params), offsetof(Params, collective_mainloop_params),
             offsetof(Params, collective_epilogue_params), offsetof(Params, scheduler),
-            a.launch_args.smem_size, a.kernel_name,
+            smem_check, a.kernel_name,
             kIsLinear1 ? "" : ", const int64_t* ids, const float* weights, __ppu_bfloat16* output, int tokens",
-            execute);
+            smem, execute);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args a) {
@@ -153,6 +160,7 @@ public:
         int8_t* output;
         float* scale;
         const uint32_t* rows;
+        bool round_to_nearest;
     };
     static std::string generate_impl(const Args& a) {
         // Short batches need a CTA per row to keep the launch grid populated.
@@ -162,9 +170,9 @@ public:
 extern "C" __global__ __launch_bounds__(256) void megamoe_int8_quant(
         const __ppu_bfloat16* input, int8_t* output, float* scale,
         const uint32_t* rows) {{
-    deep_gemm::int8_quant_activated<{},256,{}>(input, output, scale, rows);
+    deep_gemm::int8_quant_activated<{},256,{},{}>(input, output, scale, rows);
 }}
-)", a.intermediate, warp_rows);
+)", a.intermediate, warp_rows, a.round_to_nearest);
     }
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args a) {
         DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, a.input, a.output, a.scale, a.rows));
@@ -202,18 +210,18 @@ static void launch_int8_split_stage1(typename Runtime::Args& args, int num_sms, 
 
     // Every persistent GEMM CTA computes. Copy uses a separate grid and its
     // own intensive launch instead of taking slots from the Tensor CU budget.
-    const std::array<int64_t, 25> key{
+    const std::array<int64_t, 26> key{
         args.hidden, args.intermediate, args.groups, args.capacity, args.topk,
         tile.block_m, tile.block_n, tile.block_k, tile.warp_m, tile.warp_n, tile.num_stages,
         tile.k_tiles_per_flag, copy_ctas, num_sms, threads, copy_threads, args.launch_args.smem_size,
         args.apply_clamp, args.activation_limit_bits,
         static_cast<int>(args.activation), args.beta_bits, args.linear_beta_bits, args.alpha_bits, args.fast_math,
-        args.split_sync};
+        args.split_sync, args.packed_int4};
     HGcontext context = nullptr;
     DG_HGGC_DRIVER_CHECK(hgCtxGetCurrent(&context));
     const auto* active_compiler = compiler.operator->();
     struct Plan {
-        std::array<int64_t, 25> key;
+        std::array<int64_t, 26> key;
         HGcontext context;
         const Compiler* compiler;
         std::string signature, flags;
@@ -293,12 +301,13 @@ static auto make_packed_stride(int m, int n) {
     return cutlass::make_cute_packed_stride(Stride{}, cute::make_shape(m, n, 1));
 }
 
-static LaunchArgs make_launch_args(const mega::MegaMoEPhaseConfig& config, bool scatter) {
+static LaunchArgs make_launch_args(const mega::MegaMoEPhaseConfig& config, bool scatter, bool packed_int4) {
+    const auto threads = dim3((config.block_m / config.warp_m) * (config.block_n / config.warp_n) * 32);
+    if (packed_int4) return {dim3(1), threads, 0};
     const int smem = config.num_stages * (config.block_m + config.block_n) * config.block_k;
     const int epilogue = scatter
         ? 2 * (config.block_m / config.warp_m) * 16 * config.block_n * int(sizeof(float)) : 0;
-    return {dim3(1), dim3((config.block_m / config.warp_m) * (config.block_n / config.warp_n) * 32),
-            std::max(smem, epilogue)};
+    return {dim3(1), threads, std::max(smem, epilogue)};
 }
 
 template <int Ranks>
@@ -308,12 +317,13 @@ static auto make_linear1_args(
         int capacity, int topk, const mega::MegaMoEL1Config& config, int num_sms,
         GatedActivation activation, float limit,
         float beta, float linear_beta, float alpha, bool fast_math,
-        int32_t* cumulative_local_expert_recv_stats) {
+        int32_t* cumulative_local_expert_recv_stats, bool packed_int4) {
     using Runtime = GemmRuntime<MegaMoEPhaseKind::Linear1, Ranks>;
     const auto& [weight, scale] = w1;
-    const int hidden = weight.size(2), groups = weight.size(0);
+    const int hidden = weight.size(2) * (packed_int4 ? 2 : 1), groups = weight.size(0);
     typename Runtime::Args args{config, hidden, intermediate, groups, capacity, topk,
-                                make_launch_args(config, false)};
+                                make_launch_args(config, false, packed_int4)};
+    args.packed_int4 = packed_int4;
     args.apply_clamp = std::isfinite(limit);
     args.activation = activation;
     args.fast_math = fast_math;
@@ -359,7 +369,7 @@ static void launch_linear1(
         args.intermediate, int64_t(num_tokens) * args.topk,
         {dim3(num_sms * 4), dim3(256), 0}, buffers.activated.data(base),
         buffers.l2_acts.data<int8_t>(base), buffers.l2_acts_sf.data<float>(base),
-        buffers.expert_base.data<uint32_t>(base) + args.groups};
+        buffers.expert_base.data<uint32_t>(base) + args.groups, args.packed_int4};
     auto kernel = compiler->build("megamoe_int8_quant", Int8MegaMoEQuantRuntime::generate(quantization));
     const int vector_grid = device_runtime->get_prop()->multiProcessorCount * 4;
     if (vector_grid > quantization.launch_args.grid_dim.x &&
@@ -372,12 +382,13 @@ template <int Ranks>
 static auto make_linear2_args(
         const std::tuple<torch::Tensor, torch::Tensor>& w2, const layout::Int8MegaMoEBuffer& buffers,
         uint8_t* base, const std::vector<int64_t>& pointers, int rank, int capacity, int topk,
-        int* masked_m, const mega::MegaMoEPhaseConfig& config, int num_sms) {
+        int* masked_m, const mega::MegaMoEPhaseConfig& config, int num_sms, bool packed_int4) {
     using Runtime = GemmRuntime<MegaMoEPhaseKind::Linear2, Ranks>;
     const auto& [weight, scale] = w2;
-    const int hidden = weight.size(1), intermediate = weight.size(2), groups = weight.size(0);
+    const int hidden = weight.size(1), intermediate = weight.size(2) * (packed_int4 ? 2 : 1), groups = weight.size(0);
     typename Runtime::Args args{config, hidden, intermediate, groups, capacity, topk,
-                                make_launch_args(config, true)};
+                                make_launch_args(config, true, packed_int4)};
+    args.packed_int4 = packed_int4;
     auto& params = args.kernel_params;
     params.mode = cutlass::gemm::GemmUniversalMode::kGemm;
     params.problem_shape = {static_cast<int>(buffers.compact), hidden, intermediate, 1};
@@ -416,21 +427,24 @@ static void int8_mega_moe_impl(
         GatedActivation activation = GatedActivation::SwiGLU,
         float beta = 0, float linear_beta = 0, float alpha = 1.702f,
         int32_t* cumulative_local_expert_recv_stats = nullptr,
-        bool fast_math = true) {
-    const int hidden = std::get<0>(w1).size(2), intermediate = std::get<0>(w2).size(2);
+        bool fast_math = true, bool packed_int4 = false) {
+    const int packed = packed_int4 ? 2 : 1;
+    const int hidden = std::get<0>(w1).size(2) * packed, intermediate = std::get<0>(w2).size(2) * packed;
     const int groups = std::get<0>(w1).size(0), num_sms = device_runtime->get_num_sms();
-    const auto config = mega::select_int8_mega_moe(expected_m, hidden, intermediate, groups, num_sms,
-        get_env<int>("DG_MEGAMOE_COPY_THREADS", 0));
+    const int copy_threads = get_env<int>("DG_MEGAMOE_COPY_THREADS", 0);
+    const auto config = packed_int4
+        ? mega::select_int8_int4_mega_moe(expected_m, hidden, intermediate, groups, num_sms, copy_threads)
+        : mega::select_int8_mega_moe(expected_m, hidden, intermediate, groups, num_sms, copy_threads);
     const bool split_sync = get_env<int>("DG_MEGAMOE_SPLIT_SYNC", 0) != 0;
 
     auto l1_args = make_linear1_args<Ranks>(w1, intermediate, buffers, base, layout::SymBuffer<>(pointers, rank),
         capacity, topk, config.l1, num_sms, activation, limit,
-        beta, linear_beta, alpha, fast_math, cumulative_local_expert_recv_stats);
+        beta, linear_beta, alpha, fast_math, cumulative_local_expert_recv_stats, packed_int4);
     l1_args.split_sync = split_sync;
     launch_linear1<Ranks>(l1_args, buffers, base, y.size(0), num_sms, streams);
 
     auto l2_args = make_linear2_args<Ranks>(w2, buffers, base, pointers, rank, capacity, topk,
-        l1_args.kernel_params.scheduler.grouped_layout, config.l2, num_sms);
+        l1_args.kernel_params.scheduler.grouped_layout, config.l2, num_sms, packed_int4);
     l2_args.reduce_ids = buffers.topk_idx.data<int64_t>(base);
     l2_args.reduce_weights = buffers.topk_weights.data<float>(base);
     l2_args.reduce_output = y.data_ptr();
@@ -439,20 +453,20 @@ static void int8_mega_moe_impl(
     launch_linear2<Ranks>(l2_args, num_sms);
 }
 
-static void int8_int8_mega_moe_impl(uint8_t* base, const layout::Int8MegaMoEBuffer& buffers,
+static void int8_activation_mega_moe_impl(uint8_t* base, const layout::Int8MegaMoEBuffer& buffers,
         int capacity, int topk, CopyStreamResources& streams,
         const std::vector<int64_t>& pointers, int rank, const torch::Tensor& y,
         const std::tuple<torch::Tensor, torch::Tensor>& w1,
         const std::tuple<torch::Tensor, torch::Tensor>& w2,
         const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
         int expected_m,
-        GatedActivation activation, float limit, float beta, float linear_beta, float alpha, bool fast_math) {
+        GatedActivation activation, float limit, float beta, float linear_beta, float alpha, bool fast_math, bool packed_int4) {
     mega_int8::for_ranks(pointers.size(), [&](auto r) {
         mega_int8::int8_mega_moe_impl<decltype(r)::value>(y, w1, w2, base, buffers, pointers,
             rank, capacity, topk, expected_m, limit, streams,
             activation, beta, linear_beta, alpha,
             cumulative_local_expert_recv_stats ? cumulative_local_expert_recv_stats->data_ptr<int32_t>() : nullptr,
-            fast_math);
+            fast_math, packed_int4);
     });
 }
 

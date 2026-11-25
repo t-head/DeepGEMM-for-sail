@@ -18,6 +18,7 @@
 #include <deep_gemm/layout/routed_moe.cuh>
 #include "common_fp8.hpp"
 #include "common_int8.hpp"
+#include "common_a8w4_int8.hpp"
 #include "common_w4a16.hpp"
 #include "common_w4a8.hpp"
 #include "mega_moe_tuning.hpp"
@@ -259,6 +260,19 @@ static MegaMoEConfig select_int8_mega_moe(
                    ceil_div(hidden / up.block_k, ktpf) <= 7);
     return {{up, select_l1_copy_blocks(expected_m, intermediate_hidden * 2,
                 hidden, groups, up, ktpf, copy_threads / 32), ktpf}, {down}};
+}
+
+static MegaMoEConfig select_int8_int4_mega_moe(int expected_m, int hidden, int intermediate,
+                                               int groups, int num_sms, int copy_threads) {
+    const auto select = [&](int n, int k) {
+        return make_phase_config(deep_gemm_a8w4_common::get_best_configs(
+            expected_m, n, k, groups, num_sms, GemmType::MGroupedNoPad));
+    };
+    const auto up = select(2 * intermediate, hidden);
+    const auto down = select(hidden, intermediate);
+    const int ktpf = aligned_copy_ktpf(hidden, up.block_k, 0);
+    return {{up, select_l1_copy_blocks(expected_m, 2 * intermediate, hidden, groups, up, ktpf,
+        get_int8_mega_moe_copy_threads(copy_threads) / 32), ktpf}, {down}};
 }
 
 inline int combine_num_threads(int tokens, int hidden) {

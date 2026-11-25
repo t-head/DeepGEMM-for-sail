@@ -4,6 +4,7 @@
 #include <cutlass/gemm/config/gemm_configs.hpp>
 
 #include <deep_gemm/impls/int8_gemm_cutlass3.cuh>
+#include <deep_gemm/impls/a8w4_int8_gemm_cutlass3.cuh>
 #include <deep_gemm/epilogue/int8_gated_epilogue.cuh>
 #include <deep_gemm/impls/int8_mega_moe_dispatch.cuh>
 #include <deep_gemm/epilogue/mega_moe_l2_epilogue.cuh>
@@ -17,7 +18,7 @@ template <int N, int K, int BM, int BN, int BK, int WM, int WN,
           bool WaitScatterPair = false, bool ApplyClamp = false,
           uint32_t ActivationLimitBits = 0xffffffffu,
           GatedActivation Activation = GatedActivation::SwiGLU, uint32_t BetaBits = 0,
-          uint32_t LinearBetaBits = 0, uint32_t AlphaBits = 0, bool FastMath = true>
+          uint32_t LinearBetaBits = 0, uint32_t AlphaBits = 0, bool FastMath = true, bool PackedInt4 = false>
 struct MegaMoEInt8Kernel {
     static_assert(Stage == MegaMoEPhaseKind::Linear1 || Stage == MegaMoEPhaseKind::Linear2,
                   "unsupported MegaMoE stage");
@@ -31,18 +32,25 @@ struct MegaMoEInt8Kernel {
     using StrideCD = cutlass::detail::TagToStrideC_t<cutlass::layout::RowMajor>;
     using OperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<Arch, Element, false,
         cute::Int<BM>, cute::Int<BK>, false, BM * BK>;
-    using OperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<Arch, Element, false,
-        cute::Int<BN>, cute::Int<BK>, true, BN * BK>;
+    using ElementB = cute::conditional_t<PackedInt4, cutlass::int4b_t, Element>;
+    using OperandB = cute::conditional_t<PackedInt4, A8W4PackedOperandB<Arch, BN, BK>,
+        cutlass::gemm::config::DefaultGemm_AIU_Operand<Arch, Element, false,
+            cute::Int<BN>, cute::Int<BK>, true, BN * BK>>;
+    using Schedule = cutlass::gemm::KernelAiuMultistage;
+    static constexpr int kCopyKTiles = kIsLinear1 ? KTilesPerFlag : 0;
+    using Policy = cute::conditional_t<PackedInt4,
+        cutlass::gemm::MainloopPPUAiuA8W4<Stages, Schedule, kCopyKTiles>,
+        cutlass::gemm::MainloopPPUAiuA8W8<Stages, Schedule, kCopyKTiles>>;
     using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<Arch, Element, Element, int32_t>::type;
     using Mma = cute::TiledMMA<cute::MMA_Atom<MmaInst>,
         cute::Layout<cute::Shape<WarpOnM, WarpOnN, cute::_1>>,
-        cute::Tile<cute::Int<(BM / WM) * 16>, cute::Int<(BN / WN) * 16>, cute::_32>>;
+        cute::Tile<cute::Int<(BM / WM) * 16>, cute::Int<(BN / WN) * 16>,
+                   cute::Int<PackedInt4 ? 64 : 32>>>;
     using Mainloop = cutlass::gemm::collective::CollectiveMma<Arch,
-        cutlass::gemm::MainloopPPUAiuA8W8<Stages, cutlass::gemm::KernelAiuMultistage,
-                                       kIsLinear1 ? KTilesPerFlag : 0>,
+        Policy,
         cute::Shape<cute::Int<BM>, cute::Int<BN>, cute::Int<BK>>,
         Element, cutlass::detail::TagToStrideA_t<cutlass::layout::RowMajor>,
-        Element, cutlass::detail::TagToStrideB_t<cutlass::layout::ColumnMajor>, Mma,
+        ElementB, cutlass::detail::TagToStrideB_t<cutlass::layout::ColumnMajor>, Mma,
         typename OperandA::GmemTiledCopy, typename OperandA::SmemLayoutAtom,
         typename OperandA::SmemCopyAtom, cute::identity,
         typename OperandB::GmemTiledCopy, typename OperandB::SmemLayoutAtom,
@@ -50,7 +58,7 @@ struct MegaMoEInt8Kernel {
     using ActivationEpilogue = epilogue::Int8GatedEpilogue<StrideCD, StrideCD,
         cutlass::epilogue::thread::LinearCombination<cutlass::bfloat16_t, 2, float, float,
             cutlass::epilogue::thread::ScaleType::Nothing>, ApplyClamp, 4, ActivationLimitBits,
-            Activation, BetaBits, LinearBetaBits, AlphaBits, FastMath>;
+            Activation, BetaBits, LinearBetaBits, AlphaBits, FastMath, PackedInt4>;
     using ScatterEpilogue = epilogue::MegaMoEScatterEpilogue<StrideCD, StrideCD,
         cute::Layout<cute::Shape<cute::Int<(BM / WM) * 16>, cute::Int<BN>>,
                      cute::Stride<cute::Int<BN>, cute::_1>>,

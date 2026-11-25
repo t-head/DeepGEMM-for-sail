@@ -20,6 +20,8 @@ __all__ = [
     "fp8_fp8_mega_moe", "bf16_fp4_mega_moe", "bf16_int4_mega_moe",
     "transform_weights_for_w4a8_mega_moe", "fp8_fp4_mega_moe",
     "int8_int8_mega_moe",
+    "int8_int4_mega_moe",
+    "transform_weights_for_int8_int4_mega_moe",
 ]
 
 def _normalize_activation(activation: str) -> str:
@@ -36,7 +38,7 @@ class SymmBuffer:
     """Symmetric workspace for the supported PPU MegaMoE precisions.
 
     mma_type='fp4xfp4' (also 'mxfp4xmxfp4') selects W4A4; 'fp8xfp4' selects W4A8.
-    'int8xint8' selects SM80 INT8 with one FP32 scale per token.
+    'int8xint8' and 'int8xint4' select SM80 INT8 activations with one FP32 scale per token.
     'bf16xfp4' selects MXFP4 W4A16 and 'bf16xint4' selects SM80 INT4 W4A16; 'fp8xfp8' selects W8A8, with
     quantization='channelwise' (default) or 'blockwise'. intermediate_hidden is I.
 
@@ -51,7 +53,7 @@ class SymmBuffer:
     x is the FP4 dispatch view in [token, hidden/2] order. x_sf is the pushed-SFA
     staging view in [parity, source_rank, source_token, scale_block]
     order. It is an internal output of pre-dispatch, not a source-scale input
-    that callers may fill directly. W4A8 instead exposes E4M3 x [token, hidden]
+    that callers may fill directly. The fp8xfp4 workspace exposes E4M3 x [token, hidden]
     and FP32 x_sf [token, 1], as does FP8 channelwise. FP8 blockwise has one
     input scale per 128 elements. W4A16 exposes BF16 x and an empty x_sf view.
     INT8 exposes x [token, hidden] and per-source-token FP32 scales in the
@@ -134,7 +136,7 @@ class SymmBuffer:
             self.handle = base.handle
 
         # Create input buffer views
-        if mma_type in ('fp4xfp4', 'int8xint8'):
+        if mma_type in ('fp4xfp4', 'int8xint8', 'int8xint4'):
             (self.x, self.x_sf,
              self.topk_idx, self.topk_weights,
              self.l1_acts, self.l1_acts_sf,
@@ -156,7 +158,7 @@ class SymmBuffer:
             raise RuntimeError("SymmBuffer cannot be destroyed during graph capture")
         self.handle = self.buffer = self.group = None
         self.x = self.x_sf = self.topk_idx = self.topk_weights = None
-        if self.mma_type in ('fp4xfp4', 'int8xint8'):
+        if self.mma_type in ('fp4xfp4', 'int8xint8', 'int8xint4'):
             self.l1_acts = self.l1_acts_sf = self.l2_acts = self.l2_acts_sf = None
 
 
@@ -178,7 +180,7 @@ def get_symm_buffer_for_mega_moe(
 
     The workspace is filled by mega_moe_pre_dispatch and consumed by
     the corresponding complete compute entry. MMA modes are 'fp4xfp4' (alias 'mxfp4xmxfp4'),
-    'int8xint8', 'fp8xfp4', 'bf16xfp4', 'bf16xint4' and 'fp8xfp8'. Only fp8xfp8 accepts quantization,
+    'int8xint8', 'int8xint4', 'fp8xfp4', 'bf16xfp4', 'bf16xint4' and 'fp8xfp8'. Only fp8xfp8 accepts quantization,
     selecting channelwise (default) or blockwise scales.
     """
     if use_fp8_dispatch is not None:
@@ -397,21 +399,60 @@ def int8_int8_mega_moe(
     valid route on every call, including routes with zero weight. Initialize
     or reset the cumulative counters in the caller.
     """
-    if (not isinstance(sym_buffer, SymmBuffer) or sym_buffer.mma_type != 'int8xint8'
+    _run_int8_activation_mega_moe(
+        _C.int8_int8_mega_moe, "int8xint8", y, l1_weights, l2_weights, sym_buffer,
+        cumulative_local_expert_recv_stats, recipe, activation, activation_clamp,
+        fast_math, situ_beta, situ_linear_beta, activation_alpha)
+
+
+def int8_int4_mega_moe(
+    y: torch.Tensor,
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+    sym_buffer: SymmBuffer,
+    cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+    recipe: Tuple[int, int, int] = (1, 1, 0),
+    activation: str = "swiglu",
+    activation_clamp: Optional[float] = None,
+    fast_math: bool = True,
+    *,
+    situ_beta: Optional[float] = 4.0,
+    situ_linear_beta: Optional[float] = 25.0,
+    activation_alpha: Optional[float] = None,
+) -> None:
+    """Run SM80 W4A8 MegaMoE with INT8 activations and signed packed INT4 weights.
+
+    Prepare the two weight/FP32 channel-scale pairs with
+    transform_weights_for_int8_int4_mega_moe. Use an int8xint4 SymmBuffer
+    and recipe (1, 1, 0). Activations and output follow int8_int8_mega_moe.
+    """
+    _run_int8_activation_mega_moe(
+        _C.int8_int4_mega_moe, "int8xint4", y, l1_weights, l2_weights, sym_buffer,
+        cumulative_local_expert_recv_stats, recipe, activation, activation_clamp,
+        fast_math, situ_beta, situ_linear_beta, activation_alpha)
+
+
+def _run_int8_activation_mega_moe(
+    kernel, mma_type, y, l1_weights, l2_weights, sym_buffer,
+    cumulative_local_expert_recv_stats, recipe, activation, activation_clamp,
+    fast_math, situ_beta, situ_linear_beta, activation_alpha,
+):
+    if (not isinstance(sym_buffer, SymmBuffer) or sym_buffer.mma_type != mma_type
             or sym_buffer.buffer is None):
-        raise ValueError("int8_int8_mega_moe requires a live SymmBuffer(mma_type='int8xint8')")
+        raise ValueError(f"expected a live SymmBuffer(mma_type={mma_type!r})")
     activation = _normalize_activation(activation)
     # C++ infers dimensions from weights; reject a differently shaped buffer before entering it.
     groups = sym_buffer.num_experts // sym_buffer.group.size()
-    for pair, shape in ((l1_weights, (groups, 2 * sym_buffer.intermediate_hidden, sym_buffer.hidden)),
-                        (l2_weights, (groups, sym_buffer.hidden, sym_buffer.intermediate_hidden))):
+    packing = 2 if mma_type == "int8xint4" else 1
+    for pair, shape in ((l1_weights, (groups, 2 * sym_buffer.intermediate_hidden, sym_buffer.hidden // packing)),
+                        (l2_weights, (groups, sym_buffer.hidden, sym_buffer.intermediate_hidden // packing))):
         if (not isinstance(pair, (tuple, list)) or len(pair) != 2
                 or not isinstance(pair[0], torch.Tensor) or tuple(pair[0].shape) != shape):
             raise ValueError("weight shape must match the INT8 MegaMoE buffer")
     if activation != 'situ':
         situ_beta = None if situ_beta == 4.0 else situ_beta
         situ_linear_beta = None if situ_linear_beta == 25.0 else situ_linear_beta
-    _C.int8_int8_mega_moe(
+    kernel(
         y, l1_weights, l2_weights, cumulative_local_expert_recv_stats, sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
@@ -424,6 +465,41 @@ def _interleave_weights(tensor: torch.Tensor, gran: int = 8) -> torch.Tensor:
     experts, n, k = tensor.shape
     return (tensor.reshape(experts, 2, n // (2 * gran), gran, k)
             .transpose(1, 2).contiguous().reshape(experts, n, k))
+
+
+def transform_weights_for_int8_int4_mega_moe(
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+    activation: str = "swiglu",
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    """Convert portable packed INT4 weights to the SM80 W4A8 layout.
+
+    Inputs are uint8 [E, 2*I, H/2] and [E, H, I/2], with two signed INT4
+    nibbles per byte (even K index in the low nibble). FP32 scales are [E, 2*I]
+    and [E, H]. Pass raw [gate...][up...] L1 rows to interleave groups of four.
+    """
+    _normalize_activation(activation)
+    for w, scale in (l1_weights, l2_weights):
+        if w.dtype != torch.uint8 or w.ndim != 3 or not w.is_contiguous():
+            raise ValueError("W4A8 requires contiguous packed uint8 weights [E,N,K/2]")
+        if (scale.dtype != torch.float32 or scale.shape != w.shape[:2]
+                or scale.device != w.device or not scale.is_contiguous()):
+            raise ValueError("W4A8 requires contiguous FP32 channel scales [E,N]")
+        if not w.is_cuda or torch.cuda.get_device_capability(w.device) != (8, 0):
+            raise ValueError("INT8×INT4 MegaMoE requires SM80")
+    w1, s1 = l1_weights
+    w2, s2 = l2_weights
+    hidden, intermediate = 2 * w1.shape[-1], 2 * w2.shape[-1]
+    if (w1.device != w2.device or w1.shape[0] != w2.shape[0]
+            or w1.shape[1] != 2 * intermediate or w2.shape[1] != hidden
+            or hidden < 2048 or hidden % 512 or intermediate <= 0 or intermediate % 256):
+        raise ValueError("Unsupported INT8×INT4 MegaMoE weight dimensions")
+    mode = _C.PreprocessMode.W4A8_INT8
+    return (
+        _C.preprocess_weights_and_scales(mode, False, _interleave_weights(w1, 4),
+                                         _interleave_weights(s1.unsqueeze(-1), 4).squeeze(-1)),
+        _C.preprocess_weights_and_scales(mode, False, w2, s2),
+    )
 
 
 def _check_routed_weights(l1_weights, l2_weights, dtype, blockwise=False, *, scale_dtypes=None):

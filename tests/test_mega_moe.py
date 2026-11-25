@@ -225,11 +225,12 @@ def _reference_activation(projection, case):
 
 
 def _reference_mega_moe(case, source, ids, weights, l1_weights_raw, l2_weights_raw,
-                        num_tokens, checked, *, quantization_aware=True, projection_dtype=torch.float32):
+                        num_tokens, checked, *, quantization_aware=True, projection_dtype=torch.float32,
+                        w4a8=False):
     """Independent distributed MoE reference with format-specific quantization.
 
-    INT8 retains FP32 projection/activation arithmetic, stores BF16 results and truncates the
-    post-activation values; input dispatch uses nearest-even quantization.
+    INT8 retains FP32 projection/activation arithmetic, stores BF16 results and selects post-activation rounding
+    for W4A8 or truncation for W8A8; input dispatch uses nearest-even quantization.
     The optional FP4 diagnostic omits activation quantization.
     """
     c = case
@@ -257,9 +258,15 @@ def _reference_mega_moe(case, source, ids, weights, l1_weights_raw, l2_weights_r
         if int8:
             projection = ((x[src, tok] @ l1_weights[expert].float().t())
                           * input_scales[src, tok, None] * l1_weights_sf[expert])
+            if w4a8:
+                projection = projection.bfloat16().float()
             activated = _reference_activation(projection, c).bfloat16().float()
             scales = activated.abs().amax(-1).clamp_min(1e-10) / 127
-            q = (activated / scales[:, None]).clamp(-128, 127).to(torch.int8)
+            if w4a8:
+                scaled = activated * (127.0 / activated.abs().amax(-1, keepdim=True).clamp_min(1e-10))
+                q = (scaled.sign() * (scaled.abs() + 0.5).floor()).to(torch.int8)
+            else:
+                q = (activated / scales[:, None]).clamp(-128, 127).to(torch.int8)
             y = (q.float() @ l2_weights[expert].float().t()) * scales[:, None] * l2_weights_sf[expert]
         else:
             projection = x[src, tok] @ _dequantize_mxfp4(l1_weights[expert], l1_weights_sf[expert]).t()
@@ -348,7 +355,7 @@ def _compile_kernels(*calls):
 def _pre_dispatch(source, ids, weights, buffer):
     deep_gemm.mega_moe_pre_dispatch(
         source, ids, weights, buffer.x, buffer.x_sf, buffer.topk_idx, buffer.topk_weights,
-        num_tokens=source.shape[0], group_size=0 if buffer.mma_type == "int8xint8" else 32,
+        num_tokens=source.shape[0], group_size=0 if buffer.mma_type in ("int8xint8", "int8xint4") else 32,
         mma_type=buffer.mma_type)
 
 
@@ -801,6 +808,54 @@ def mega_moe_smoke(mega_moe_group, request):
                               options=options, pipeline=pipeline, reference=reference)
     finally:
         buffer.destroy()
+
+
+def test_sm80_int8_int4_mega_moe(mega_moe_group):
+    if torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("INT8×INT4 MegaMoE requires SM80")
+    group = mega_moe_group
+    local_experts, capacity, topk, hidden, intermediate = 8, 32, 4, 2048, 256
+    experts = group.size() * local_experts
+    rng = torch.Generator(device="cuda").manual_seed(18273 + group.rank())
+
+    def make_weights(n, k):
+        w = torch.randint(-8, 8, (local_experts, n, k), dtype=torch.int8,
+                          device="cuda", generator=rng)
+        scale = torch.full((local_experts, n), 1 / 128, device="cuda")
+        packed = ((w[..., ::2].to(torch.uint8) & 15) | (w[..., 1::2].to(torch.uint8) << 4)).contiguous()
+        return (packed, scale), (w, scale)
+
+    p1, u1 = make_weights(2 * intermediate, hidden)
+    p2, u2 = make_weights(hidden, intermediate)
+    w4 = deep_gemm.transform_weights_for_int8_int4_mega_moe(p1, p2)
+    w8 = deep_gemm.transform_weights_for_mega_moe(u1, u2)
+    x = torch.randn(16, hidden, dtype=torch.bfloat16, device="cuda", generator=rng) / 8
+    ids = torch.rand(16, experts, device="cuda", generator=rng).topk(topk).indices.to(torch.int32)
+    weights = torch.rand(16, topk, device="cuda", generator=rng).softmax(-1)
+    ids[0, 0], weights[1, 0] = -1, 0
+
+    def run(mma_type, kernel, bank):
+        b = deep_gemm.get_symm_buffer_for_mega_moe(
+            group, experts, capacity, topk, hidden, intermediate, mma_type=mma_type)
+        try:
+            y = torch.empty_like(x)
+            stats = torch.zeros(local_experts, dtype=torch.int32, device="cuda")
+            _pre_dispatch(x, ids, weights, b)
+            kernel(y, *bank, b, stats)
+            torch.cuda.synchronize()
+            return y, stats
+        finally:
+            b.destroy()
+
+    y4, s4 = run("int8xint4", deep_gemm.int8_int4_mega_moe, w4)
+    y8, s8 = run("int8xint8", deep_gemm.int8_int8_mega_moe, w8)
+    assert torch.isfinite(y4).all() and y4.abs().max() > 0
+    case = MegaMoECase("w4a8", hidden, intermediate, experts, topk, capacity, precision="int8_channelwise")
+    for y, nearest in ((y4, True), (y8, False)):
+        ref = _reference_mega_moe(case, x, ids, weights, u1, u2, len(x), len(x),
+                                  w4a8=nearest).float()
+        assert (y.float() - ref).norm() / ref.norm() < 0.015
+    torch.testing.assert_close(s4, s8, atol=0, rtol=0)
 
 
 def test_mega_moe_smoke_api(mega_moe_smoke, mega_moe_group):

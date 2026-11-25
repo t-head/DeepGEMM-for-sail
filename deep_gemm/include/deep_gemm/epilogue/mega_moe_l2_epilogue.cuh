@@ -314,7 +314,7 @@ private:
         constexpr int kRowsPerSubtile = kSmemM / kRowsPerIteration;
         static_assert(kNumThreads % 32 == 0 && kSmemM % kRowsPerIteration == 0);
         constexpr int kRowsPerBatch = kRowsPerSubtile == 1 ? 1 : 2;
-        static_assert(kRowsPerSubtile % kRowsPerBatch == 0 && (kVector == 4 || kVector == 8));
+        static_assert(kRowsPerSubtile % kRowsPerBatch == 0 && (kVector == 2 || kVector == 4 || kVector == 8));
         const int row_lane = thread_idx / 32;
         const int column = (thread_idx % 32) * kVector;
         auto* local_tile_base = scatter_buffer.template get_base_ptr<__ppu_bfloat16*>() + n_base;
@@ -382,7 +382,7 @@ private:
                                 reinterpret_cast<volatile void*>(destination),
                                 *reinterpret_cast<uint4*>(&value.packed));
                         }
-                    } else {
+                    } else if constexpr (kVector == 4) {
                         const float4 values = *reinterpret_cast<const float4*>(source);
                         const __ppu_bfloat162 low =
                             __floats2bfloat162_rn(values.x, values.y);
@@ -395,6 +395,10 @@ private:
                             "ppu.st.global.bl.v2.b32 [%0], {%1, %2};"
                             :: "l"(destination), "r"(packed.x),
                                "r"(packed.y) : "memory");
+                    } else {
+                        const float2 values = *reinterpret_cast<const float2*>(source);
+                        const __ppu_bfloat162 packed = __floats2bfloat162_rn(values.x, values.y);
+                        __stbl(reinterpret_cast<int32_t*>(destination), *reinterpret_cast<const int32_t*>(&packed));
                     }
                     if constexpr (kWaitScatterPair)
                         pending_remote |= destination_rank != scatter_buffer.rank_idx;

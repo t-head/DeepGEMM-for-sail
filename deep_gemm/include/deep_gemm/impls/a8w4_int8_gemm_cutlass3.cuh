@@ -1,5 +1,7 @@
 #pragma once
 
+#include <deep_gemm/comm/barrier.cuh>
+
 #include <deep_gemm/impls/int8_gemm_cutlass3.cuh>
 #include <cutlass/gemm/collective/ppu_mma_aiu_multistage_mixed_input.hpp>
 #include <cutlass/fast_numeric_conversion_for_mix_gemm.h>
@@ -100,9 +102,10 @@ struct A8W4PackedOperandB {
 
 namespace cutlass::gemm {
 
-template <int Stages_, typename Schedule_ = KernelAiuMultistage>
+template <int Stages_, typename Schedule_ = KernelAiuMultistage, int CopyKTilesPerFlag_ = 0>
 struct MainloopPPUAiuA8W4 {
   static constexpr int Stages = Stages_;
+  static constexpr int CopyKTilesPerFlag = CopyKTilesPerFlag_;
   using ArchTag = arch::PPU0010;
   using Schedule = Schedule_;
   using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
@@ -113,18 +116,18 @@ struct MainloopPPUAiuA8W4 {
 namespace cutlass::gemm::collective {
 
 template <
-    int Stages, typename KernelSchedule,
+    int Stages, typename KernelSchedule, int CopyKTilesPerFlag,
     typename TileShape_, typename StrideA_, typename StrideB_,
     typename TiledMma_, typename GmemTiledCopyA_, typename SmemLayoutAtomA_, typename SmemCopyAtomA_,
     typename TransformA_, typename GmemTiledCopyB_, typename SmemLayoutAtomB_, typename SmemCopyAtomB_,
     typename TransformB_>
 struct CollectiveMma<
-    cutlass::arch::PPU0010, MainloopPPUAiuA8W4<Stages, KernelSchedule>, TileShape_,
+    cutlass::arch::PPU0010, MainloopPPUAiuA8W4<Stages, KernelSchedule, CopyKTilesPerFlag>, TileShape_,
     int8_t, StrideA_, cutlass::int4b_t, StrideB_, TiledMma_,
     GmemTiledCopyA_, SmemLayoutAtomA_, SmemCopyAtomA_, TransformA_,
     GmemTiledCopyB_, SmemLayoutAtomB_, SmemCopyAtomB_, TransformB_> {
 public:
-  using DispatchPolicy = MainloopPPUAiuA8W4<Stages, KernelSchedule>;
+  using DispatchPolicy = MainloopPPUAiuA8W4<Stages, KernelSchedule, CopyKTilesPerFlag>;
   using TileShape = TileShape_;
   using ElementA = int8_t;
   using StrideA = StrideA_;
@@ -185,8 +188,15 @@ private:
   Params params_;
   ElementScale const* tile_scale_a_ = nullptr;
   ElementScale const* tile_scale_b_ = nullptr;
+  const volatile uint32_t* copy_ready_ = nullptr;
+  uint32_t generation_ = 0;
 
 public:
+  CUTLASS_DEVICE void set_copy_ready(const volatile uint32_t* flags, uint32_t generation) {
+    copy_ready_ = flags;
+    generation_ = generation;
+  }
+
   template <typename ProblemShape>
   CUTLASS_DEVICE CollectiveMma(Params params, ProblemShape) : params_(params) {
     base_params_.ptr_A = params.ptr_A;
@@ -225,7 +235,8 @@ public:
     constexpr int kMmaN = cute::size<2>(FrgTensorD{});
     // Small decode tiles keep scales live across the mainloop to hide VMEM latency. Larger M tiles
     // load only one output atom's six unique scales at a time after MMA, avoiding scale-array spills.
-    if constexpr (BlockM < 64) {
+    // The final copy stripe publishes the compacted activation scales.
+    if constexpr (BlockM < 64 && CopyKTilesPerFlag == 0) {
       TiledMma tiled_mma;
       auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
       auto coords = thread_mma.partition_C(
@@ -333,10 +344,18 @@ private:
     Tensor tBgB = gmem_thr_copy_B.partition_S(gB);  // (BCPY,BCPY_N,BCPY_K,k)
     Tensor tBsB = gmem_thr_copy_B.partition_D(sB);  // (BCPY,BCPY_N,BCPY_K,PIPE)
 
+    const auto wait_for_a = [&] {
+      if constexpr (CopyKTilesPerFlag > 0) {
+        const int k_tile = *k_tile_iter;
+        if (warp_idx == 0 && k_tile % CopyKTilesPerFlag == 0)
+          deep_gemm::comm::wait_copy_stripe(copy_ready_, generation_, k_tile / CopyKTilesPerFlag + 1);
+      }
+    };
     const int num_k_tiles = k_tile_count;
     CUTLASS_PRAGMA_UNROLL
     for (int k_pipe = 0; k_pipe < kStages; ++k_pipe) {
       if (k_tile_count > 0) {
+        wait_for_a();
         copy_aiu(gmem_tiled_copy_A, tAgA(_, _, _, *k_tile_iter), tAsA(_, _, _, k_pipe),
                  gmem_tiled_copy_B, tBgB(_, _, _, idx2crd(*k_tile_iter, k_iter_shape)), tBsB(_, _, _, k_pipe),
                  warp_idx);
@@ -393,6 +412,7 @@ private:
       if (k_tile > 0) {
         const int smem_pipe_write = (k_tile - 1) % kStages;
         if (k_tile_count > 0) {
+          wait_for_a();
           copy_aiu(gmem_tiled_copy_A, tAgA(_, _, _, *k_tile_iter), tAsA(_, _, _, smem_pipe_write),
                    gmem_tiled_copy_B, tBgB(_, _, _, idx2crd(*k_tile_iter, k_iter_shape)), tBsB(_, _, _, smem_pipe_write),
                    warp_idx);

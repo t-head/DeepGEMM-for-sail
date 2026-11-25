@@ -249,7 +249,7 @@ get_symm_buffer_size_for_mega_moe(
     if ((mma_type == "bf16xfp4" || mma_type == "bf16xint4") && is_sm80())
         return get_mega_moe_buffer_slices<layout::Bf16MegaMoEBuffer>(
             num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, staging_config);
-    if (mma_type == "int8xint8")
+    if (mma_type == "int8xint8" || mma_type == "int8xint4")
         return get_mega_moe_buffer_slices<layout::Int8MegaMoEBuffer>(
             num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, staging_config);
     if (mma_type == "fp8xfp8" || mma_type == "fp8xfp4" || mma_type == "bf16xfp4") {
@@ -301,14 +301,14 @@ static void mega_moe_pre_dispatch(
     if (owner_mma_type != mma_type && !(is_fp4_mma_type(owner_mma_type) && is_fp4_mma_type(mma_type)))
         throw pybind11::value_error("mma_type must match the output views' MegaMoE SymmBuffer");
     const bool bf16 = (mma_type == "bf16xfp4" || mma_type == "bf16xint4") && is_sm80();
-    if (!bf16 && !is_fp4_mma_type(mma_type) && mma_type != "int8xint8") {
+    const bool int8 = mma_type == "int8xint8" || mma_type == "int8xint4";
+    if (!bf16 && !is_fp4_mma_type(mma_type) && !int8) {
         TORCH_CHECK(mma_type == "fp8xfp8" || mma_type == "fp8xfp4" || mma_type == "bf16xfp4",
                     "Unsupported MegaMoE mma_type: ", mma_type);
         routed_mega_moe_pre_dispatch(x, topk_idx, topk_weights, buf_x, buf_x_sf,
                                     buf_topk_idx, buf_topk_weights, num_tokens);
         return;
     }
-    const bool int8 = mma_type == "int8xint8";
     TORCH_CHECK(bf16 || group_size == (int8 ? 0 : 32), "invalid MegaMoE quantization group size");
     const auto buffer = owner.attr("buffer").cast<Tensor>();
     const auto pointers = owner.attr("handle").attr("buffer_ptrs").cast<std::vector<int64_t>>();
@@ -837,7 +837,8 @@ void fp8_fp4_mega_moe(
         configs, cumulative_local_expert_recv_stats);
 }
 
-static void int8_int8_mega_moe(
+template <bool kPackedInt4>
+static void int8_activation_mega_moe(
     const Tensor& y, const WeightPair& l1_weights_tuple, const WeightPair& l2_weights_tuple,
     const OptTensor& cumulative_local_expert_recv_stats,
     const Tensor& sym_buffer, const std::vector<int64_t>& sym_buffer_ptrs,
@@ -856,7 +857,9 @@ static void int8_int8_mega_moe(
     TORCH_CHECK(rm == 1 && rn == 1 && rk == 0,
                 "INT8 MegaMoE requires recipe=(1, 1, 0), where 0 means the full K dimension");
     TORCH_CHECK(l1_weights.dim() == 3 && l2_weights.dim() == 3, "weights must be 3D");
-    const int hidden = l2_weights.size(1), intermediate = l2_weights.size(2);
+    constexpr int packing = kPackedInt4 ? 2 : 1;
+    constexpr auto dtype = kPackedInt4 ? torch::kUInt8 : torch::kInt8;
+    const int hidden = l2_weights.size(1), intermediate = l2_weights.size(2) * packing;
     const int num_ranks = sym_buffer_ptrs.size();
     const auto b = get_mega_moe_layout<layout::Int8MegaMoEBuffer>(num_ranks, num_experts, num_max_tokens_per_rank,
                                        num_topk, hidden, intermediate, staging_config);
@@ -866,9 +869,9 @@ static void int8_int8_mega_moe(
     const int num_tokens = y.size(0), groups = num_experts / num_ranks;
     const auto device = sym_buffer.device();
     check_tensor(y, torch::kBFloat16, device, {num_tokens, hidden}, "y");
-    check_tensor(l1_weights, torch::kInt8, device, {groups, 2 * intermediate, hidden}, "l1_weights");
+    check_tensor(l1_weights, dtype, device, {groups, 2 * intermediate, hidden / packing}, "l1_weights");
     check_tensor(l1_weights_sf, torch::kFloat32, device, {groups, 2 * intermediate}, "l1_weights_sf");
-    check_tensor(l2_weights, torch::kInt8, device, {groups, hidden, intermediate}, "l2_weights");
+    check_tensor(l2_weights, dtype, device, {groups, hidden, intermediate / packing}, "l2_weights");
     check_tensor(l2_weights_sf, torch::kFloat32, device, {groups, hidden}, "l2_weights_sf");
     if (cumulative_local_expert_recv_stats)
         check_tensor(*cumulative_local_expert_recv_stats, torch::kInt32, device,
@@ -880,10 +883,10 @@ static void int8_int8_mega_moe(
     const auto activation_clamp = activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
     const auto expected_m = expected_expert_rows(num_tokens, num_topk, groups, num_ranks, num_max_tokens_per_rank);
     auto& streams = get_copy_stream(sym_buffer);
-    mega_int8::int8_int8_mega_moe_impl(sym_buffer.data_ptr<uint8_t>(), b, num_max_tokens_per_rank, num_topk, streams,
+    mega_int8::int8_activation_mega_moe_impl(sym_buffer.data_ptr<uint8_t>(), b, num_max_tokens_per_rank, num_topk, streams,
         sym_buffer_ptrs, rank_idx, y, l1_weights_tuple, l2_weights_tuple, cumulative_local_expert_recv_stats,
         expected_m, activation_kind, activation_clamp,
-        activation_params.beta, activation_params.linear_beta, activation_params.alpha, fast_math);
+        activation_params.beta, activation_params.linear_beta, activation_params.alpha, fast_math, kPackedInt4);
 }
 
 static void register_apis(pybind11::module_& m) {
@@ -892,7 +895,8 @@ static void register_apis(pybind11::module_& m) {
     m.def("bf16_int4_mega_moe", &bf16_w4_mega_moe<true>);
     m.def("fp8_fp8_mega_moe", &fp8_fp8_mega_moe);
     m.def("fp4_fp4_mega_moe", &fp4_fp4_mega_moe);
-    m.def("int8_int8_mega_moe", &int8_int8_mega_moe);
+    m.def("int8_int8_mega_moe", &int8_activation_mega_moe<false>);
+    m.def("int8_int4_mega_moe", &int8_activation_mega_moe<true>);
     m.def("mega_moe_pre_dispatch", &mega_moe_pre_dispatch);
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe,
