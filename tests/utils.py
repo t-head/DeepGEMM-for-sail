@@ -1661,7 +1661,7 @@ def _check_k_grouped_output(actual, expected):
 
 
 def test_k_grouped_gemm_contiguous(args) -> None:
-    """SM90 protocol: BF16 [sum(K), M/N], FP32 D = C + A.T @ B per group."""
+    """BF16 [capacity_a/b, M/N], FP32 D = C + A.T @ B per group."""
     if not __debug__:
         raise RuntimeError("Do not disable assertions in correctness tests")
     if args["data_type"] != torch.bfloat16:
@@ -1672,6 +1672,8 @@ def test_k_grouped_gemm_contiguous(args) -> None:
     if groups <= 0 or min(m, n, sum_k) < 0 or max(groups, m, n, sum_k) > 2**31 - 1:
         raise ValueError("Invalid K-grouped dimensions")
     distribution = args.get("distribution", "uniform")
+    if args.get("ks_cpu") == "None" and not isinstance(distribution, list):
+        raise ValueError("Cannot replay device-only K without explicit distribution and matching k")
     if isinstance(distribution, list):
         ks = distribution
     elif distribution == "uniform":
@@ -1693,9 +1695,19 @@ def test_k_grouped_gemm_contiguous(args) -> None:
     separate_c = args.get("separate_c", 0)
     if type(repeats) is not int or repeats < 1 or separate_c not in (0, 1):
         raise ValueError("repeats must be positive; separate_c must be 0 or 1")
+    a_capacity = args.get("a_capacity", sum_k)
+    b_capacity = args.get("b_capacity", sum_k)
+    if any(type(capacity) is not int or capacity < sum_k for capacity in (a_capacity, b_capacity)):
+        raise ValueError("A/B capacities must cover the physical K groups")
+    use_psum_layout = args.get("use_psum_layout", 0)
+    if use_psum_layout not in (0, 1):
+        raise ValueError("use_psum_layout must be 0 or 1")
+    host_ks_options = (ks, None, []) if use_psum_layout else (ks,)
     torch.manual_seed(args.get("seed", 0))
-    a = torch.randn((sum_k, m), device="cuda", dtype=torch.bfloat16)
-    b = torch.randn((sum_k, n), device="cuda", dtype=torch.bfloat16)
+    a = torch.randn((a_capacity, m), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((b_capacity, n), device="cuda", dtype=torch.bfloat16)
+    a[sum_k:].fill_(float("nan"))
+    b[sum_k:].fill_(float("nan"))
     begin = 0
     for logical, physical in zip(logical_ks, ks):
         a[begin + logical:begin + physical].zero_()
@@ -1703,14 +1715,19 @@ def test_k_grouped_gemm_contiguous(args) -> None:
         begin += physical
     initial = torch.randn((groups, m, n), device="cuda", dtype=torch.float32)
     layout = torch.tensor(ks, device="cuda", dtype=torch.int32)
+    if use_psum_layout:
+        layout = layout.cumsum(0, dtype=torch.int32)
     out = initial.clone()
 
     # Correctness and timing exercise the same call; only the C tensor changes.
     def test_func():
-        deep_gemm.k_grouped_bf16_gemm_tn_contiguous(a, b, out, ks, layout, c)
+        deep_gemm.k_grouped_bf16_gemm_tn_contiguous(
+            a, b, out, host_ks, layout, c, use_psum_layout=bool(use_psum_layout))
 
     print(f"Testing KGroupedContiguous,groups:{groups},m:{m},n:{n},k:{sum_k},"
-          f"distribution:{ks}" + (",separate_c:1" if separate_c else ""))
+          f"distribution:{ks},a_capacity:{a_capacity},b_capacity:{b_capacity},"
+          f"use_psum_layout:{use_psum_layout}"
+          + (",separate_c:1" if separate_c else ""))
     ref_device = "cpu" if get_ref_backend() == "host" else "cuda"
     expected = initial.to(ref_device).clone() if _acc_check else None
     # Reference GEMMs use FP32 inputs without TF32 rounding; restore the runner's
@@ -1719,25 +1736,30 @@ def test_k_grouped_gemm_contiguous(args) -> None:
     differences = []
     try:
         torch.backends.cuda.matmul.allow_tf32 = False
-        for _ in range(repeats if _acc_check else 1):
-            c = out.clone() if separate_c else out
-            snapshot = c.clone() if _acc_check and separate_c else None
-            if separate_c:
-                out.fill_(float("nan"))
-            test_func()
+        for host_ks in host_ks_options:
+            out.copy_(initial)
             if _acc_check:
-                begin = 0
-                for group, k in enumerate(ks):
-                    if k:
-                        x = a[begin:begin + k].to(device=ref_device, dtype=torch.float32)
-                        y = b[begin:begin + k].to(device=ref_device, dtype=torch.float32)
-                        expected[group].add_(x.T @ y)
-                    else:
-                        assert torch.equal(out[group].view(torch.int32), initial[group].view(torch.int32)), "empty group modified"
-                    begin += k
-                differences.append(_check_k_grouped_output(out.to(ref_device), expected)["diff"])
+                expected.copy_(initial.to(ref_device))
+            print(f"ks_cpu={host_ks}")
+            for _ in range(repeats if _acc_check else 1):
+                c = out.clone() if separate_c else out
+                snapshot = c.clone() if _acc_check and separate_c else None
                 if separate_c:
-                    assert torch.equal(c.view(torch.int32), snapshot.view(torch.int32)), "input C modified"
+                    out.fill_(float("nan"))
+                test_func()
+                if _acc_check:
+                    begin = 0
+                    for group, k in enumerate(ks):
+                        if k:
+                            x = a[begin:begin + k].to(device=ref_device, dtype=torch.float32)
+                            y = b[begin:begin + k].to(device=ref_device, dtype=torch.float32)
+                            expected[group].add_(x.T @ y)
+                        else:
+                            assert torch.equal(out[group].view(torch.int32), initial[group].view(torch.int32)), "empty group modified"
+                        begin += k
+                    differences.append(_check_k_grouped_output(out.to(ref_device), expected)["diff"])
+                    if separate_c:
+                        assert torch.equal(c.view(torch.int32), snapshot.view(torch.int32)), "input C modified"
     finally:
         torch.backends.cuda.matmul.allow_tf32 = saved_tf32
     if _acc_check:
@@ -1746,6 +1768,7 @@ def test_k_grouped_gemm_contiguous(args) -> None:
         print("Passed without acc_check\n")
     if get_benchmark():
         del expected
+        host_ks = ks
         c = initial if separate_c else out
         # Requirement protocol: 5 warmups, 20 event timings, 3 rounds, beta=1.
         import hashlib

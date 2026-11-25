@@ -319,7 +319,7 @@ ConfigResult get_adaptive_configs_bf16(int m, int n, int k, int num_sms, int* se
 ConfigResult get_best_configs(int m, int n, int k, int num_groups, int num_sms,
                               GemmType gemm_type = GemmType::Normal, int max_block_n = 256,
                               bool* from_runtime_lut = nullptr, int* selected_warp_k = nullptr) {
-    const bool is_k_grouped = gemm_type == GemmType::KGroupedContiguous;
+    const bool is_k_grouped = deep_gemm::is_k_grouped_contiguous(gemm_type);
     if (from_runtime_lut) *from_runtime_lut = false;
     if (selected_warp_k) *selected_warp_k = 0; // Non-adaptive callers use block_k.
     if (auto tile = deep_gemm_lut::get_runtime_config(
@@ -680,6 +680,35 @@ inline ConfigResult get_k_grouped_configs(int m, int n, int sum_k, int max_k,
     if (base_ctas == 0)
         return config;
     stages = max_k > bk && resident_ctas(3) == base_ctas ? 3 : 2;
+    smem_config = {static_cast<int>(gemm_smem_total_size(2, stages, bm, bn, bk)), 128, 0};
+    return config;
+}
+
+inline ConfigResult get_k_grouped_device_configs(int m, int n, int num_groups, int num_sms) {
+    // The aligned minimum seeds tile geometry; device-only lengths are not a LUT key.
+    auto config = get_best_configs(m, n, 128, num_groups, num_sms,
+                                  GemmType::KGroupedContiguousWithPsumLayout);
+    auto& [sms, bm, bn, bk, wm, wn, stages, smem_config] = config;
+    if (m % 128 == 0 && n % 128 == 0) {
+        bm = m % 256 == 0 ? 256 : 128;
+        bn = n % 256 == 0 ? 256 : 128;
+        wm = wn = 64;
+        sms = static_cast<int>(std::min<int64_t>(num_sms,
+            ceil_div<int64_t>(m, bm) * ceil_div<int64_t>(n, bn) * num_groups));
+    }
+    const auto prop = device_runtime->get_prop();
+    const auto resident_ctas = [&](int candidate_stages) {
+        const auto smem = gemm_smem_total_size(2, candidate_stages, bm, bn, bk);
+        if (smem > prop->sharedMemPerBlockOptin)
+            return 0;
+        return estimate_gemm_occupancy(
+            bm, bn, bk, wm, wn, bk, smem, 16, 16, 32,
+            prop->sharedMemPerMultiprocessor, prop->maxThreadsPerBlock,
+            prop->maxThreadsPerMultiProcessor / prop->warpSize,
+            prop->regsPerMultiprocessor / prop->warpSize).occ;
+    };
+    const int base_ctas = resident_ctas(2);
+    stages = base_ctas > 0 && resident_ctas(3) == base_ctas ? 3 : 2;
     smem_config = {static_cast<int>(gemm_smem_total_size(2, stages, bm, bn, bk)), 128, 0};
     return config;
 }

@@ -920,12 +920,17 @@ static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
                    (c->is_cuda() and c->dim() == 3 and c->device() == a.device()));
 
     // Shape checks
+    DG_HOST_ASSERT(a.size(0) <= std::numeric_limits<int>::max() &&
+                   b.size(0) <= std::numeric_limits<int>::max());
     const auto [num_groups, m, n] = get_shape<3>(d);
+    DG_HOST_ASSERT(num_groups > 0);
     const auto [sum_k_a, m_] = get_shape<2>(a);
     const auto [sum_k_b, n_] = get_shape<2>(b);
+    const int k_capacity = std::min(sum_k_a, sum_k_b);
     const int sum_k = check_k_grouped_args(ks_cpu, grouped_layout, num_groups,
-                                           use_psum_layout, 128, sum_k_a);
-    DG_HOST_ASSERT(m == m_ and n == n_ and sum_k == sum_k_a and sum_k == sum_k_b);
+                                           use_psum_layout, 128, k_capacity);
+    DG_HOST_ASSERT(m == m_ and n == n_);
+    DG_HOST_ASSERT(sum_k >= 0 and sum_k <= sum_k_a and sum_k <= sum_k_b);
     DG_HOST_ASSERT(not c.has_value() or c->sizes() == d.sizes());
 
     // Contiguity checks
@@ -942,14 +947,15 @@ static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
     if (get_ppu_arch() == AC_PPU0015) {
         // Reject unsupported options before early_return can copy or zero d.
         DG_HOST_ASSERT(c.has_value());
-        DG_HOST_ASSERT(not use_psum_layout and ks_cpu.has_value() and not ks_cpu.value().empty());
+        DG_HOST_ASSERT(use_psum_layout or (ks_cpu.has_value() and not ks_cpu.value().empty()));
         DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues are not supported on PPU1.5");
         DG_HOST_ASSERT(compiled_dims == "mn" and "This implementation specializes both M and N");
         DG_HOST_ASSERT(c->scalar_type() == torch::kFloat);
 
         if (early_return(m, n, sum_k, d, c))
             return;
-        k_grouped_bf16_gemm_tn_contiguous_impl(a, b, c, d, m, n, sum_k, ks_cpu.value(), grouped_layout);
+        k_grouped_bf16_gemm_tn_contiguous_impl(a, b, c, d, m, n, sum_k, ks_cpu, grouped_layout,
+                                               use_psum_layout);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

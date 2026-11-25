@@ -489,8 +489,8 @@ bool check_support_dump() {
     // MegaMoE counts are produced inside the collective; do not read or synchronize here.
     if (gemm_type_ == GemmType::MegaMoE)
         return false;
-    if (gemm_type_ == GemmType::KGroupedContiguous) {
-        return false;  // Host K lengths were supplied by set_k_grouped_params.
+    if (is_k_grouped_contiguous(gemm_type_)) {
+        return false;  // Host K lengths were supplied by set_k_grouped_params. Device-only lengths must not be read back.
     }
     if (!ProfilingInterface::instance().support_dump(device_id_) && !is_paged_mqa_logits()) {
         return false;

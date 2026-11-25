@@ -28,6 +28,7 @@ public:
         int warp_m, warp_n;
         int num_stages;
         std::string kernel_name;
+        bool use_psum_layout;
     };
 
     struct Args {
@@ -58,7 +59,7 @@ extern "C"
 __launch_bounds__(BLOCK_SIZE, 1)
 __global__ void {}(const KGroupedGemmArgs args) {{
     bf16_k_grouped_gemm_impl<
-        cutlass::bfloat16_t, float, GemmType::KGroupedContiguous,
+        cutlass::bfloat16_t, float, GemmType::{},
         SHAPE_M, SHAPE_N, NUM_GROUPS,
         BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_SIZE, NUM_STAGES, true
     >(args);
@@ -75,7 +76,8 @@ __global__ void {}(const KGroupedGemmArgs args) {{
             args.launch_info.warp_m,
             args.launch_info.warp_n,
             args.launch_info.num_stages,
-            args.launch_info.kernel_name);
+            args.launch_info.kernel_name,
+            args.launch_info.use_psum_layout ? "KGroupedContiguousWithPsumLayout" : "KGroupedContiguous");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -87,11 +89,16 @@ static void k_grouped_bf16_gemm_tn_contiguous_impl(
     const torch::Tensor& a, const torch::Tensor& b,
     const std::optional<torch::Tensor>& c, const torch::Tensor& d,
     const int& m, const int& n, const int& sum_k,
-    const std::vector<int>& ks_cpu, const torch::Tensor& grouped_layout) {
-    const auto num_groups = static_cast<int>(ks_cpu.size());
-    const auto max_k = *std::max_element(ks_cpu.begin(), ks_cpu.end());
-    const auto [num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, _smem_config] =
-        deep_gemm_bf16_common::get_k_grouped_configs(m, n, sum_k, max_k, ks_cpu, get_num_sms());
+    const std::optional<std::vector<int>>& ks_cpu, const torch::Tensor& grouped_layout,
+    bool use_psum_layout) {
+    const int k_capacity = std::min(a.size(0), b.size(0));
+    const auto num_groups = static_cast<int>(d.size(0));
+    const bool has_host_ks = ks_cpu.has_value() && !ks_cpu->empty();
+    const int max_k = has_host_ks ? *std::max_element(ks_cpu->begin(), ks_cpu->end()) : k_capacity;
+    const auto config = has_host_ks
+        ? deep_gemm_bf16_common::get_k_grouped_configs(m, n, sum_k, max_k, *ks_cpu, get_num_sms())
+        : deep_gemm_bf16_common::get_k_grouped_device_configs(m, n, num_groups, get_num_sms());
+    const auto [num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, _smem_config] = config;
     const int block_size = 32 * (block_m / warp_m) * (block_n / warp_n);
     const int smem_size = static_cast<int>(gemm_smem_total_size(
         2, num_stages, block_m, block_n, block_k));
@@ -99,7 +106,7 @@ static void k_grouped_bf16_gemm_tn_contiguous_impl(
 
     auto args = Bf16KGroupedRuntime::Args{
         .launch_info = {m, n, num_groups, block_m, block_n, block_k,
-                        warp_m, warp_n, num_stages, kernel_name},
+                        warp_m, warp_n, num_stages, kernel_name, use_psum_layout},
         .launch_args = {get_grid_shape(num_sms), dim3(block_size), smem_size},
         .kernel_params = {
             .a_ptr = a.data_ptr(),
@@ -126,8 +133,17 @@ static void k_grouped_bf16_gemm_tn_contiguous_impl(
 
     DgProfParam dg_prof_params;
     if (deep_gemm::profiling_enabled()) {
-        dg_prof_params.set_k_grouped_params(m, n, sum_k, ks_cpu,
-                                           c->data_ptr() != d.data_ptr(), current_stream());
+        if (has_host_ks) {
+            dg_prof_params.set_k_grouped_params(m, n, sum_k, *ks_cpu,
+                                               c->data_ptr() != d.data_ptr(), current_stream());
+        } else {
+            dg_prof_params.set_params(GemmType::KGroupedContiguousWithPsumLayout, false, "bf16",
+                                      num_groups, m, n, 0, 0, nullptr, current_stream());
+            // Keep numeric K for trace parsers; zero is an unknown-length placeholder.
+            dg_prof_params.add_params("ks_cpu", "None");
+        }
+        if (use_psum_layout)
+            dg_prof_params.add_params("use_psum_layout", 1);
     }
     {
         auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
@@ -148,7 +164,8 @@ static void k_grouped_bf16_gemm_tn_contiguous_impl(
 #endif
 
         std::printf("[KGroupedContiguous_BF16:]\n");
-        std::printf("groups:%d, m:%d, n:%d, sum_k:%d, max_k:%d\n", num_groups, m, n, sum_k, max_k);
+        std::printf("groups:%d, m:%d, n:%d, %s:%d, max_k_upper_bound:%d, use_psum_layout:%d\n",
+                    num_groups, m, n, has_host_ks ? "sum_k" : "k_capacity", sum_k, max_k, use_psum_layout);
         std::printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%u, threads:%d\n",
                     num_sms, blocks_per_cu, args.launch_args.grid_dim.x, block_size);
         std::printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], num_stages:%d\n",

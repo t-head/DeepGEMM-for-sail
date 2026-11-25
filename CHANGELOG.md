@@ -19,6 +19,12 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   including in-place `c=d`, and compact expert end offsets through
   `use_psum_layout=True`, including empty experts.
 
+- **M890 K-grouped BF16 wgrad GEMM**: `k_grouped_bf16_gemm_tn_contiguous`
+  accepts unequal A/B K capacities, ignoring trailing capacity beyond the
+  effective groups, and supports `ks_cpu=None` or `[]` with
+  `use_psum_layout=True` to derive group lengths from device end offsets
+  without D2H synchronization.
+
 - **DeepSeek V4 normal Mega-mHC**: `mega_mhc` supports hidden sizes 4096 and
   7168 on Zhenwu M890 when both `shifted_prev_mix` and `new_prev_mix` are `None`.
 
