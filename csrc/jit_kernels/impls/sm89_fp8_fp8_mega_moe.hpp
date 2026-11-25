@@ -134,8 +134,8 @@ public:
             const auto& tile = c.tile;
             TORCH_CHECK(dispatch.num_ranks > 0 && dispatch.num_experts % dispatch.num_ranks == 0,
                         "invalid MegaMoE layout");
-            const layout::RoutedMoEInputLayout inputs(dispatch.num_ranks, dispatch.num_experts, dispatch.nmtpr,
-                                                     dispatch.num_topk, dispatch.token_bytes, dispatch.sf_bytes, args.routing_bytes);
+            const layout::RoutedMoEBuffer inputs(dispatch.num_ranks, dispatch.num_experts, dispatch.nmtpr,
+                dispatch.num_topk, dispatch.token_bytes, c.n / 2, true, kIsBlockwise, args.routing_bytes);
             if constexpr (kIsBlockwise) {
                 return fmt::format(R"(
 #define DG_MOE_FAST_MATH {}
