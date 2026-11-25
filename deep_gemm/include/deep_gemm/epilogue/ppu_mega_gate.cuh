@@ -17,11 +17,39 @@ __device__ __forceinline__ void device_check(bool condition) {
 }
 
 // Store GEMM scores and defer any invalid-score trap until synchronization completes.
-__device__ __forceinline__ void store_checked_scores(float* dst, float lo, float hi,
+template <bool UseSigmoid, int S>
+__device__ __forceinline__ void store_checked_scores(const KernelArgs& a, int token, int expert, float* dst, float lo, float hi,
                                                       bool check_activated, bool& gate_is_valid) {
-    gate_is_valid &= check_activated ? lo < INFINITY : isfinite(lo);
-    gate_is_valid &= check_activated ? hi < INFINITY : isfinite(hi);
+    bool valid;
+    if constexpr (UseSigmoid) {
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
+        const bool check_hi = expert + 4 < a.routing.num_routed_experts;
+#else
+        // tc02 pairs stay within the aligned expert range.
+        constexpr bool check_hi = true;
+#endif
+        if (token >= a.num_tokens || expert >= a.routing.num_routed_experts) {
+            valid = true;
+        } else if constexpr (S == 1) {
+            valid = !isnan(lo) && (!check_hi || !isnan(hi));
+        } else {
+            // Learned routing checks the reduced logits. Fixed/random routes skip that loop.
+            const bool skips_reduction_check = (a.fix_routing_mask && a.fix_routing_mask[token]) ||
+                                               (a.force_random && a.force_random[token]);
+            valid = !skips_reduction_check || (isfinite(lo) && (!check_hi || isfinite(hi)));
+        }
+    } else {
+        valid = check_activated ? lo < INFINITY && hi < INFINITY : isfinite(lo) && isfinite(hi);
+    }
+    // Masked input may contain NaN/inf. The final MMA tile can extend past the mask allocation.
+    gate_is_valid &= valid || (a.mask && (token >= a.num_tokens || !a.mask[token]));
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
+    // Adjacent tc01 accumulator registers hold scores four experts apart.
+    dst[0] = lo;
+    dst[4] = hi;
+#else
     *reinterpret_cast<float2*>(dst) = make_float2(lo, hi);
+#endif
 }
 
 __device__ __forceinline__ float sqrt_softplus(const float& value) {
@@ -42,6 +70,27 @@ __device__ __forceinline__ void sqrt_softplus(float (&values)[kNumValues]) {
     #pragma unroll
     for (uint32_t value_idx = 0; value_idx < kNumValues; ++ value_idx)
         values[value_idx] = sqrtf(values[value_idx] > 20.0f ? values[value_idx] : softplus[value_idx]);
+}
+
+template <bool UseSigmoid>
+__device__ __forceinline__ float gate_score(float value) {
+    if constexpr (UseSigmoid)
+        // Equivalent to: 1.0f / (1.0f + expf(-value)).
+        return __ppu_sgmdf(value);
+    else
+        return sqrt_softplus(value);
+}
+
+template <bool UseSigmoid, uint32_t N>
+__device__ __forceinline__ void gate_score(float (&values)[N]) {
+    if constexpr (UseSigmoid) {
+        #pragma unroll
+        for (uint32_t i = 0; i < N; ++i)
+            // Equivalent to: 1.0f / (1.0f + expf(-values[i])).
+            values[i] = __ppu_sgmdf(values[i]);
+    } else {
+        sqrt_softplus(values);
+    }
 }
 
 __device__ __forceinline__ void warp_reduce_best(const float& score, int& expert_idx) {
@@ -151,7 +200,7 @@ __device__ __forceinline__ void store_token_outputs(const RoutingArgs& args, con
     }
 }
 
-template <uint32_t kNumTopk, bool kHasUnmappedTopkIdx, bool kHasPhysicalMap>
+template <uint32_t kNumTopk, bool kHasUnmappedTopkIdx, bool kHasPhysicalMap, bool UseSigmoid>
 __device__ __forceinline__ bool store_topk_token(const RoutingArgs& args, const int* routed_logical_count,
                                      const uint32_t& global_token_idx, const uint32_t& lane_idx,
                                      int selected_expert_idx, const float& selected_unbiased_score) {
@@ -185,7 +234,12 @@ __device__ __forceinline__ bool store_topk_token(const RoutingArgs& args, const 
 
     // The smallest shuffle width covering the routed lanes, the other lanes hold zero
     constexpr uint32_t kSumWidth = kNumTopk <= 8 ? 8 : (kNumTopk <= 16 ? 16 : 32);
-    const auto topk_sum = math::warp_reduce_sum<kSumWidth>(selected_unbiased_score) + 1e-20f;
+    const float sum = math::warp_reduce_sum<kSumWidth>(selected_unbiased_score);
+    // For any K split count, GLM divides by the sum of the selected, unbiased sigmoid scores.
+    // Even a tiny positive sum gives routed weights that sum to 1 before scaling.
+    // When all scores are zero, a denominator of 1 keeps all weights zero.
+    // DeepSeek V4.1 sqrtsoftplus uses sum + 1e-20.
+    const float topk_sum = UseSigmoid ? (sum > 0.0f ? sum : 1.0f) : sum + 1e-20f;
     const auto selected_weight = lane_idx < kNumTopk ? selected_unbiased_score / topk_sum * args.routed_scaling_factor : 1.0f;
     store_token_outputs<kNumTopk, kHasUnmappedTopkIdx>(args, global_token_idx, lane_idx,
                                                        physical_expert_idx, selected_weight, selected_expert_idx);

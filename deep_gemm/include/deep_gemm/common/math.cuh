@@ -2,10 +2,22 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 #include <cutlass/cutlass.h>
 
 namespace deep_gemm::math {
+
+// Fast division uses the native reciprocal without the full-division
+// correction sequence. Keep transcendental activation math independent.
+template <bool FastMath, typename T>
+CUTLASS_DEVICE T fp32_divide(T numerator, T denominator) {
+    static_assert(std::is_same_v<T, float>, "FP32 division requires float operands");
+    if constexpr (FastMath)
+        return numerator * __ppu_rcpf(denominator);
+    else
+        return numerator / denominator;
+}
 
 template <typename T>
 CUTLASS_HOST_DEVICE constexpr T ceil_div(T a, T b) {

@@ -30,5 +30,26 @@ __device__ __forceinline__ int smem_ptr_to_tsm_base(void const* ptr, int coord_o
   return tsm_base;
 }
 
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
+// PPU0010 ldmatrix needs the shared-memory base, row, and K sub-tile separately.
+struct TsmCoord {
+  int row;
+  int k_cube;
+};
+struct TsmBase {
+  uintptr_t ptr;
+  int coord;
+  int k_cube;
+  __device__ __forceinline__ TsmBase operator+(int x) const { return {ptr, coord + x, k_cube}; }
+};
+__device__ __forceinline__ TsmBase smem_ptr_to_tsm_base(void const* ptr, TsmCoord coord) {
+  return {reinterpret_cast<uintptr_t>(ptr), coord.row, coord.k_cube};
+}
+#else
+using TsmCoord = int;
+using TsmBase = int;
+
+#endif
+
 } // namespace arch
 } // namespace deep_gemm

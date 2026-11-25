@@ -4,7 +4,7 @@ This document records user-visible changes for formal DeepGEMM-for-sail releases
 
 DeepGEMM-for-sail maintains its release identifiers independently of the upstream [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) project.
 
-## Unreleased
+## unreleased
 
 ### Added
 
@@ -17,14 +17,57 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   Zhenwu M890P (PPU1.5) uses a fused dual-B cute-free kernel:
   A is streamed once per K partition, high/low products accumulate
   separately in FP32, and the final result is combined and stored once.
-  Zhenwu M810E (PPU1.0) falls back to
-  two BF16 GEMMs composed through an FP32 intermediate. The convenience
-  wrapper accepts only `x`, `w_high`, `w_low`, `scale`, and
+  The public entry currently requires PPU1.5 and rejects PPU1.0.
+  The convenience wrapper accepts only `x`, `w_high`, `w_low`, `scale`, and
   `use_fp32_output=False`; GEMM requires no external workspace. Requires `N % 2 == 0`.
+
+- **Zhenwu810E INT8 AVG MQA**: adds `int8_mqa_avg_logits` and
+  `int8_paged_mqa_avg_logits` with H4/H8, logical D128 and BF16 output.
+  Accepts explicit FP32 quantization scales per Q/head and per KV token.
+  Supports compressed non-paged output and paged `next_n=1..6` with page
+  sizes that are positive multiples of 64, using the existing metadata API.
+  See the [INT8 AVG API guide](docs/api/indexer.md#int8-on-810e).
+
+- **M890 M-grouped BF16 NT GEMM**: supports optional BF16 C accumulation,
+  including in-place `c=d`, and compact expert end offsets through
+  `use_psum_layout=True`, including empty experts. Accepts packed MN-major B
+  so dgrad can reuse transposed forward weights. Both grouping layouts accept
+  different A and D row capacities and leave the ungrouped output tail untouched.
+
+- **DeepSeek V4 normal Mega-mHC**: `mega_mhc` supports hidden sizes 4096 and
+  7168 on Zhenwu M890 when both `shifted_prev_mix` and `new_prev_mix` are `None`.
+
+- **Weighted MQA logits**: M890 FP8 supports native H8 with D64/D128.
+  Paged FP8 and INT8 accept optional request IDs in metadata and logits calls.
 
 ## 1.1.0+v1.1.0
 
+### Fixed
+
+- **Device properties and CU budgets**: cache architecture and `set_num_sms`
+  overrides per current device, so switching devices does not reuse the first
+  device's architecture or scheduling budget.
+- **Sparse MQA input contracts**: enforce 16-byte input base-address alignment
+  consistently for MXFP4 and INT8, in both paged and non-paged compute APIs.
+
 ### Added
+
+- **MegaMoE workspace reuse**: allows FP8 channelwise/blockwise, W4A8 and
+  W4A16 layers of the same precision to share a symmetric allocation across
+  shapes through `SymmBuffer(base=...)`, including eager execution and
+  CUDA Graph replay.
+
+- **MegaMoE activation parity**: all MMA types support `swiglu`, `swiglu_step`,
+  `swiglu_oai` and `situ` through shared FP32 activation formulas. Native PPU
+  sigmoid/tanh are unconditional; `fast_math` selects only the division path.
+
+- **M890 paged MXFP4 DSA request scheduling**: uses consecutive request
+  `indices` to reuse KV data across fixed MTP and ragged query rows. Supports
+  H32/H64, logical D128, page32/64/128 and BF16 weights/output with public
+  `next_n=1`. Context masks remain per query, and metadata generation can be
+  captured for replay with changing contexts, request groups and page tables.
+  Callers provide the maximum context in each request run's last query.
+  Metadata generated without indices retains independent per-query scheduling.
 
 - **M890 NVFP4 W4A8 GEMMs**: adds `gemm_fp8_nvfp4_bf16_nt` and grouped
   nopad, masked and fused-routing variants for FP8 activations and NVFP4
@@ -32,6 +75,9 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   decode-to-FP8 execution with a reusable workspace. Supports native K16
   E4M3 scales, FP32 global scales, and per-channel or 128x128 outer scales.
   See the [NVFP4 W4A8 API guide](docs/api/nvfp4_w4a8.md).
+
+- **810E Mega-mHC**: adds BF16 support for DeepSeek V4.1 Flash on
+  Zhenwu 810E through the existing `mega_mhc` API.
 
 - **Mega-mHC FP8 output**: `mega_mhc` can write FP8 E4M3 alongside or instead
   of BF16. Supports grouped UE8M0 scales and per-token FP32 scales through
@@ -55,14 +101,22 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 - **FP8, W4A8 and W4A16 MegaMoE**: adds complete FP8 channelwise/blockwise,
   E4M3 x MXFP4 and BF16 x MXFP4 routed pipelines through the common `SymmBuffer`
   entry and precision-specific weight transforms in `deep_gemm.mega`. Supports
-  FP8 SwiGLU/SwiGLU-OAI, W4A8 SwiGLU/SwiGLU-OAI/SiTU, W4A16 SiTU, separate
-  replica banks and reusable library-owned communication state.
+  SwiGLU, STEP, SwiGLU-OAI and SiTU on every backend, separate replica banks
+  and reusable library-owned communication state.
 
-- **Mega Gate**: adds `bf16_mega_gate`, fusing BF16 routing GEMM,
-  sqrt-softplus scoring, bias-aware Top-k selection, weight normalization
-  and scaling, and optional logical-to-physical expert mapping.
+- **Mega Gate**: adds `bf16_mega_gate`, fusing BF16 routing GEMM, bias-aware
+  Top-k selection, weight normalization and scaling, and optional
+  logical-to-physical expert mapping on Zhenwu 810E and 890P.
+  Supports `scoring_func="sqrtsoftplus"` (default) and `scoring_func="sigmoid"`.
 
 ### Changed
+
+- **MegaMoE activation precision**: all backends consume FP32 GEMM1
+  accumulators and use FP32 activation with native PPU sigmoid/tanh.
+  Separate row quantizers consume BF16 activation scratch; fused FP4 and
+  blockwise FP8 quantization retain FP32 until the final conversion.
+  `fast_math` selects fast reciprocal versus regular FP32 division for SiTU
+  and post-activation FP8 quantization, independently of native sigmoid/tanh.
 
 - **MegaMoE MMA names**: uses `mma_type="fp4xfp4"`, `"fp8xfp4"`,
   `"bf16xfp4"` and `"fp8xfp8"` consistently across workspace allocation,

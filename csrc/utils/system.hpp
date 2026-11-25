@@ -1,12 +1,16 @@
 #pragma once
 
 #include <array>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <random>
 #include <string>
 #include <memory>
 #include <unistd.h>
+#include <sys/wait.h>
 
 #include "exception.hpp"
 #include "format.hpp"
@@ -43,6 +47,13 @@ static std::tuple<int, std::string> call_external_command(std::string command) {
     while (fgets(buffer.data(), buffer.size(), pipe.get()))
         output += buffer.data();
     const auto status = pclose(pipe.release());
+    if (status == -1) {
+        const auto wait_errno = errno;
+        std::fprintf(stderr, "Subprocess exit status unavailable: pclose failed (errno %d: %s). "
+                             "Command: %s. Output: %s\n",
+                     wait_errno, std::strerror(wait_errno), command.c_str(), output.c_str());
+        return {-1, output};
+    }
     // NOTES: if the child was killed by a signal (e.g., SIGINT from Ctrl+C),
     // WEXITSTATUS would incorrectly return 0. Treat signal death as failure.
     const auto exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);

@@ -6,7 +6,6 @@
 #include <deep_gemm/impls/mqa_logits_utils.cuh>
 #include <deep_gemm/scheduler/paged_mqa_logits_scheduler.cuh>
 
-
 namespace cutlass::gemm::kernel {
 
 template <typename ElementQK, typename ElementAcc, typename ElementLogits, typename ElementWeights,
@@ -14,7 +13,8 @@ template <typename ElementQK, typename ElementAcc, typename ElementLogits, typen
           uint32_t kHeadDim, uint32_t PAGE_KV, uint32_t SPLIT_KV, uint32_t BLOCK_KV, uint32_t WARP_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           bool SPLIT_MBLOCK = false,
-          uint32_t kScaleMode = deep_gemm::kScaleModeWeights>
+          uint32_t kScaleMode = deep_gemm::kScaleModeWeights,
+          bool kDirectScale = false, bool kGrouped = false, typename TableOffset = uint32_t>
 class PPUPagedMqaLogits {
 public:
     static_assert(PAGE_KV == 32 || (PAGE_KV > 0 && PAGE_KV % BLOCK_KV == 0),
@@ -22,18 +22,22 @@ public:
   static_assert(not SPLIT_MBLOCK, "SPLIT_MBLOCK is only supported for FP4");
   // Avg variant (kScaleMode = kScaleModeUnity): no per-head weights,
   // logits = sum_h(relu(qk)) * k_scale / sqrt(kHeadDim)
+  static constexpr bool kIsFP8H8 = kNumHeads == 8 && cute::is_same_v<ElementQK, cutlass::float_e4m3_t> &&
+      kScaleMode == deep_gemm::kScaleModeWeights;
   static constexpr float kInvSqrtHeadDim = kHeadDim == 32 ? 0x1.6a09e6p-3f : (kHeadDim == 64 ? 0x1p-3f : 0x1.6a09e6p-4f);
-  // 4 heads: a warp N tile of 16 columns covers 4 q tokens, so BLOCK_N rounds
-  // next_n * 4 up to a multiple of 16; pad rows are zero-filled by the Q copy
-  static constexpr uint32_t kMMANumHeads = kNumHeads == 4 ? 16 : kNumHeads;
+  // N16 packs four H4 AVG tokens or two H8 weighted tokens. Round odd
+  // query tails up to a whole tile; the Q/weight copies zero-fill pad rows.
+  static constexpr uint32_t kMMANumHeads = kNumHeads < 16 ? 16 : kNumHeads;
+  static constexpr int WARP_Q = kMMANumHeads / kNumHeads;
   static constexpr int BLOCK_M = BLOCK_KV;
-  static constexpr int BLOCK_N = kNumHeads == 4 ? (kNextN + 3) / 4 * 16 : kNextN * kMMANumHeads;
+  static constexpr int BLOCK_N = ((kNextN + WARP_Q - 1) / WARP_Q) * kMMANumHeads;
   static constexpr int BLOCK_K = kHeadDim;
   static constexpr int WARP_M = WARP_KV;
   static constexpr int WARP_N = kMMANumHeads;
 
   static constexpr int BLOCK_Q = kNextN;
-  static constexpr int WARP_Q = kNumHeads == 4 ? 4 : 1;
+  static_assert(!kDirectScale || (kIsFP8H8 && PAGE_KV >= BLOCK_KV),
+                "direct scales require FP8 H8 with page size >= compute tile");
   // 4-head avg tile: parity-split epilogue, each lane loads/stores only its own
   // kv row half (see operator()). Applies to both float and bf16 logits
   static constexpr bool kWq4 = WARP_Q == 4;
@@ -75,7 +79,12 @@ public:
 
   // Match each page32 transfer's swizzle.
   static constexpr int kKVSmemRows = PAGE_KV < BLOCK_KV ? PAGE_KV : BLOCK_KV;
-  using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementQK, false, Int<kKVSmemRows>, Int<BLOCK_K>, false>;
+  // A stage spans the complete compute tile, even when AIU copies one smaller
+  // page at a time. The page-sized default advances ldmatrix into the wrong
+  // stage after the first iteration when PAGE_KV < BLOCK_KV.
+  using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<
+      ArchTag, ElementQK, false, Int<kKVSmemRows>, Int<BLOCK_K>, false,
+      (kKVSmemRows < BLOCK_KV ? BLOCK_KV * BLOCK_K : 0)>;
   using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<ArchTag, ElementQK, false, Int<BLOCK_N>, Int<BLOCK_K>, true>;
 
   // A
@@ -98,6 +107,8 @@ public:
   using SmemLayoutA = decltype(tile_to_shape(
       SmemLayoutAtomA{},
       make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<kNumKVStages>{}, Int<kNumMathWarpGroups>{})));
+  static_assert(kNumKVStages == 1 || stride<2>(SmemLayoutA{}) == BLOCK_KV * BLOCK_K,
+                "K matrix-load stage stride must match the full shared tile");
   using SmemLayoutB = decltype(tile_to_shape(
       SmemLayoutAtomB{},
       make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<kNumQStages>{})));
@@ -148,11 +159,12 @@ public:
     const uint32_t batch_size;
     const uint64_t logits_stride;
     const uint64_t kv_cache_stride_bytes;
-    const uint32_t block_table_stride;
+    const uint64_t block_table_stride;
     const uint32_t* context_lens;
     ElementLogits* logits;
     const uint32_t* block_table;
     const uint32_t* schedule_meta;
+    const uint32_t* indices;
   };
 
   // Kernel entry point API
@@ -228,6 +240,8 @@ public:
     // Clamp the Q copy to the real rows; pad rows are zero-filled by hardware
     if constexpr (BLOCK_N != kNextN * kNumHeads)
         gmem_tiled_copy_B.desc_.dim_h = kNextN * kNumHeads;
+    if constexpr (kIsFP8H8)
+        gmem_tiled_copy_SFB.desc_.dim_w = kNextN * kNumHeads;
 
     // init input tensors
     auto load_inputs = load_init(params);
@@ -293,10 +307,16 @@ public:
     bool thread_print = enable_print && cute::thread(0, 0);
 
     // Scheduler
-    auto scheduler = deep_gemm::PagedMQALogitsScheduler<BLOCK_KV, kNumMathWarpGroups, kNextN>(params.batch_size, blockIdx.x, params.context_lens, params.schedule_meta);
+    auto scheduler = deep_gemm::PagedMQALogitsScheduler<
+        BLOCK_KV, kNumMathWarpGroups, kNextN, kIsFP8H8, kGrouped ? kNextN : 0>(
+            params.batch_size, blockIdx.x, params.context_lens, params.schedule_meta, params.indices);
     DG_STATIC_ASSERT(SPLIT_KV % BLOCK_KV == 0, "Unaligned SPLIT_KV");
+    // Idle workers (including an entirely empty batch) must not prefetch Q,
+    // weights, a page-table entry, or an uninitialized KV pipeline slot.
+    if (scheduler.is_last_task(scheduler.current_q_idx, scheduler.current_kv_idx)) return;
 
-    ElementLogits weights[kNumHeads / 4];
+    ElementLogits weights[WARP_N / 4];
+    float q_head_scales[4];
 
     clear(accum);
     auto tKgK = tAgA;
@@ -317,14 +337,27 @@ public:
     int warp_group_id = warp_idx / 8;
 
     uint32_t q_idx = scheduler.current_q_idx;
+    uint32_t query_length;
+    uint32_t q_stage_valid = kNextN; // A partial request group has fewer live queries.
+    ElementLogits* query_logits;
     uint32_t kv_idx_base;
     uint32_t kv_idx_array[kNumKVStages];
+    uint32_t q_idx_array[kNumKVStages];
     uint32_t smem_pipe_read_q = 0, smem_pipe_read_kv = 0;
     uint32_t smem_pipe_write_q = 0, smem_pipe_write_kv = 0;
 
+    const auto table_row_offset = [&](uint32_t row) {
+        return row * static_cast<TableOffset>(params.block_table_stride);
+    };
     auto load_q_g2s = [&](uint32_t q_idx) {
         // gmem rows per token are the real heads only (BLOCK_N counts the padded heads)
-        auto q_offset = q_idx * kNextN * kNumHeads;
+        const uint64_t q_offset = static_cast<uint64_t>(q_idx) * (kGrouped ? 1 : kNextN) * kNumHeads;
+        if constexpr (kGrouped) {
+            q_stage_valid = scheduler.group_size(q_idx);
+            const uint32_t heads = q_stage_valid * kNumHeads;
+            gmem_tiled_copy_B.desc_.dim_h = heads;
+            gmem_tiled_copy_SFB.desc_.dim_w = heads;
+        }
         tBgB.data() = tQgQ.data() + q_offset * kHeadDim;
         copy_aiu(gmem_tiled_copy_B, tBgB(_,_,_,0), tBsB(_,_,_,smem_pipe_write_q), warp_idx);
         if constexpr (kScaleMode == deep_gemm::kScaleModeWeights) {
@@ -332,7 +365,8 @@ public:
             copy_aiu(gmem_tiled_copy_SFB, tSFBgSFB(_,_,_,0), tSFBsSFB(_,_,_,smem_pipe_write_q), warp_idx);
         }
         if (thread_print) {
-            printf("  copy_q q_idx = %d, q_offset = %d, stage = %d\n", q_idx, q_offset, smem_pipe_write_q);
+            printf("  copy_q q_idx = %u, q_offset = %llu, stage = %u\n", q_idx,
+                   static_cast<unsigned long long>(q_offset), smem_pipe_write_q);
         }
         smem_pipe_write_q = (smem_pipe_write_q + 1) % kNumQStages;
     };
@@ -342,42 +376,44 @@ public:
         if constexpr (PAGE_KV >= BLOCK_KV) {
             const uint32_t token = kv_idx * BLOCK_KV;
             const uint32_t row_in_page = token % PAGE_KV;
-            auto kv_offset = __ldg(params.block_table + q_idx * params.block_table_stride + token / PAGE_KV);
+            auto kv_offset = __ldg(params.block_table + table_row_offset(q_idx) + token / PAGE_KV);
             tAgA.data() = tKgK.data() + kv_offset * params.kv_cache_stride_bytes + static_cast<uint64_t>(row_in_page) * BLOCK_K;
             tSFAgSFA.data() = tSFKgSFK.data() + kv_offset * params.kv_cache_stride_bytes / 4 + row_in_page;
             // Split the value/scale AIU copies across warps 0/1 only when the group
             // has >= 2 warps; otherwise warp 0 issues both (as fp4's SPLIT_AIU)
             constexpr bool SPLIT_AIU = (WarpOnGroup >= 2);
-            copy_aiu<SPLIT_AIU>(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_pipe_write_kv),
-                gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,0), tSFAsSFA(_,_,_,smem_pipe_write_kv), local_warp_idx);
+            if constexpr (kDirectScale)
+                copy_aiu(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_pipe_write_kv), local_warp_idx);
+            else
+                copy_aiu<SPLIT_AIU>(gmem_tiled_copy_A, tAgA(_,_,_,0), tAsA(_,_,_,smem_pipe_write_kv),
+                    gmem_tiled_copy_SFA, tSFAgSFA(_,_,_,0), tSFAsSFA(_,_,_,smem_pipe_write_kv), local_warp_idx);
             if (thread_print) {
                 printf("  copy_k q_idx = %d, kv_idx = %d, kv_offset = %d, wg = %d, stage = %d\n", q_idx, kv_idx, kv_offset, warp_group_idx, smem_pipe_write_kv);
             }
         } else {
-            // Assemble one compute tile from page-local AIU copies.
-            constexpr uint32_t kCopyRows = PAGE_KV < BLOCK_KV ? PAGE_KV : BLOCK_KV;
+            // Each copy starts at the first key in a physical page.
+            static_assert(BLOCK_KV % PAGE_KV == 0);
+            constexpr uint32_t kCopyRows = PAGE_KV;
             using ChunkKV = cutlass::gemm::config::DefaultGemm_AIU_Operand<
                 ArchTag, ElementQK, false, Int<kCopyRows>, Int<BLOCK_K>, false>;
             using ChunkSF = cutlass::gemm::config::DefaultGemm_AIU_Operand<
                 ArchTag, float, false, _1, Int<kCopyRows>, false, 0, false>;
             using ChunkKVCopy = typename ChunkKV::CopyInst;
             using ChunkSFCopy = typename ChunkSF::CopyInst;
-            const uint32_t context_len = PAGE_KV < BLOCK_KV
-                ? __ldg(params.context_lens + q_idx * kNextN + kNextN - 1) : 0;
+            const uint32_t context_len = scheduler.context_len(q_idx);
             const uint32_t first_page = kv_idx * BLOCK_KV / PAGE_KV;
             CUTE_UNROLL
             for (uint32_t row = 0; row < BLOCK_KV; row += kCopyRows) {
                 const uint32_t token = kv_idx * BLOCK_KV + row;
-                const bool valid_page = PAGE_KV >= BLOCK_KV || token < context_len;
+                const bool valid_page = token < context_len;
                 const uint32_t logical_page = valid_page ? token / PAGE_KV : first_page;
-                const uint32_t physical_page = __ldg(params.block_table + q_idx * params.block_table_stride + logical_page);
-                const uint32_t row_in_page = valid_page ? token % PAGE_KV : 0;
+                const uint32_t physical_page = __ldg(params.block_table + table_row_offset(q_idx) + logical_page);
                 cute::AiuDesc kv_desc;
                 kv_desc.template init<ElementQK, false, kCopyRows, BLOCK_K>(
                     nullptr, kCopyRows, BLOCK_K, StrideAB{});
                 if (local_warp_idx == 0 && lane_idx == 0) {
                     auto src = reinterpret_cast<const ElementQK*>(
-                        reinterpret_cast<const uint8_t*>(params.ptr_k) + physical_page * params.kv_cache_stride_bytes * sizeof(ElementQK)) + static_cast<uint64_t>(row_in_page) * BLOCK_K;
+                        reinterpret_cast<const uint8_t*>(params.ptr_k) + physical_page * params.kv_cache_stride_bytes * sizeof(ElementQK));
                     CUTE_UNROLL
                     for (int k = 0; k < BLOCK_K; k += ChunkKV::CUBE_W) {
                         auto dst_k = shared_storage.smem_k.data() + SmemLayoutA{}(make_coord(row, k, smem_pipe_write_kv, warp_group_idx));
@@ -391,7 +427,7 @@ public:
                 if (local_warp_idx == kScaleWarp && lane_idx == 0) {
                     auto dst = shared_storage.smem_k_scales.data() + SmemLayoutSFA{}(make_coord(0, row, smem_pipe_write_kv, warp_group_idx));
                     auto src = reinterpret_cast<const float*>(
-                        reinterpret_cast<const uint8_t*>(params.k_scales) + physical_page * params.kv_cache_stride_bytes) + row_in_page;
+                        reinterpret_cast<const uint8_t*>(params.k_scales) + physical_page * params.kv_cache_stride_bytes);
                     CUTE_UNROLL
                     for (int k = 0; k < kCopyRows; k += ChunkSF::CUBE_W)
                         ChunkSFCopy::copy(dst + k, src, sf_desc, k, 0, 0);
@@ -408,14 +444,32 @@ public:
 
         if constexpr (kScaleMode == deep_gemm::kScaleModeWeights) {
             // Read weights
-            deep_gemm::load_weights_from_smem_ld_shared<ElementWeights, ElementLogits, kNumHeads>(
+            deep_gemm::load_weights_from_smem_ld_shared<ElementWeights, ElementLogits, WARP_N>(
                 sSFB(_,_,smem_pipe_read_q), weights, lane_idx, warp_q_idx);
+        }
+        if constexpr (kScaleMode == deep_gemm::kScaleModeQHead) {
+            #pragma unroll
+            for (uint32_t j = 0; j < 4; ++j) {
+                const uint32_t column = 4 * j + lane_idx % 4;
+                const uint32_t local_q = column / kNumHeads;
+                const uint32_t head = column % kNumHeads;
+                const uint32_t token = q_idx * kNextN + min(warp_q_idx * WARP_Q + local_q, kNextN - 1);
+                q_head_scales[j] = __ldg(params.weights + token * kNumHeads + head);
+            }
+        } else if constexpr (kIsFP8H8) {
+            // Query state is invariant across its KV tiles. Refresh it together
+            // with Q so persistent request switches and graph replay stay live.
+            const uint32_t query = warp_q_idx * WARP_Q + (lane_idx % 4) / 2;
+            const bool live = query < q_stage_valid;
+            const uint32_t row = q_idx * (kGrouped ? 1 : kNextN) + (live ? query : 0);
+            query_length = live ? __ldg(params.context_lens + row) : 0;
+            query_logits = params.logits + row * params.logits_stride;
         }
         smem_pipe_read_q = (smem_pipe_read_q + 1) % kNumQStages;
     };
 
     auto load_next_qk_g2s = [&](bool load_q) {
-        uint32_t q_idx, kv_idx_base, num_kv;
+        uint32_t q_idx = scheduler.end_q_idx, kv_idx_base = scheduler.end_kv_idx, num_kv;
         if (scheduler.fetch_next_task(q_idx, kv_idx_base, num_kv)) {
             if (load_q) load_q_g2s(q_idx);
             uint32_t actual_kv = kv_idx_base + warp_group_idx;
@@ -423,21 +477,35 @@ public:
                 load_kv_g2s(q_idx, actual_kv);
         }
         kv_idx_array[smem_pipe_write_kv] = kv_idx_base;
+        if constexpr (kIsFP8H8)
+            q_idx_array[smem_pipe_write_kv] = q_idx;
         smem_pipe_write_kv = (smem_pipe_write_kv + 1) % kNumKVStages;
         if (thread_print) printf("cp_async commit, write_stage = %d\n", smem_pipe_write_kv);
         cp_async_fence();
     };
 
     static constexpr uint32_t kMmaIterM = MmaIterM{};
-    float scale_kv_array[kMmaIterM * 2];
+    float scale_kv_array[kMmaIterM * 2]{};
 
     auto load_kv_scale_s2r = [&]() {
+        if constexpr (kDirectScale) {
+            // Each lane guards the scale page for its own query.
+            const uint32_t key_base = (kv_idx_base + warp_group_idx) * BLOCK_KV + warp_offset;
+            if (key_base < query_length) {
+                const uint32_t page = __ldg(params.block_table + table_row_offset(q_idx) + key_base / PAGE_KV);
+                const auto* scales = reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(params.k_scales)
+                    + page * params.kv_cache_stride_bytes) + key_base % PAGE_KV;
+                #pragma unroll
+                for (int m = 0; m < kMmaIterM; ++m)
+                    scale_kv_array[m] = __ldg(scales + m * InstM + v_offset_mine);
+            }
+            return;
+        }
         float * smem_kv_scales = sSFA(_,_,smem_pipe_read_kv).data().get();
         for (int m = 0; m < kMmaIterM; m++) {
             uint32_t mma_offset = m * InstM;
-            if constexpr (kWq4) {
-                // Each lane stores only its own parity's kv row in the kWq4 epilogue,
-                // so it only loads that row's scale
+            if constexpr (kScaleMode == deep_gemm::kScaleModeQHead || kWq4 || kIsFP8H8) {
+                // Each lane loads the scale for the KV row it writes.
                 scale_kv_array[m] = deep_gemm::tix::ld_shared(smem_kv_scales + warp_offset + mma_offset + v_offset_mine);
                 if constexpr (kScaleMode != deep_gemm::kScaleModeWeights) {
                     scale_kv_array[m] *= kInvSqrtHeadDim;
@@ -457,16 +525,37 @@ public:
     auto epilogue = [&](uint32_t q_idx, uint32_t kv_idx) {
         static constexpr uint32_t kNumAccumPerMma = 8;
         CUTE_STATIC_ASSERT(kMMANumHeads % 16 == 0);
-        CUTE_STATIC_ASSERT(WARP_Q == 1 || WARP_Q == 4);
+        CUTE_STATIC_ASSERT(WARP_Q == 1 || WARP_Q == 2 || WARP_Q == 4);
         for (int m = 0; m < kMmaIterM; m++) {
             uint32_t mma_offset = m * InstM;
             float scale_kv_0, scale_kv_1;
-            if constexpr (!kWq4) {
+            if constexpr (kScaleMode != deep_gemm::kScaleModeQHead && !kWq4 && !kIsFP8H8) {
                 scale_kv_0 = scale_kv_array[m * 2];
                 scale_kv_1 = scale_kv_array[m * 2 + 1];
             }
 
-            if constexpr (kWq4 && kScaleMode == deep_gemm::kScaleModeUnity) {
+            if constexpr (kScaleMode == deep_gemm::kScaleModeQHead) {
+                CUTE_STATIC_ASSERT(MmaIterN{} == 1);
+                CUTE_STATIC_ASSERT(cute::is_same_v<ElementLogits, __ppu_bfloat16>);
+                float totals[2];
+                deep_gemm::int8_avg_head_sum<kNumHeads>(accum, m, q_head_scales, lane_idx, totals);
+                #pragma unroll
+                for (int t = 0; t < (kNumHeads == 4 ? 2 : 1); ++t) {
+                    const uint32_t local_q = 2 * t + (lane_idx % 4) / 2;
+                    const uint32_t token = warp_q_idx * WARP_Q + local_q;
+                    if (token < kNextN) {
+                        const auto row = (q_idx * kNextN + token) * params.logits_stride;
+                        const uint32_t col = kv_idx * BLOCK_KV + warp_offset + mma_offset + v_offset_mine;
+                        params.logits[row + col] = static_cast<ElementLogits>(totals[t] * scale_kv_array[m]);
+                    }
+                }
+            } else if constexpr (kIsFP8H8) {
+                CUTE_STATIC_ASSERT(MmaIterN{} == 1);
+                const float value = deep_gemm::float_epilogue_reduce_weights_h8_output<true>(accum, m, weights, lane_idx);
+                const uint32_t key = kv_idx * BLOCK_KV + warp_offset + mma_offset + v_offset_mine;
+                if (key < query_length)
+                    query_logits[key] = value * scale_kv_array[m];
+            } else if constexpr (kWq4 && kScaleMode == deep_gemm::kScaleModeUnity) {
                 // 4-head avg epilogue, parity split as the non-paged kernel: each lane
                 // stores its own parity's kv row; the token guard skips pad tokens
                 static constexpr int kQPerLane = 2;
@@ -562,27 +651,32 @@ public:
     deep_gemm::warp_interleave_start<WarpInterleaving>(warp_group_id, MaxThreadsPerBlock);
 
     auto handle_q_change = [&]() {
-        if constexpr(kNumQStages > 1) {
-            if (scheduler.exist_q_idx(q_idx + 1)) {
-                load_q_g2s(q_idx + 1);
-            }
-            cp_async_fence();
-        }
-        load_q_s2r();
-        if constexpr(kNumQStages == 1) { // not supported with warp interleaving
+        const uint32_t next_q_idx = kGrouped && q_idx == scheduler.end_q_idx
+            ? params.batch_size : scheduler.next_q_idx(q_idx);
+        if constexpr (kNumQStages == 1) {
+            load_q_s2r();
             __syncthreads();
-            if (scheduler.exist_q_idx(q_idx + 1)) {
-                load_q_g2s(q_idx + 1);
-            }
-            cp_async_fence();
         }
+        if (scheduler.exist_q_idx(next_q_idx))
+            load_q_g2s(next_q_idx);
+        cp_async_fence();
+        if constexpr (kNumQStages > 1)
+            load_q_s2r();
     };
 
     // Make `first` a compile-time constant via cute::true_type / cute::false_type
     // so the compiler can fold the first-iteration branch and avoid the runtime
     // check on the first iteration.
-    auto mainloop = [&](auto first_ic) {
+    // Rotate the H8 three-stage ring at compile time to fold stage-address
+    // arithmetic. Keep the computation shared with the other paged kernels.
+    static constexpr bool kStaticH8Pipeline = kIsFP8H8 && kNumKVStages == 3;
+    auto mainloop = [&](auto first_ic, auto stage_ic) {
         constexpr bool first = decltype(first_ic)::value;
+        if constexpr (kStaticH8Pipeline) {
+            constexpr int stage = decltype(stage_ic)::value;
+            smem_pipe_read_kv = stage;
+            smem_pipe_write_kv = (stage + kNumKVStages - 1) % kNumKVStages;
+        }
         if (thread_print) {
             printf("q_idx = %d, kv_idx_base = %d, wg = %d, read_stage = %d\n", q_idx, kv_idx_base, warp_group_idx, smem_pipe_read_kv);
         }
@@ -622,16 +716,26 @@ public:
         // move to next kv_block
         smem_pipe_read_kv = (smem_pipe_read_kv + 1) % kNumKVStages;
         kv_idx_base = kv_idx_array[smem_pipe_read_kv];
-        if (kv_idx_base == 0) q_idx++;
+        if constexpr (kIsFP8H8)
+            q_idx = q_idx_array[smem_pipe_read_kv];
+        else if (kv_idx_base == 0)
+            q_idx++;
 
         clear(accum);
     };
 
-    if (!scheduler.is_last_task(q_idx, kv_idx_base)) {
-        mainloop(cute::true_type{});
-    }
-    while (!scheduler.is_last_task(q_idx, kv_idx_base)) {
-        mainloop(cute::false_type{});
+    mainloop(cute::true_type{}, cute::Int<0>{});
+    if constexpr (kStaticH8Pipeline) {
+        while (!scheduler.is_last_task(q_idx, kv_idx_base)) {
+            mainloop(cute::false_type{}, cute::Int<1>{});
+            if (scheduler.is_last_task(q_idx, kv_idx_base)) break;
+            mainloop(cute::false_type{}, cute::Int<2>{});
+            if (scheduler.is_last_task(q_idx, kv_idx_base)) break;
+            mainloop(cute::false_type{}, cute::Int<0>{});
+        }
+    } else {
+        while (!scheduler.is_last_task(q_idx, kv_idx_base))
+            mainloop(cute::false_type{}, cute::Int<0>{});
     }
 
     deep_gemm::warp_interleave_end<WarpInterleaving>(warp_group_id, MaxThreadsPerBlock);

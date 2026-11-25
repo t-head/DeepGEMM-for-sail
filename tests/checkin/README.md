@@ -52,10 +52,11 @@ python tests/run_deep_gemm.py --caselist tests/checkin/checkin_890p.list --case_
 
 For masked GEMM, the `test_m_grouped_gemm_masked->test_func:` log line contains a replayable `--format` specification with the generated expert counts, padding, scheduler hint, epilogue, clipping limit and bias setting. Pass that specification to `tests/run_deep_gemm.py --format` to repeat the same case configuration.
 
-## MegaMoE
+## MegaMoE and MegaGate
 
 The single-device suite runs the public smoke tests for SwiGLU, SwiGLU-Step
-and SiTU, including invalid inputs and workspace reuse.
+and SiTU, including invalid inputs and workspace reuse. It also runs the MegaGate
+scoring-mode, infinite-logit, and API-contract tests on the same M890P runner.
 
 ```bash
 python tests/checkin/run_checkin.py --suite ZW-M890P-MegaMoE
@@ -63,7 +64,7 @@ python tests/checkin/run_checkin.py --suite ZW-M890P-MegaMoE
 
 It compiles and executes the pipeline together, without `HGGC_WARM_UP` or the
 legacy `testcase.json`. `--phase compile` is not supported for this suite.
-Output and failures are retained in `checkin-logs/script-0001.log` and the usual
+Each command writes its own `checkin-logs/script-NNNN.log` and contributes to the usual
 JUnit report. Multi-card tests are disabled in automatic check-in because a
 runner may have only one device. On a host with two free PPU1.5 devices, run:
 
@@ -85,14 +86,40 @@ The unified entry point calls `test_activation.py` and `test_fp4_core.py` direct
 - `GroupedMasked` / `GroupedNoPad,data_type:w4a8_int8`: 810E packed INT4 weights with INT8 activations. Cases from main retain large shapes, K=32/K=160 tails, and both small-M GEMV shapes; weight packing/preprocessing is exercised by the original generators.
 - `MqaAvgLogits,data_type:fp4`: six 890P cases cover the required compressed output, all three Q-scale modes, both output dtypes, Q/KV tails, active/fallback KV balancing, and multi-MMA-group execution for every Q-scale mode. Broader coverage remains in the attention script.
 - `PagedMqaAvgLogits,data_type:fp4`: four 890P cases cover next_n=1/4/5/6, page32/64/128, both output dtypes across both Q layouts, empty/mixed contexts, page tails and in-CTA request switches.
+- `PagedMqaLogits,data_type:fp4,is_varlen:1,varlen_indices:[...]`: grouped
+  replay uses flattened query rows with explicit request indices and `next_n=1`.
+  Dense consecutive request IDs identify the runs; `context_lens` retains
+  exact per-query lengths, with each request's maximum in its last query.
+  Without it, `distribution` gives per-request bases
+  expanded as base+j. Check-in covers ragged tails, shared page mappings,
+  nonmonotonic contexts, both head counts and multi-cluster KV reuse. Cases
+  without varlen fields retain the legacy independent-query metadata path.
 - `with_bias:1`: FP4 Dense/GroupedNoPad/GroupedMasked Default epilogues; bias and fused activation epilogues are tested separately.
 
 The added representatives also preserve INT8 contiguous, masked overlap/signal checks, FP8 channel contiguous/fused, BF16 paged attention, FP4 dense, and 890P BF16 dense M=2/grouped small-M GEMV. Existing colleague-authored cases are retained. FP4 masked overlap is currently unimplemented (the device template only specializes overlap=false); it is excluded rather than treated as a supported positive case.
 
 Actual HGCC compilation, device accuracy, cache reuse and timing must be validated on both PPU boards.
 
+## Cold graph capture
+
+Board check-in runs `tests/test_cold_graph_capture.py` after successful accuracy
+checks, including in CI. M890P covers BF16 and FP8 channel/block; 810E covers BF16.
+Each case uses fresh processes and a private cache, warms a different specialization,
+then captures the target's first call with either an empty or pre-existing disk cache.
+Three random inputs check replay accuracy and exact agreement with eager execution.
+The script result and complete subprocess output are included in the check-in report.
+`--phase compile` and custom caselists do not run this regression.
+The runner's `--timeout` covers the whole capture script and terminates its
+process group, including compiler descendants. Direct pytest runs have no timeout.
+
+```bash
+python -m pytest -q -s tests/test_cold_graph_capture.py
+```
+
 Device checks comparing W4 warm-up shapes, types and strides with real quantization, and ensuring `--disable_acc` alone keeps real inputs:
 
 ```bash
 python tests/checkin/test_warmup_inputs.py -v
 ```
+
+- `MqaAvgLogits` / `PagedMqaAvgLogits`, `data_type:int8`: six 810E cases cover H4/H8, BF16 output, D128, compressed Q/KV tails, paged next_n=1/3/5/6, page64/128/192/512, and mixed/empty contexts. The attention AVG loop covers all next_n values and nonzero window starts.

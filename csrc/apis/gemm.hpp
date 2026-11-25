@@ -3,6 +3,8 @@
 #include "../utils/compatibility.hpp"
 #include "../utils/layout.hpp"
 #include <torch/extension.h>
+#include <limits>
+#include <c10/core/DeviceGuard.h>
 #include "../jit_kernels/impls/epilogue_class.hpp"
 #include "../jit_kernels/impls/fp8_gemm.hpp"
 #include "../jit_kernels/impls/ppuxx_layout.hpp"
@@ -95,10 +97,12 @@ void bf16_gemm_nt(const torch::Tensor& a,
                   const std::optional<torch::Tensor>& c,
                   const std::string& compiled_dims,
                   std::optional<ConfigTuple> configs = std::nullopt) {
-    const auto major_a = get_major_type_ab(a);
-    const auto major_b = get_major_type_ab(b);
-    check_major_type_cd(d);
-
+    TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && d.dim() == 2, "BF16 dense GEMM requires rank-2 tensors");
+    // Host tile/grid calculations add up to 511 before division in int32.
+    for (auto size : {a.size(0), a.size(1), b.size(0), b.size(1), d.size(0), d.size(1)})
+        TORCH_CHECK(size <= std::numeric_limits<int>::max() - 511, "BF16 dense GEMM dimensions exceed int32 tile range");
+    TORCH_CHECK(a.size(1) <= std::numeric_limits<int>::max() - 4096,
+                "BF16 dense GEMM K exceeds the int32 K-loop range");
     const auto& [m, k] = get_shape<2>(a);
     const auto& [n, k_] = get_shape<2>(b);
     const auto& [m_, n_] = get_shape<2>(d);
@@ -111,6 +115,13 @@ void bf16_gemm_nt(const torch::Tensor& a,
     TORCH_CHECK(a.is_contiguous(), "lhs must be contiguous");
     TORCH_CHECK(b.is_contiguous(), "rhs must be contiguous");
     TORCH_CHECK(d.is_contiguous(), "out must be contiguous");
+    TORCH_CHECK(b.device() == a.device() && d.device() == a.device(),
+                "GEMM tensors must be on the same accelerator");
+    int device;
+    DG_HGGC_RUNTIME_CHECK(hggcGetDevice(&device));
+    TORCH_CHECK(a.get_device() == device, "GEMM tensors must be on the current accelerator");
+    TORCH_CHECK(is_contiguous_output_disjoint(d, a) && is_contiguous_output_disjoint(d, b),
+                "GEMM output must not overlap an input");
     if (c.has_value()) {
         TORCH_CHECK(c->sizes() == d.sizes(), "C and D must have the same shape");
         TORCH_CHECK(c->scalar_type() == d.scalar_type(), "C and D must have the same dtype");
@@ -118,27 +129,17 @@ void bf16_gemm_nt(const torch::Tensor& a,
         check_major_type_cd(c.value());
         TORCH_CHECK(c->data_ptr() != d.data_ptr() || c->strides() == d.strides(),
                     "C and D sharing the same address must have the same strides");
-        if (m != 0 && n != 0 && k != 0) {
-            // BF16 product kernels (including GEMV and split-K) have beta=0.
-            // Keep C alive until the FP32 product is complete, including C == D,
-            // and add it before the only conversion to the requested output dtype.
-            // Calls without C retain their existing dispatch and allocations.
-            auto accum = torch::empty({m, n}, d.options().dtype(torch::kFloat));
-            bf16_gemm_nt(a, b, accum, std::nullopt, compiled_dims, configs);
-            // The product kernel is cached but leaves accum unwritten in these modes.
-            if (is_compile_only()) return;
-            accum.add_(c.value());
-            d.copy_(accum);
-            return;
-        }
+        TORCH_CHECK(c->data_ptr() == d.data_ptr() || is_contiguous_output_disjoint(d, *c),
+                    "BF16 GEMM C/D must be disjoint or exactly aliased");
     }
-    if (early_return(m, n, k, d, c)) return;
-    if (n == 1 && !configs.has_value() && model_810e_bf16_n1(a, b, d)) return;
-    if (!configs.has_value() && model_810e_dispatch_dense(a, b, d)) return;
-    TORCH_CHECK(is_ppu1v5_device() || n % 2 == 0, "BF16 dense GEMM on PPU1.0 requires even N, got ", n);
+    if (m == 0 || n == 0) return;
+    if (k == 0) {
+        bf16_gemm_empty(d, c);
+        return;
+    }
     const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 8) {
-        bf16_gemm(a, b, d, m, n, k, configs);
+        bf16_gemm(a, b, d, m, n, k, configs, c);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -157,19 +158,6 @@ void gemm_fp32_fp32_fp32_nt(const torch::Tensor& a, const torch::Tensor& b, cons
     if (a.size(0) == 0 || b.size(0) == 0) return;
     if (a.size(1) == 0) { d.zero_(); return; }
     fp32_gemm(a, b, d);
-}
-
-void bf16_gemm_strided_batched_nt(const torch::Tensor& a, const torch::Tensor& b,
-    const torch::Tensor& d, std::optional<ConfigTuple> configs = std::nullopt) {
-    if (model_810e_check_batch(a, b, d)) return;
-    if (!configs.has_value() && model_810e_dispatch_batch(a, b, d)) return;
-    if (!configs.has_value() && a.size(2) == 128) {
-        // Short-K batches are output-bound at large M. Use the coalesced TSM
-        // epilogue; its existing alignment gate retains guarded direct stores.
-        model_810e_bf16_strided_batched_tsm(a, b, d, configs);
-        return;
-    }
-    model_810e_bf16_strided_batched(a, b, d, configs);
 }
 
 void bf16_gemm_nn(const torch::Tensor& a,
@@ -1031,43 +1019,93 @@ void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& lhs, const torch::Te
                                        const bool& use_psum_layout,
                                        const bool& ensure_zero_padding,
                                        const std::optional<int>& expected_m_for_psum_layout,
-                                       std::optional<ConfigTuple> configs = std::nullopt) {
+                                       std::optional<ConfigTuple> configs = std::nullopt,
+                                       const std::optional<torch::Tensor>& c = std::nullopt) {
+    DG_HOST_ASSERT(lhs.is_cuda() && lhs.dim() == 2 && out.is_cuda() && out.dim() == 2);
     const auto major_a = get_major_type_ab(lhs);
-    const auto major_b = get_major_type_ab(rhs);
     DG_HOST_ASSERT(major_a == MajorType::K);
 
-    const auto& [m, k] = get_shape<2>(lhs);
-    const auto& [num_groups, n, k_] = get_shape<3>(rhs);
-    const auto& [m_, n_] = get_shape<2>(out);
-    int m__ = m_indices.numel();
-
-    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+    const auto& [num_groups, n, k] = get_shape<3>(rhs);
+    DG_HOST_ASSERT(out.size(1) == n && lhs.size(1) == k);
+    const auto row_capacity = std::min(lhs.size(0), out.size(0));
     DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
     DG_HOST_ASSERT(lhs.dtype() == torch::kBFloat16);
     DG_HOST_ASSERT(rhs.dtype() == torch::kBFloat16);
     DG_HOST_ASSERT(out.dtype() == torch::kBFloat16);
     DG_HOST_ASSERT(m_indices.dtype() == torch::kInt32);
     TORCH_CHECK(lhs.is_contiguous(), "lhs must be contiguous");
-    TORCH_CHECK(rhs.is_contiguous(), "rhs must be contiguous");
+    // Transposing the last two dimensions creates a view, without copying weights.
+    // Prefer K-major when singleton dimensions make both packed layouts valid.
+    const bool b_is_mn_major = !rhs.is_contiguous();
+    TORCH_CHECK(!b_is_mn_major || rhs.transpose(1, 2).is_contiguous(),
+                "rhs must use packed K-major or packed MN-major layout");
     TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
     TORCH_CHECK(m_indices.is_contiguous(), "m_indices must be contiguous");
 
+    TORCH_CHECK(lhs.device() == out.device() && rhs.device() == out.device() &&
+                m_indices.device() == out.device(), "grouped BF16 inputs must be on the same accelerator");
+    TORCH_CHECK(m_indices.dim() == 1, "m_indices must be one-dimensional");
     if (use_psum_layout) {
-        DG_HOST_ASSERT(m__ == num_groups);
+        TORCH_CHECK(m_indices.size(0) == num_groups, "grouped_layout must contain one end offset per expert");
     } else {
-        DG_HOST_ASSERT(m == m_);
-        DG_HOST_ASSERT(!expected_m_for_psum_layout.has_value());
+        TORCH_CHECK(m_indices.size(0) <= row_capacity, "m_indices row count must fit in A and D");
+        TORCH_CHECK(m_indices.size(0) <= std::numeric_limits<int32_t>::max(), "m_indices row count must fit in int32");
+    }
+    // Prefix-sum scheduling uses int32 device offsets, so no expert can end past INT32_MAX.
+    const auto launch_rows = use_psum_layout ? std::min<int64_t>(row_capacity, std::numeric_limits<int32_t>::max())
+                                             : m_indices.size(0);
+    const int launch_m = static_cast<int>(launch_rows);
+    const c10::DeviceGuard device_guard(out.device());
+    if (c.has_value()) {
+        TORCH_CHECK(c->defined() && c->sizes() == out.sizes(), "c must have the same shape as out");
+        TORCH_CHECK(c->scalar_type() == torch::kBFloat16 && c->is_contiguous(), "c must be contiguous BF16");
+        TORCH_CHECK(c->device() == out.device(), "c and out must be on the same accelerator");
+        TORCH_CHECK(!out.is_neg() && !c->is_neg(), "grouped BF16 accumulation requires resolved C/D views");
+    }
+    if (launch_m != 0) {
+        // Compare byte ranges, including DLPack views backed by distinct StorageImpls.
+        const auto dst = reinterpret_cast<uintptr_t>(out.data_ptr());
+        const auto overlaps_out = [&](const torch::Tensor& input) {
+            const auto src = reinterpret_cast<uintptr_t>(input.data_ptr());
+            return dst < src ? src - dst < out.nbytes() : dst - src < input.nbytes();
+        };
+        if (c.has_value()) {
+            TORCH_CHECK(c->data_ptr() == out.data_ptr() || !overlaps_out(*c), "c and out partially overlap");
+        }
+        TORCH_CHECK(!overlaps_out(lhs) && !overlaps_out(rhs) && !overlaps_out(m_indices),
+                    "out overlaps a grouped GEMM input");
+    }
+
+    if (use_psum_layout) {
+        TORCH_CHECK(n % 8 == 0 && k % 8 == 0, "compact grouped BF16 requires N and K divisible by 8");
+        validate_compact_group_ends(m_indices, row_capacity);
+    } else {
+        TORCH_CHECK(!expected_m_for_psum_layout.has_value(), "expected_m_for_psum_layout requires prefix sums");
     }
 
     check_major_type_cd(out);
 
-    if (m == 0) {
+    if (launch_m == 0) {
         return;
     }
 
     const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 8) {
-        m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(lhs, rhs, out, m_indices, m, n, k, num_groups, configs);
+        const auto launch = [&]<bool ScalarNoC>() {
+            if (b_is_mn_major) {
+                m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl<true, ScalarNoC>(
+                    lhs, rhs, out, m_indices, launch_m, n, k, num_groups, configs, c, use_psum_layout);
+            } else {
+                m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl<false, ScalarNoC>(
+                    lhs, rhs, out, m_indices, launch_m, n, k, num_groups, configs, c, use_psum_layout);
+            }
+        };
+        // Odd row strides can leave a single BF16 at the end of a no-C store.
+        if (n % 2 != 0 && !c.has_value() && is_ppu1v5_device()) {
+            launch.operator()<true>();
+        } else {
+            launch.operator()<false>();
+        }
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -2046,8 +2084,6 @@ static void register_apis(pybind11::module_& m) {
     // BF16 GEMMs
     m.def("gemm_fp32_fp32_fp32_nt", &gemm_fp32_fp32_fp32_nt,
           py::arg("a"), py::arg("b"), py::arg("d"));
-    m.def("bf16_gemm_strided_batched_nt", &bf16_gemm_strided_batched_nt,
-          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("configs") = std::nullopt);
     m.def("bf16_gemm_nt", &bf16_gemm_nt, py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("compiled_dims") = "nk", py::arg("configs") = std::nullopt);
     m.def("bf16_gemm_nn", &bf16_gemm_nn, py::arg("a"), py::arg("b"), py::arg("d"),
@@ -2067,7 +2103,11 @@ static void register_apis(pybind11::module_& m) {
     m.def("m_grouped_bf16_gemm_nt_contiguous", &m_grouped_bf16_gemm_nt_contiguous, py::arg("lhs"),
           py::arg("rhs"), py::arg("out"), py::arg("m_indices"), py::arg("compiled_dims") = "nk",
           py::arg("use_psum_layout") = false, py::arg("ensure_zero_padding") = true,
-          py::arg("expected_m_for_psum_layout") = std::nullopt, py::arg("configs") = std::nullopt);
+          py::arg("expected_m_for_psum_layout") = std::nullopt, py::arg("configs") = std::nullopt,
+          py::arg("c") = std::nullopt,
+          "Optionally add BF16 C to the FP32 product before writing BF16 out. C may alias out exactly. "
+          "With use_psum_layout=True, m_indices is int32[G] of compact exclusive expert end offsets; "
+          "adjacent equal offsets are empty experts.");
     m.def("m_grouped_bf16_gemm_nt_masked", &m_grouped_bf16_gemm_nt_masked, py::arg("lhs"),
           py::arg("rhs"), py::arg("out"), py::arg("masked_m"), py::arg("expected_m"), py::arg("compiled_dims") = "nk",
           py::arg("max_block_n") = 256, py::arg("enable_sbo_overlap") = false, py::arg("signal") = std::nullopt,

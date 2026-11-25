@@ -1,4 +1,7 @@
 # Ported from DeepGEMM 5081f851 (MIT); backend and architecture gate adapted for PPU.
+import os
+import subprocess
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -13,6 +16,7 @@ from deep_gemm.testing import (
     get_arch_major,
     test_filter,
 )
+from utils import get_arch_version
 
 NUM_TOPK = 6
 NUM_SHARED_EXPERTS = 1
@@ -48,6 +52,12 @@ def make_physical_map(num_logical_experts: int) -> tuple[torch.Tensor, torch.Ten
         num_logical_experts + torch.arange(num_duplicated_experts, dtype=torch.int32, device='cuda'))
     logical_count[:num_duplicated_experts] = 2
     return to_physical_map, logical_count
+
+
+def normalized_weights(selected: torch.Tensor, *, sigmoid: bool, scale: float = ROUTED_SCALING_FACTOR) -> torch.Tensor:
+    total = selected.sum(dim=-1, keepdim=True)
+    denominator = torch.where(total > 0, total, 1.0) if sigmoid else total + 1e-20
+    return selected / denominator * scale
 
 
 def make_inputs(num_tokens: int, hidden: int, num_routed_experts: int,
@@ -87,11 +97,12 @@ def make_outputs(inputs: dict[str, Any], use_shared_as_routed: bool = False,
 def run_mega_gate(inputs: dict[str, Any], outputs: dict[str, torch.Tensor | None],
                   use_shared_as_routed: bool = False,
                   num_topk: int = NUM_TOPK, num_shared_experts: int = NUM_SHARED_EXPERTS,
+                  routed_scaling_factor: float = ROUTED_SCALING_FACTOR, ep_rank: int = 0,
                   **overrides: Any) -> tuple[torch.Tensor, torch.Tensor]:
     kwargs = {**inputs, **overrides}
     x, weight = kwargs.pop('x'), kwargs.pop('weight')
     return deep_gemm.bf16_mega_gate(
-        x, weight, num_topk, use_shared_as_routed, num_shared_experts, ROUTED_SCALING_FACTOR, 0,
+        x, weight, num_topk, use_shared_as_routed, num_shared_experts, routed_scaling_factor, ep_rank,
         unmapped_topk_idx=outputs['unmapped_topk_idx'],
         out=(outputs['topk_idx'], outputs['topk_weights']), **kwargs)
 
@@ -107,7 +118,8 @@ def check_topk_weights(inputs: dict[str, Any], outputs: dict[str, torch.Tensor |
                        mask: torch.Tensor | None = None,
                        force_random: torch.Tensor | None = None,
                        fix_routing_mask: torch.Tensor | None = None,
-                       num_topk: int = NUM_TOPK) -> float:
+                       num_topk: int = NUM_TOPK,
+                       routed_scaling_factor: float = ROUTED_SCALING_FACTOR, scoring_func: str = 'sqrtsoftplus') -> float:
     fused_idx, fused_weights = outputs['topk_idx'], outputs['topk_weights']
     num_tokens, num_routed_experts = logits.shape
     active = mask if mask is not None else torch.ones((num_tokens,), dtype=torch.bool, device='cuda')
@@ -115,7 +127,8 @@ def check_topk_weights(inputs: dict[str, Any], outputs: dict[str, torch.Tensor |
     weight_diff = 0.0
 
     if score_based.any():
-        scores = F.softplus(logits).sqrt()
+        use_sigmoid = scoring_func == 'sigmoid'
+        scores = logits.sigmoid() if use_sigmoid else F.softplus(logits).sqrt()
         logical_topk_idx = outputs['unmapped_topk_idx']
         if logical_topk_idx is None:
             logical_topk_idx = fused_idx[:, :num_topk]
@@ -137,7 +150,7 @@ def check_topk_weights(inputs: dict[str, Any], outputs: dict[str, torch.Tensor |
 
         def reference_weights(row_mask: torch.Tensor, topk_idx: torch.Tensor) -> torch.Tensor:
             topk_scores = scores[row_mask].gather(1, topk_idx)
-            return topk_scores / (topk_scores.sum(dim=1, keepdim=True) + 1e-20) * ROUTED_SCALING_FACTOR
+            return normalized_weights(topk_scores, sigmoid=use_sigmoid, scale=routed_scaling_factor)
 
         weight_diff = float(calc_diff(fused_weights[score_based, :num_topk],
                                       reference_weights(score_based, selected_idx)))
@@ -156,11 +169,17 @@ def check_topk_weights(inputs: dict[str, Any], outputs: dict[str, torch.Tensor |
             assert torch.all(crossing <= tolerance).item(), \
                 f'top-k selection beyond numerical ties: {crossing.max().item()=}'
 
-            ref_weights = reference_weights(ranked, ranking[ranked].topk(num_topk, dim=1).indices)
-            ranked_diff = float(calc_diff(fused_weights[ranked, :num_topk].sort(dim=1).values,
-                                          ref_weights.sort(dim=1).values))
-            assert ranked_diff < 1e-11, f'{ranked_diff=}'
-            weight_diff = max(weight_diff, ranked_diff)
+            ref_idx = ranking[ranked].argsort(dim=1, descending=True, stable=True)[:, :num_topk]
+            same_experts = (sorted_idx == ref_idx.sort(dim=1).values).all(dim=1)
+            # Numerical ties in biased ranking may select different experts with
+            # different unbiased weights. Their selected weights and ranking
+            # bounds were checked above; compare reference weights for equal sets.
+            if same_experts.any():
+                ref_weights = reference_weights(ranked, ref_idx)
+                ranked_diff = float(calc_diff(fused_weights[ranked, :num_topk][same_experts].sort(dim=1).values,
+                                              ref_weights[same_experts].sort(dim=1).values))
+                assert ranked_diff < 1e-11, f'{ranked_diff=}'
+                weight_diff = max(weight_diff, ranked_diff)
 
         if fused_weights.shape[1] > num_topk:
             assert torch.all(fused_weights[score_based, num_topk:] == 1.0).item()
@@ -202,7 +221,7 @@ def check_case(num_tokens: int, hidden: int, num_routed_experts: int,
     check_correctness(inputs, outputs, use_shared_as_routed, num_topk, num_shared_experts)
 
 
-@test_filter(lambda: get_arch_major() == 8)
+@test_filter(lambda: get_arch_major() >= 8)
 @torch.no_grad()
 def test_mega_gate() -> None:
     torch.manual_seed(0)
@@ -254,7 +273,7 @@ def check_routing_controls() -> None:
     assert torch.all(unmapped_topk_idx[active_force_random] == -1).item()
 
 
-@test_filter(lambda: get_arch_major() == 8)
+@test_filter(lambda: get_arch_major() >= 8)
 @torch.no_grad()
 def test_mega_gate_api_contract() -> None:
     torch.manual_seed(2)
@@ -269,6 +288,14 @@ def test_mega_gate_api_contract() -> None:
 
     check_case(16, 4096, 128, with_bias=False, with_physical_map=False)
     check_case(129, 4352, 260, with_image_bias=True, with_mask=True, with_unmapped_topk_idx=True)
+
+    # Masked rows may hold non-finite values (e.g. CUDA graph padding)
+    for num_tokens, num_routed_experts in ((16, 256), (129, 384), (1024, 384)):
+        inputs = make_inputs(num_tokens, 4096, num_routed_experts, with_image_bias=True, with_mask=True)
+        masked_idx = (~inputs['mask']).nonzero().flatten()
+        inputs['x'][masked_idx[0::2]] = float('nan')
+        inputs['x'][masked_idx[1::2]] = float('inf')
+        check_correctness(inputs, make_outputs(inputs, with_unmapped_topk_idx=True))
 
     inputs = make_inputs(128, 4096, 384, with_image_bias=True)
     inputs['bias'].fill_(1e8)
@@ -314,6 +341,155 @@ def test_mega_gate_api_contract() -> None:
         deep_gemm.use_deterministic_algorithms(False)
 
 
+@test_filter(lambda: get_arch_major() >= 8)
+@torch.no_grad()
+def test_mega_gate_scoring_modes() -> None:
+    # Make the dot products exact. Only one hidden channel contributes.
+    for rows in (1, 129):
+        inputs = make_inputs(rows, 6144, 256, with_physical_map=False)
+        inputs['x'].zero_()
+        inputs['x'][:, 0] = 1
+        weight = inputs['weight']
+        weight.zero_()
+        weight[:4, 0] = torch.arange(4, device='cuda') - 2
+        weight[8:12, 0] = 2
+        bias = inputs['bias']
+        bias.fill_(-8)
+        bias[:4] = 4
+        bias[4:8] = 0.4
+        bias[8:12] = 0
+        logits = weight[:, 0].float()
+        # Interleave activations with identical shapes to exercise JIT cache reuse.
+        for mode in (None, 'sigmoid', 'sqrtsoftplus', 'sigmoid'):
+            outputs = make_outputs(inputs, num_topk=8)
+            kwargs = {} if mode is None else {'scoring_func': mode}
+            ids, weights = run_mega_gate(inputs, outputs, num_topk=8, **kwargs)
+            scores = logits.sigmoid() if mode == 'sigmoid' else F.softplus(logits).sqrt()
+            expected_ids = (scores + bias).topk(8).indices.sort().values
+            assert torch.equal(ids.sort(dim=1).values, expected_ids.expand(rows, -1))
+            selected = scores[ids]
+            expected_weights = normalized_weights(selected, sigmoid=mode == 'sigmoid')
+            torch.testing.assert_close(weights, expected_weights, rtol=3e-4, atol=2e-5)
+
+        # Bias fixes the winning set while all eight unbiased scores are tiny or zero.
+        bias.zero_()
+        bias[:8] = 1
+        expected_ids = torch.arange(8, device='cuda').expand(rows, -1)
+        for logit in (-50, -128):
+            weight[:, 0] = logit
+            for mode in ('sigmoid', 'sqrtsoftplus'):
+                outputs = make_outputs(inputs, num_topk=8)
+                ids, weights = run_mega_gate(inputs, outputs, num_topk=8, scoring_func=mode)
+                assert torch.equal(ids.sort(dim=1).values, expected_ids)
+                selected_logits = weight[:, 0].float()[ids]
+                scores = selected_logits.sigmoid() if mode == 'sigmoid' else F.softplus(selected_logits).sqrt()
+                expected = normalized_weights(scores, sigmoid=mode == 'sigmoid')
+                torch.testing.assert_close(weights, expected, rtol=3e-4, atol=0)
+
+        # All FP32 sigmoid scores round to one; the documented tie break is lowest ID.
+        inputs['bias'] = None
+        weight[:, 0] = 32
+        weight[8:, 0] = 48
+        outputs = make_outputs(inputs, num_topk=8)
+        ids, weights = run_mega_gate(inputs, outputs, num_topk=8, scoring_func='sigmoid')
+        expected_ids = torch.arange(8, device='cuda').expand(rows, -1)
+        assert torch.equal(ids, expected_ids)
+        torch.testing.assert_close(weights, torch.full_like(weights, ROUTED_SCALING_FACTOR / 8))
+
+        # Exercise the GLM sigmoid specialization with non-finite graph padding.
+        mask = torch.arange(rows, device='cuda') % 3 == 0
+        inputs['x'][1::3] = float('nan')
+        inputs['x'][2::3] = float('inf')
+        ids, weights = run_mega_gate(inputs, outputs, num_topk=8, scoring_func='sigmoid', mask=mask)
+        assert torch.equal(ids[mask], expected_ids[mask])
+        torch.testing.assert_close(weights[mask], torch.full_like(weights[mask], ROUTED_SCALING_FACTOR / 8))
+        assert (ids[~mask] == -1).all().item() and (weights[~mask] == 0).all().item()
+
+
+@test_filter(lambda: get_arch_major() >= 8)
+@torch.no_grad()
+def test_mega_gate_sigmoid_routing_controls() -> None:
+    inputs = make_inputs(2, 6144, 132, with_physical_map=False)
+    x, weight = inputs['x'], inputs['weight']
+    x.zero_()
+    x[:, 0] = 1
+    weight.zero_()
+    weight[:8, 0] = torch.arange(-4, 4, device='cuda')
+    inputs['bias'].zero_()
+    inputs['bias'][8:] = 4  # Learned ranking would choose different experts.
+    fixed_ids = torch.tensor([7, 2, 4, 0, 5, 1, 6, 3], device='cuda')
+    fixed = torch.tensor([True, False], device='cuda')
+    expected = normalized_weights(weight[fixed_ids, 0].float().sigmoid(), sigmoid=True)
+    try:
+        for deterministic in (True, False):  # One K split, then multiple splits on M890.
+            deep_gemm.use_deterministic_algorithms(deterministic)
+            outputs = make_outputs(inputs, with_unmapped_topk_idx=True, num_topk=8)
+            logical = outputs['unmapped_topk_idx']
+            logical.copy_(fixed_ids.expand_as(logical))
+            ids, weights = run_mega_gate(inputs, outputs, num_topk=8, scoring_func='sigmoid',
+                                         fix_routing_mask=fixed, force_random=~fixed)
+            assert torch.equal(ids[0], fixed_ids) and torch.equal(logical[0], fixed_ids)
+            torch.testing.assert_close(weights[0], expected, rtol=3e-4, atol=0)
+            assert logical[1].eq(-1).all().item()
+            assert ((ids[1] >= 0) & (ids[1] < weight.size(0))).all().item()
+            assert ids[1].unique().numel() == 8
+            assert ((weights[1] > 0) & (weights[1] <= 1)).all().item()
+    finally:
+        deep_gemm.use_deterministic_algorithms(False)
+
+
+@test_filter(lambda: get_arch_major() >= 8)
+def test_mega_gate_sigmoid_partial_scores(tmp_path) -> None:
+    # Observe the production validity flag directly: trapping the full kernel would
+    # invalidate the device context used by the rest of the check-in suite.
+    root = Path(__file__).resolve().parents[1]
+    hgcc = (os.environ.get('DG_JIT_HGCC_COMPILER') or os.environ.get('DG_HGCC_COMPILER')
+            or Path(deep_gemm.PPU_HOME) / 'bin/hgcc')
+    binary = tmp_path / 'mega_gate_partial_scores'
+    arch_version = get_arch_version()
+    if arch_version not in (80, 89):
+        raise RuntimeError(f'Unsupported PPU architecture: {arch_version}')
+    arch = 'ppu_10' if arch_version == 80 else 'ppu_15'
+    subprocess.run([hgcc, '-std=c++17', f'-arch={arch}',
+                    '-I' + str(root / 'deep_gemm/include'),
+                    '-I' + str(root / 'third-party/actlize_v1.0.0/include'),
+                    str(root / 'tests/mega_gate_partial_scores.cu'), '-o', str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)
+
+
+@test_filter(lambda: get_arch_major() >= 8)
+@torch.no_grad()
+def test_mega_gate_sigmoid_infinite_logits() -> None:
+    # Both token rows and expert columns need physical padding; no caller mask.
+    inputs = make_inputs(2, 6144, 132, with_physical_map=False)
+    magnitude = float(2**64)
+    x, weight, bias = inputs['x'], inputs['weight'], inputs['bias']
+    x.zero_()
+    weight.zero_()
+    bias.zero_()
+    bias[:8] = 2  # Select the same eight experts, including the zero-weight ones.
+
+    try:
+        for deterministic in (True, False):  # Single split and heuristic split-K.
+            deep_gemm.use_deterministic_algorithms(deterministic)
+            # Finite overflow, NaN in padded token rows, NaN in padded expert columns.
+            for x0, w0 in ((magnitude, magnitude), (1.0, float('inf')), (float('inf'), 1.0)):
+                x[0, 0], x[1, 0] = x0, -x0
+                weight[:, 0] = -w0
+                weight[:4, 0] = w0
+                ids, weights = run_mega_gate(inputs, make_outputs(inputs, num_topk=8),
+                                             num_topk=8, scoring_func='sigmoid')
+                expected_ids = torch.arange(8, device='cuda').expand(2, -1)
+                assert torch.equal(ids.sort(dim=1).values, expected_ids)
+                positive = torch.stack((ids[0] < 4, ids[1] >= 4))
+                torch.testing.assert_close(weights, positive.float() * (ROUTED_SCALING_FACTOR / 4), rtol=0, atol=0)
+    finally:
+        deep_gemm.use_deterministic_algorithms(False)
+
+
 if __name__ == '__main__':
+    test_mega_gate_sigmoid_routing_controls()
+    test_mega_gate_sigmoid_infinite_logits()
+    test_mega_gate_scoring_modes()
     test_mega_gate_api_contract()
     test_mega_gate()

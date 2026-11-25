@@ -12,6 +12,23 @@ __forceinline__ __device__ uint32_t get_lane_idx() {
 
 #if defined(__HGGC__)
 
+// All Threads participate. Synchronize before reusing the per-warp scratch storage.
+template <int Threads>
+__device__ __forceinline__ float block_reduce_max(float value, float* warp_max, float minimum) {
+    static_assert(Threads % 32 == 0 && Threads <= 1024);
+    #pragma unroll
+    for (int offset = 16; offset; offset >>= 1)
+        value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, offset));
+    const int lane = threadIdx.x % 32;
+    if (lane == 0) warp_max[threadIdx.x / 32] = value;
+    __syncthreads();
+    value = lane < Threads / 32 ? warp_max[lane] : minimum;
+    #pragma unroll
+    for (int offset = 16; offset; offset >>= 1)
+        value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, offset));
+    return value;
+}
+
 // Approximate reciprocal with flush-to-zero semantics for MXFP4 scales.
 __device__ __forceinline__ float reciprocal_approx_ftz(float value) {
     float result;

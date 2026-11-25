@@ -84,6 +84,9 @@ See [CHANGELOG.md](CHANGELOG.md) for the complete release notes.
 - PyTorch 2.1 or above
 - ACTLIZE for PPU: v1.0.0
 
+Keep the PPU SDK's `hgobjdump` executable on `PATH`. Module loading uses it to
+inspect kernel symbols, including disk-cache loads; ISA export uses it as well.
+
 ### Development
 
 Before contributing, read the [DeepGEMM development guidelines](docs/development.md).
@@ -130,9 +133,20 @@ To perform a basic non-grouped FP8 GEMM, call the `deep_gemm.gemm_fp8_fp8_bf16_n
 
 BF16 dense GEMM: `deep_gemm.bf16_gemm_nt(a, b, out)` computes `out = a @ b.T`
 with contiguous BF16 inputs. On 810E and 890P, `out` supports BF16 or FP32.
-890P supports odd and even N. On 810E, N must be even except for N=1
-without an explicit configuration, which requires K divisible by 8 and
-16-byte-aligned inputs.
+890P supports odd and even N. On 810E, GEMV/Direct paths also cover narrow
+and partial outputs; tiled paths require `K>=64`, `K%32=0` and aligned inputs.
+N=1 GEMV requires `K%8=0` and 16-byte-aligned inputs.
+
+Use `deep_gemm.bf16_gemm_nt(a, b, d, c=c)` for optional accumulation.
+C must match D's shape, dtype and device; C/D must be disjoint or exactly aliased
+with identical strides. The product and C are added in FP32 before output conversion.
+All tensors must be on the current accelerator; D must not overlap A or B.
+Empty outputs are no-ops; K=0 writes C or zero. Compile-only mode preserves C/D.
+
+810E `configs` are `(num_sms, BM, BN, BK, WM, WN, stages, (0, 0, 0))`.
+Explicit/LUT tiles require a 16-byte-aligned product output and N divisible by
+8 (BF16) or 4 (FP32); with C, this applies to the internal FP32 product.
+Unsupported inputs/configurations raise host errors; see [810E checkin cases](tests/checkin/checkin_810e.list).
 
 BF16 x FP32 dense GEMM: `deep_gemm.gemm_bf16xfp32(x, w_high, w_low,
 scale, use_fp32_output=False)` computes `x @ (w_high + scale * w_low).T`
@@ -146,6 +160,21 @@ or FP32 when requested. No external workspace is accepted. The native
 Unlike traditional grouped GEMMs in ACTLIZE, DeepGEMM groups only the M-axis, while N and K must remain fixed. This design is tailored for scenarios where experts in an MoE model share the same shape.
 
 For training forward passes or inference prefilling, where each expert may process a varying number of tokens, we concatenate these tokens into a single tensor, referred to as the "contiguous" layout. Note that each expert segment must be aligned to the GEMM M block size (`get_m_alignment_for_contiguous_layout()`).
+
+On M890P, `m_grouped_bf16_gemm_nt_contiguous` accepts optional BF16 `c`,
+including in-place `c=d`, with FP32 accumulation before BF16 output.
+A and D may have different row capacities as long as both cover the grouped
+rows, including per-expert padding. The GEMM leaves D's tail unchanged.
+The grouped row count is `m_indices.numel()` for row IDs and `m_indices[-1]`
+with `use_psum_layout=True`. Prefix sums are device int32 exclusive expert ends.
+They must be nonnegative and nondecreasing, with repeated ends for empty experts.
+Prefix sums require N and K divisible by 8. For automatic tile selection with
+`c` in the row-ID layout, align each expert's physical row span to 256 rows.
+
+For B of shape `[E, N, K]`, `m_grouped_bf16_gemm_nt_contiguous` accepts packed
+K-major strides `(N*K, K, 1)` and MN-major strides `(N*K, 1, N)`. With the same
+expert row layout, `m_grouped_bf16_gemm_nt_contiguous(dy, w.transpose(1, 2), dx, m_indices)`
+computes input gradients directly from a view of the contiguous forward weights.
 
 For more information, please refer to the `m_grouped_gemm_fp8_fp8_bf16_nt_contiguous` function documentation.
 
@@ -421,7 +450,7 @@ standalone correctness suite.
 #### DSA and AVG indexer logits
 
 Non-paged and paged DSA indexers support legacy INT8/FP8 and MXFP4 inputs.
-Legacy FP8 uses FP32 weights/logits;
+On M890, FP8 supports H8/H32/H64 with D64/D128 and FP32 weights/logits;
 INT8 accepts BF16 or FP32 weights and returns the same logits dtype. New
 `fp8_fp4_*mqa_logits` weighted entry points support MXFP4 only, with BF16
 weights/logits. Weighted paged calls require `next_n=1` and support page
@@ -429,10 +458,19 @@ size 32 or any positive multiple of 64 on M890, including 256/512/1024.
 The same page-size rule applies to M890 AVG. 810E rejects page32 due to
 an actlize TSM addressing issue; use a positive multiple of 64.
 
+On M890, FP8 H8 and weighted MXFP4 can reuse KV pages across consecutive
+queries from the same request. Pass matching request `indices` to metadata
+and logits. Rows in a group share a KV page mapping and keep their own context lengths.
+Regenerate metadata with the current indices and contexts, including inside
+CUDA Graph capture when those inputs change on replay.
+
 AVG indexers use no weights, default to BF16 output and retain paged
-`next_n=1–6`. Non-paged AVG requires a positive `max_seqlen_k`. The paged
+`next_n=1–6`. MXFP4 AVG supports 4 or 8 Q heads; FP8 AVG supports 4. H4 retains optional FP32 output; MXFP4 H8 requires BF16 output.
+Non-paged AVG requires a positive `max_seqlen_k`. The paged
 `fp8_fp4` AVG entry point accepts MXFP4 only; ordinary FP8 uses the separate
-FP8 entry point. All AVG entry points omit `clean_logits`.
+FP8 entry point. All AVG entry points omit `clean_logits`. 810E also provides
+`int8_mqa_avg_logits` and `int8_paged_mqa_avg_logits` for H4/H8 with
+explicit per-Q/head FP32 quantization scales and BF16 output.
 
 Logits outside valid windows are unspecified and require caller-side masking
 or valid candidate bounds for top-k. For paged scheduling on both PPU0010/PPU0015, callers must pass
@@ -446,11 +484,11 @@ See the [indexer API guide](docs/api/indexer.md) for all signatures, dtype
 and layout contracts, metadata generation, top-k coordinate mapping and
 recommended 810E/M890 integration settings.
 
-#### Sparse MQA logits (Zhenwu M890)
+#### Sparse MQA logits (Zhenwu M890 / 810E)
 
 Sparse MQA computes indexer logits only for selected KV blocks, for both
-prefill and paged decode. The current implementation supports **MXFP4
-only**, despite the `fp8_fp4` API prefix, with **32 heads** and
+prefill and paged decode. On M890, the `fp8_fp4` APIs support **MXFP4
+only**, with **32 heads** and
 **head dimension 128**. Build metadata with the matching helper before
 calling the logits kernel:
 
@@ -467,32 +505,49 @@ are contiguous BF16 `[T,32]`.
 `sparse_block_kv` is **8 or 16**, and `num_max_sparse_blocks` must be a
 positive multiple of 4, at most 4096. The selected KV block indices are
 contiguous int32 `[T,num_max_sparse_blocks]`, with a strictly increasing
-valid prefix in each row. Paged sparse MQA requires a positive `page_kv`
+valid prefix in each row. Paged MXFP4 sparse MQA requires a positive `page_kv`
 that is a multiple of `sparse_block_kv`; its fused uint8 KV cache has shape
 `[num_pages,page_kv,1,68]` and a 512-byte-aligned page stride.
 
-The output is BF16 with shape
+The MXFP4 output is BF16 with shape
 `[T,num_max_sparse_blocks*sparse_block_kv]`, with an aligned physical row stride.
 Logical columns are compacted by selected block slot:
 `column = slot*sparse_block_kv + token_in_block`, rather than absolute KV
 token position. Allocation padding is not exposed as logical columns.
+
+On 810E, `int8_sparse_mqa_logits` and `int8_paged_sparse_mqa_logits` add
+INT8 support with the same metadata helpers, head count and head dimension.
+Q scales are folded into BF16 weights; K scales are per-token FP32.
+Its paged cache has shape `[num_pages,page_kv,1,132]`, with K bytes followed
+by FP32 scales within each page; see the API guide for packing and padding.
+INT8 output includes padding columns up to a multiple of 512; callers must
+mask invalid candidates and padding before top-k. Both formats require
+16-byte-aligned compute input base addresses.
+
 See the [indexer API guide](docs/api/indexer.md) for metadata and layout
 requirements and [attention tests](tests/test_attention.py) for supported
 cases.
 
 #### Mega Gate
 
-`deep_gemm.bf16_mega_gate` fuses the BF16 routing GEMM and MoE routing.
+`deep_gemm.bf16_mega_gate` fuses the BF16 routing GEMM and MoE routing
+on Zhenwu 810E and 890P.
 Given BF16 tokens `x [T, H]` and expert weights `weight [E, H]`, it
-computes `x @ weight.T` with FP32 accumulation, applies `sqrt(softplus)`, and
+computes `x @ weight.T` with FP32 accumulation, applies the selected scoring function, and
 selects the top-K experts using the scores plus optional bias. The selected
 unbiased scores are normalized and scaled to produce routing weights; expert
 indices can optionally be mapped from logical to physical IDs.
 
+Two scoring functions are supported: `scoring_func="sqrtsoftplus"` (default),
+which applies `sqrt(softplus(x))`, and `scoring_func="sigmoid"`. If sigmoid scores round
+to the same FP32 value and their biases are equal, the smaller expert ID wins.
+Both scoring modes use the same BF16 GEMM backend.
+
 The outputs are INT64 indices and FP32 weights, each shaped `[T, K]`. When
 shared experts are included as routed experts, each output is `[T, K + S]`,
-where `S` is the number of shared experts. See the [API definition](csrc/apis/mega_gate.hpp)
-for arguments and constraints and [the tests](tests/test_mega_gate.py) for examples.
+where `S` is the number of shared experts. See the [API guide](docs/api/mega_gate.md)
+for arguments and constraints, the [API definition](csrc/apis/mega_gate.hpp),
+and [the tests](tests/test_mega_gate.py) for examples.
 
 #### Mega MoE
 
@@ -540,10 +595,19 @@ with `quantization` (channelwise by default). These backends require PPU1.5.
 
 | Backend | Compute | Workspace mode | Activation | EP limit |
 |---|---|---|---|---|
-| FP8 channelwise | `fp8_fp8_mega_moe` | `mma_type="fp8xfp8", quantization="channelwise"` | SwiGLU, SwiGLU-OAI | 64 |
-| FP8 blockwise | `fp8_fp8_mega_moe` | `mma_type="fp8xfp8", quantization="blockwise"` | SwiGLU, SwiGLU-OAI | 64 |
-| E4M3 x MXFP4 | `fp8_fp4_mega_moe` | `mma_type="fp8xfp4"` | SwiGLU, SwiGLU-OAI, SiTU | 64 |
-| BF16 x MXFP4 | `bf16_fp4_mega_moe` | `mma_type="bf16xfp4", activation="situ"` | SiTU | 64 |
+| FP8 channelwise | `fp8_fp8_mega_moe` | `mma_type="fp8xfp8", quantization="channelwise"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
+| FP8 blockwise | `fp8_fp8_mega_moe` | `mma_type="fp8xfp8", quantization="blockwise"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
+| E4M3 x MXFP4 | `fp8_fp4_mega_moe` | `mma_type="fp8xfp4"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
+| BF16 x MXFP4 | `bf16_fp4_mega_moe` | `mma_type="bf16xfp4"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
+
+All MegaMoE backends pass FP32 GEMM1 accumulators to FP32 gated activation.
+Sigmoid and tanh always use the native PPU instructions, including when
+`fast_math=False`. W4A8 and channelwise FP8 round the activation result to BF16
+scratch before a separate FP32 row quantizer emits E4M3 values and one FP32
+scale per row. FP4 and blockwise FP8 keep FP32 values through fused activation
+quantization, producing group32 E8M0 and group128 FP32 scales respectively.
+W4A16 converts only the final activation result to BF16 for GEMM2. Existing clamp
+boundary conventions and quantization granularities are preserved.
 
 H is divisible by 256 and I by 128. FP8 and W4A8 support at most 128 physical experts
 per rank; W4A16 supports at most 127. Capacity is positive and below 2^24;
@@ -634,8 +698,10 @@ load-time exponent rebasing and is independent of routing weights and input
 scales. Prepare separately allocated master/replica banks independently; their
 inverse scales may differ. W4A8 scale exponents follow the
 [ordinary W4A8 preprocessing requirements](#w4a8-dense-and-moe-gemms-m890).
-FP8, W4A8 and W4A16 `base` aliases require the same mode, quantization, group,
-device and workspace dimensions; aliases execute serially on the same stream.
+FP8, W4A8 and W4A16 `base` aliases support different shapes within the allocation
+and routing capacities, with the same mode, quantization, group and device.
+Create aliases before use or capture. Treat all aliases as one workspace for
+stream and cross-rank ordering, including Graph replay.
 W4A8 input and activated output use rowwise E4M3 quantization, as for FP8
 channelwise, with the chosen activation fused into GEMM1.
 Transformed weights are specific to their backend and must not be interchanged.
@@ -644,7 +710,7 @@ FP8 `x` is E4M3 `[capacity,H]`, with FP32 `x_sf` `[capacity,1]` for channelwise
 or `[capacity,H/128]` for blockwise. W4A16 `x` is BF16 `[capacity,H]`, and
 `x_sf` is an empty `[capacity,0]` view. `mega_moe_pre_dispatch` fills these
 inputs and routes. FP8 also quantizes activated GEMM1 output to E4M3; W4A16
-keeps BF16 activated output. SiTU is fused into GEMM1.
+keeps BF16 activated output. All four activations are fused into GEMM1.
 These backends write BF16 GEMM2 scatter results and launch a separate combine
 kernel inside the complete C++ compute call. Combine handles the generation
 barrier, weighted reduction and dispatch-counter recycling.
@@ -660,14 +726,50 @@ entry points omit the MXFP4 `recipe`: FP8 granularities are selected by
 the workspace, W4A8 weight groups are fixed at 32, and W4A16 does not quantize
 activations. SwiGLU-OAI uses
 keyword-only `activation_alpha=None` (effective default `1.702`); an explicit
-alpha is accepted only for OAI. W4A16 and W4A8 SiTU retain `situ_beta=4` and
+alpha is accepted only for OAI. SiTU uses `situ_beta=4` and
 `situ_linear_beta=25`; `situ_linear_beta=None` disables the up softcap, while
 `situ_beta` must be positive and finite. All pre-dispatch paths accept int32
 or int64 routing IDs and store int64 IDs in the workspace.
-FP8 and W4A8 SwiGLU/SwiGLU-OAI round clamp boundaries to BF16. For these
+Routed SwiGLU/STEP/SwiGLU-OAI backends round clamp boundaries to BF16. For these
 MegaMoE paths, `activation_clamp=None` or `+inf` disables clipping; zero is
-an active clamp boundary. SiTU (W4A16 and W4A8) rejects any explicit
-`activation_clamp`. `fast_math` selects activation math only.
+an active clamp boundary. STEP clips SiLU(gate), while SwiGLU clips gate
+before sigmoid. SiTU rejects any explicit
+`activation_clamp`. `fast_math=True` selects native-reciprocal multiplication
+for SiTU divisions and post-activation FP8 quantization; `False` uses regular
+FP32 division. Both modes always use native PPU sigmoid and tanh. Input
+pre-dispatch quantization has no `fast_math` argument and is unchanged.
+
+##### SM80 INT8 MegaMoE
+
+The SM80 INT8 path uses per-token activation scales and
+per-channel weight scales. GEMM1 dequantization and all supported activations
+use FP32 without gate/up or SiLU intermediate BF16 rounding. The final activation
+is rounded once to BF16 scratch before GEMM2 input quantization.
+Post-activation INT8 quantization still truncates; GEMM2 retains BF16 scatter
+and weighted combine. The activation workspace stores BF16 values.
+This intentionally differs from Legacy's intermediate BF16 rounding; correctness
+is checked against the arithmetic described above.
+
+```python
+import deep_gemm
+
+buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+    group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden,
+    mma_type="int8xint8")
+l1_weights, l2_weights = deep_gemm.transform_weights_for_mega_moe(
+    (w13_int8, w13_scales), (w2_int8, w2_scales))
+
+deep_gemm.mega_moe_pre_dispatch(
+    hidden_states, topk_ids, topk_weights,
+    buffer.x, buffer.x_sf, buffer.topk_idx, buffer.topk_weights,
+    num_tokens=hidden_states.shape[0], group_size=0, mma_type="int8xint8")
+deep_gemm.int8_int8_mega_moe(output, l1_weights, l2_weights, buffer)
+```
+
+Workspace allocation, weight preparation and pre-dispatch share the MXFP4 APIs.
+Weight preparation selects the format from the raw weight dtype.
+See [MegaMoE APIs](deep_gemm/mega/__init__.py) for parameter details and
+[test_mega_moe.py](tests/test_mega_moe.py) for a complete example.
 
 #### HyperConnection (HC) prenorm GEMM
 
@@ -675,15 +777,21 @@ We provide a HyperConnection (HC) prenorm GEMM that fuses the prenorm square-sum
 
 For more information, please refer to the `tf32_hc_prenorm_gemm` function documentation.
 
-#### Mega-mHC for DeepSeek V4.1 Flash (M890)
+#### Mega-mHC for DeepSeek V4 and V4.1 (810E and M890)
 
-`deep_gemm.mega_mhc` implements the fused shifted mHC computation used by
-**DeepSeek V4.1 Flash** on **Zhenwu M890**. The current interface
-supports `hc_mult=4`, hidden size `5120`, and BF16 and/or FP8 E4M3 output.
-It computes the updated residual, mix coefficients, and RMSNorm output into
-caller-provided output buffers.
+`deep_gemm.mega_mhc` fuses residual update, coefficient prediction, input
+mixing, and RMSNorm with `hc_mult=4` into caller-provided output buffers.
 
-Provide at least one of `y_bf16` or `y_fp8`. FP8 quantization uses the
+- **DeepSeek V4 normal on Zhenwu M890** (`H=4096` or `7168`): pass `None`
+  for both `shifted_prev_mix` and `new_prev_mix`. Input mixing uses the newly
+  predicted pre-mix coefficients internally.
+- **DeepSeek V4.1 Flash shifted on Zhenwu 810E and M890** (`H=5120`): pass
+  both pre-mix tensors. Input mixing uses `shifted_prev_mix`, and
+  `new_prev_mix` receives the coefficients for the next call.
+
+810E supports BF16 output. M890 supports BF16 and/or FP8 E4M3 output.
+
+On M890, provide at least one of `y_bf16` or `y_fp8`. FP8 quantization uses the
 BF16-rounded RMSNorm output and requires one of these scale formats:
 
 - **Grouped UE8M0**: one power-of-two scale per 32 values, with four UE8M0
@@ -691,10 +799,12 @@ BF16-rounded RMSNorm output and requires one of these scale formats:
   `y_gemm_sf` for aligned column-major scales, or `y_routed_sf` together with
   `y_shared_sf` for contiguous routed scales and padded, interleaved shared
   scales. The latter also requires `shared_sf_block_m > 0`.
-- **Per-token FP32**: one FP32 scale per token in a contiguous `[T, 1]`
+- **Per-token FP32 (M890 only)**: one FP32 scale per token in a contiguous `[T, 1]`
   `y_token_sf` tensor. `y_token_sf` is an optional extension to the upstream
   API and cannot be combined with the grouped scale outputs. The scale is
   used for dequantization: `y ≈ y_fp8 * y_token_sf`.
+
+810E uses three kernels for residual/RMSNorm, projection, and coefficients.
 
 See the [API definition](csrc/apis/mega_mhc.hpp) for argument and layout requirements,
 and [the reference and correctness tests](tests/test_mega_mhc.py) for a
@@ -727,7 +837,9 @@ In addition, the dense GEMM kernels only implement the NT layout. The `nn` / `tn
 
 The library provides some utility functions besides the above kernels:
 
-- `deep_gemm.set_num_sms` / `get_num_sms`: set/get the maximum CU count to use
+- `deep_gemm.set_num_sms` / `get_num_sms`: set/get the maximum CU count to use on the current device
+  On 810E, BF16 dense Tensor uses `min(num_sms, 20)`; SIMT uses `64 - (20 - num_sms)` for 1–20, and `num_sms` for 21–64.
+  `0` restores automatic selection (20 Tensor / 64 SIMT). Counts come from the device; settings above its total CU count are rejected.
 - `deep_gemm.set_tc_util` / `get_tc_util`: set/get an approximated tensor cell utilization ratio
 - `deep_gemm.set_pdl` / `get_pdl`: enable/disable Programmatic Dependent Launch (PDL)
 - `deep_gemm.set_compile_mode` / `get_compile_mode`: set/get the JIT compile mode
@@ -788,7 +900,10 @@ Grouped lookup matches N, K, and group count, then selects the smallest
 table M greater than or equal to the requested M. Missing or malformed
 files, or queries with no matching entry, fall back to built-in
 configuration selection. These tables supply configurations; they do not
-run an automatic tuning search. See the
+run an automatic tuning search. On 810E dense BF16, explicit `configs` override
+matching LUT entries; matching entries override automatic dispatch. A parsed
+entry that violates the device's tile, alignment or resource requirements is
+rejected before JIT/launch, just like an invalid explicit configuration. See the
 [LUT loader](csrc/jit_kernels/heuristics/runtime_lut.hpp) for validation rules.
 
 ## Optimizations

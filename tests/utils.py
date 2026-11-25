@@ -1188,12 +1188,12 @@ def read_numbers_from_file(file_path):
 def parse_deepgemm_string_re(s):
     # give default value, for fp8 we have block and channel
     result = {"distribution": "uniform", "enable_sbo_overlap": False}
-    supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "HcPrenormGemm", "MqaLogits", "PagedMqaLogits", "MqaAvgLogits", "PagedMqaAvgLogits", "BatchGemm", "SparseMqaLogits", "PagedSparseMqaLogits", "MegaMhc", "AttentionRegression", "Preprocess", "Activation", "MoeAlign"]
+    supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "HcPrenormGemm", "MqaLogits", "PagedMqaLogits", "MqaAvgLogits", "PagedMqaAvgLogits", "BatchGemm", "SparseMqaLogits", "PagedSparseMqaLogits", "MegaMhc", "AttentionRegression", "Preprocess", "Activation", "MoeAlign", "MegaGate"]
     supported_indexer_epilogue_type = ["fp32", "bf16"]
     supported_quant_type = ["non_quantized", "block", "channel", "group"]
     import re
     supported_gemm_type.append("KGroupedContiguous")
-    dg_params = r"(KGroupedContiguous|GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|HcPrenormGemm|Normal|MqaAvgLogits|PagedMqaAvgLogits|PagedSparseMqaLogits|SparseMqaLogits|MqaLogits|PagedMqaLogits|BatchGemm|MegaMhc|AttentionRegression|Preprocess|Activation|MoeAlign),(.+)"
+    dg_params = r"(KGroupedContiguous|GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|HcPrenormGemm|Normal|MqaAvgLogits|PagedMqaAvgLogits|PagedSparseMqaLogits|SparseMqaLogits|MqaLogits|PagedMqaLogits|BatchGemm|MegaMhc|AttentionRegression|Preprocess|Activation|MoeAlign|MegaGate),(.+)"
     pattern = re.compile(dg_params)
     m = pattern.search(s.strip("."))
     if not m:
@@ -1234,6 +1234,8 @@ def parse_deepgemm_string_re(s):
                 except ValueError:
                     result[key] = value
                     pass
+    if result.get("replayable") == 0:
+        raise ValueError("This profiling record cannot be replayed without the group distribution")
     if "quant_type" not in result:
         quant_type_defaults = {
             torch.float32: 'non_quantized',
@@ -1365,14 +1367,26 @@ def gemm_assert_exact(actual, expected):
     torch.testing.assert_close(actual, expected.to(actual.dtype), rtol=0, atol=0)
 
 
+def gemm_call_with_sms(args, call):
+    # Caselist tests use automatic selection between explicit budget checks.
+    try:
+        if 'num_sms' in args:
+            deep_gemm.set_num_sms(args['num_sms'])
+        return call()
+    finally:
+        if 'num_sms' in args:
+            deep_gemm.set_num_sms(0)
+
+
 def test_dense_gemm_api(args):
-    """One caselist case for BF16 accumulation or the native FP32 API."""
+    """One caselist case for BF16/FP32 accuracy, accumulation or CU budgets."""
     m, n, k, dtype = args['m'], args['n'], args['k'], args['data_type']
     accumulation = args.get('accumulate', 'none')
     pattern = args.get('pattern', 'random')
+    expected_error = args.get('expect_error')
     fp32 = dtype == torch.float32
-    if min(m, n, k) <= 0:
-        raise ValueError('Dense API regression cases require positive M/N/K')
+    if min(m, n, k) < 0:
+        raise ValueError('Dense API regression cases require nonnegative M/N/K')
     if accumulation not in ('none', 'separate', 'alias'):
         raise ValueError(f'Unsupported accumulate mode: {accumulation}')
     if args.get('with_bias') or get_benchmark():
@@ -1380,24 +1394,30 @@ def test_dense_gemm_api(args):
     if fp32:
         if accumulation != 'none' or pattern != 'random':
             raise ValueError('FP32 regression supports random inputs without C')
-    elif dtype not in (torch.bfloat16, 'bf16_bf16_fp32') or accumulation == 'none' or pattern not in ('random', 'cancellation'):
-        raise ValueError('Accumulation regression requires BF16 inputs, C, and random/cancellation pattern')
+    elif dtype not in (torch.bfloat16, 'bf16_bf16_fp32') or pattern not in ('random', 'cancellation'):
+        raise ValueError('BF16 regression requires BF16 inputs and random/cancellation pattern')
+    if pattern == 'cancellation' and accumulation == 'none':
+        raise ValueError('Cancellation regression requires C')
 
     compiling = bool(os.environ.get('HGGC_WARM_UP')) or deep_gemm.get_compile_mode() == 1
     check = get_acc_check() and not compiling
     generator = torch.Generator().manual_seed(810)
     output_dtype = torch.float32 if fp32 or dtype == 'bf16_bf16_fp32' else torch.bfloat16
+    operands = []
+    for rows, name in ((m, 'a'), (n, 'b')):
+        offset = args.get('offset_' + name, 0)
+        if offset not in (0, 1):
+            raise ValueError('Dense regression storage offsets must be 0 or 1 element')
+        input_dtype = torch.float32 if fp32 else torch.bfloat16
+        tensor = torch.empty(rows * k + offset, device='cuda', dtype=input_dtype)[offset:].view(rows, k)
+        if not compiling:
+            values = (torch.randn((rows, k), generator=generator) / k ** 0.25 if fp32 and k
+                      else gemm_exact_values((rows, k), generator))
+            tensor.copy_(values)
+        operands.append(tensor)
+    a, b = operands
     if fp32:
-        operands = []
-        for rows, offset in ((m, args.get('offset_a', 0)), (n, args.get('offset_b', 0))):
-            if offset not in (0, 1):
-                raise ValueError('FP32 regression storage offsets must be 0 or 1 float')
-            tensor = torch.empty(rows * k + offset, device='cuda', dtype=torch.float32)[offset:].view(rows, k)
-            assert tensor.is_contiguous() and tensor.data_ptr() % 16 == offset * 4
-            tensor.copy_(torch.randn((rows, k), generator=generator) / k ** 0.25)
-            operands.append(tensor)
-        a, b = operands
-        if m >= 2 and n >= 2 and k >= 2:
+        if not compiling and m >= 2 and n >= 2 and k >= 2:
             # Keep random full-output coverage and plant independent A/B precision
             # checks. TF32/BF16 would lose 2^-12 and incorrectly produce zero.
             a[:2].zero_()
@@ -1406,36 +1426,86 @@ def test_dense_gemm_api(args):
             b[:2, 0], b[:2, -1] = 1, 1
             a[0, 0], b[1, 0] = 1 + 2 ** -12, 1 + 2 ** -12
     else:
-        a = gemm_exact_values((m, k), generator).to(device='cuda', dtype=torch.bfloat16)
-        b = gemm_exact_values((n, k), generator).to(device='cuda', dtype=torch.bfloat16)
         if pattern == 'cancellation':
             if k < 2:
                 raise ValueError('BF16 cancellation requires K >= 2')
-            a.zero_()
-            b.zero_()
-            # The final contribution also exercises the last split-K partition.
-            a[:, 0], a[:, -1] = 1, 1 / 256
-            b[:, 0], b[:, -1] = 1, 1
+            if not compiling:
+                a.zero_()
+                b.zero_()
+                # The final contribution also exercises the last split-K partition.
+                a[:, 0], a[:, -1] = 1, 1 / 256
+                b[:, 0], b[:, -1] = 1, 1
+        elif not compiling and output_dtype == torch.float32 and accumulation == 'none' and m and n and k >= 2:
+            # Preserve the ordinary FP32-output case's rounding regression:
+            # 1 + 1/256 is exact in FP32 but rounds to 1 in BF16.
+            a[0].zero_()
+            b[0].zero_()
+            a[0, 0], b[0, 0] = 1, 1
+            a[0, -1], b[0, -1] = 1 / 16, 1 / 16
 
-    out = torch.full((m, n), 8., device='cuda', dtype=output_dtype)
+    offset_d = args.get('offset_d', 0)
+    if offset_d not in (0, 1):
+        raise ValueError('Dense regression output offset must be 0 or 1 element')
+    output_start = 64 + offset_d
+    storage = torch.full((m * n + output_start + 64,), 8., device='cuda', dtype=output_dtype)
+    out = storage[output_start:-64].view(m, n)
+    if args.get('output_alias'):
+        if args['output_alias'] != 'input' or not expected_error or n > k:
+            raise ValueError('output_alias:input requires a rejection case with N<=K')
+        storage = a.view(-1)
+        if compiling:
+            storage.fill_(8.)
+        out = storage[:m * n].view(m, n)
     c = initial_c = None
-    if not fp32:
-        initial_c = (torch.full((m, n), -1.) if pattern == 'cancellation'
-                     else gemm_exact_values((m, n), generator)).to(device='cuda', dtype=output_dtype)
-        c = out if accumulation == 'alias' else torch.empty_like(out)
+    if not fp32 and accumulation != 'none':
+        initial_c = torch.full((m, n), -1., device='cuda', dtype=output_dtype)
+        if not compiling and pattern != 'cancellation':
+            initial_c.copy_(gemm_exact_values((m, n), generator))
+        if 'c_stride' in args:
+            if accumulation != 'separate' or args['c_stride'] < n:
+                raise ValueError('c_stride requires separate C with a row stride >= N')
+            c = torch.empty_strided((m, n), (args['c_stride'], 1), device='cuda', dtype=output_dtype)
+        else:
+            c = out if accumulation == 'alias' else torch.empty_like(out)
         c.copy_(initial_c)
-    reference = gemm_reference(a, b) if check else None
-    if check and c is not None:
+    reference = gemm_reference(a, b) if check and not expected_error else None
+    if check and c is not None and not expected_error:
         reference = reference + initial_c.float()
         if pattern == 'cancellation':
             gemm_assert_exact(reference, torch.full_like(reference, 1 / 256))
 
-    # Preserve the scheduler's compile phase and never inspect unwritten products.
-    if fp32:
-        deep_gemm.gemm_fp32_fp32_fp32_nt(a, b, out)
-    else:
-        deep_gemm.bf16_gemm_nt(a, b, out, c=c)
+    # Compilation and rejected calls must preserve output/C even with --disable_acc.
+    unchanged = storage.clone() if compiling or expected_error else None
+    config = args.get('configs')
+    if config is not None:
+        if fp32 or len(config) != 7:
+            raise ValueError('BF16 configs must specify SMS/BM/BN/BK/WM/WN/stages')
+        config = tuple(config) + (SMEM_CONFIG_UNUSED,)
+    def invoke():
+        if fp32:
+            deep_gemm.gemm_fp32_fp32_fp32_nt(a, b, out)
+        else:
+            deep_gemm.bf16_gemm_nt(a, b, out, c=c, configs=config)
+
+    try:
+        gemm_call_with_sms(args, invoke)
+    except RuntimeError as error:
+        if not expected_error or expected_error not in str(error):
+            raise
+        gemm_assert_exact(storage, unchanged)
+        if accumulation == 'separate':
+            gemm_assert_exact(c, initial_c)
+        print('Passed expected dense API rejection')
+        return
+    if expected_error:
+        raise AssertionError('Dense GEMM accepted unsupported arguments')
+    if compiling:
+        gemm_assert_exact(storage, unchanged)
+        if accumulation == 'separate':
+            gemm_assert_exact(c, initial_c)
     if check:
+        gemm_assert_exact(storage[:output_start], torch.full_like(storage[:output_start], 8.))
+        gemm_assert_exact(storage[-64:], torch.full_like(storage[-64:], 8.))
         if fp32:
             torch.testing.assert_close(out, reference, rtol=2e-5, atol=2e-6)
             if m >= 2 and n >= 2 and k >= 2:
@@ -1446,68 +1516,25 @@ def test_dense_gemm_api(args):
             gemm_assert_exact(out, reference)
             if accumulation == 'separate':
                 gemm_assert_exact(c, initial_c)
-    print('Passed with acc_check' if check else 'Passed without acc_check')
-
-
-def gemm_batch_view(batch, rows, cols, layout, padding):
-    padded = 'padded' in layout
-    pitch = cols + (padding if padded else 0)
-    storage_rows = rows + int(padded)
-    interleaved = 'interleaved' in layout
-    shape = (storage_rows, batch, pitch) if interleaved else (batch, storage_rows, pitch)
-    storage = torch.full(shape, -123., device='cuda', dtype=torch.bfloat16)
-    view = storage.transpose(0, 1) if interleaved else storage
-    return view[:, :rows, :cols], storage
-
-
-def test_native_batch_gemm(args):
-    batch, m, n, k = args['groups'], args['m'], args['n'], args['k']
-    layout, broadcast = args.get('layout', 'contiguous'), args.get('broadcast', 'none')
-    expected_error = args.get('expect_error')
-    if layout not in ('contiguous', 'padded', 'interleaved', 'interleaved_padded'):
-        raise ValueError(f'Unsupported native batch layout: {layout}')
-    if broadcast not in ('none', 'a', 'b', 'both'):
-        raise ValueError('Unsupported native batch broadcast')
-    if expected_error not in (None, 'overlap') or args.get('expr') or get_benchmark():
-        raise ValueError('Native batch regression requires accuracy mode and native [B,M,K]/[B,N,K] layouts')
-    check = get_acc_check() and not os.environ.get('HGGC_WARM_UP') and deep_gemm.get_compile_mode() != 1
-    generator = torch.Generator().manual_seed(810)
-    a, _ = gemm_batch_view(batch, m, k, layout, 8)
-    b, _ = gemm_batch_view(batch, n, k, layout, 16)
-    out, storage = gemm_batch_view(batch, m, n, layout, 24)
-    a.copy_(gemm_exact_values(a.shape, generator))
-    b.copy_(gemm_exact_values(b.shape, generator))
-    if broadcast in ('a', 'both'):
-        a = a[:1].expand(batch, -1, -1)
-    if broadcast in ('b', 'both'):
-        b = b[:1].expand(batch, -1, -1)
-    if 'out_stride' in args:
-        strides = tuple(args['out_stride'])
-        if len(strides) != 3 or any(s < 0 for s in strides):
-            raise ValueError('out_stride must contain three nonnegative element strides')
-        size = 1 + sum((dim - 1) * stride for dim, stride in zip((batch, m, n), strides))
-        storage = torch.full((size,), -123., device='cuda', dtype=torch.bfloat16)
-        out = storage.as_strided((batch, m, n), strides)
-    expected_storage = storage.clone() if check else None
-    if check and not expected_error:
-        reference = gemm_reference(a, b)
-        expected_storage.as_strided(out.shape, out.stride()).copy_(reference)
-    try:
-        deep_gemm.bf16_gemm_strided_batched_nt(a, b, out)
-    except RuntimeError as error:
-        # Expected metadata rejection must pass in both compile and accuracy phases.
-        if expected_error != 'overlap' or not any(message in str(error) for message in (
-                'output batches overlap', 'nonoverlapping rows')):
-            raise
-        if check:
-            gemm_assert_exact(storage, expected_storage)
-        print('Passed expected output-overlap rejection')
-        return
-    if expected_error:
-        raise AssertionError('Native batch accepted overlapping outputs')
-    if check:
-        gemm_assert_exact(out, reference)
-        gemm_assert_exact(storage, expected_storage)  # Includes every padding guard.
+            if pattern == 'random' and min(m, n, k) > 0:
+                # Exact-value checks above isolate layout and rounding guards.
+                # Also retain normally distributed BF16 inputs, including low
+                # mantissa bits, with the ordinary GEMM accuracy threshold.
+                a.copy_(torch.randn(a.shape, generator=generator, dtype=a.dtype))
+                b.copy_(torch.randn(b.shape, generator=generator, dtype=b.dtype))
+                reference = gemm_reference(a, b)
+                if c is not None:
+                    initial_c.copy_(torch.randn(initial_c.shape, generator=generator, dtype=initial_c.dtype))
+                    c.copy_(initial_c)
+                    reference = reference + initial_c.float()
+                gemm_call_with_sms(args, invoke)
+                diff = calc_diff(out, reference.to(output_dtype))
+                assert diff < 0.001, f'Normal BF16 accuracy: {m=}, {n=}, {k=}, {diff=:.10f}'
+                gemm_assert_exact(storage[:output_start], torch.full_like(storage[:output_start], 8.))
+                gemm_assert_exact(storage[-64:], torch.full_like(storage[-64:], 8.))
+                if accumulation == 'separate':
+                    gemm_assert_exact(c, initial_c)
+                print(f'Passed normal BF16 accuracy: {diff=:.10f}')
     print('Passed with acc_check' if check else 'Passed without acc_check')
 
 
@@ -1532,7 +1559,12 @@ def test_gemm(args) -> None:
         check = get_acc_check() and not os.environ.get('HGGC_WARM_UP') and deep_gemm.get_compile_mode() != 1
         return (run_tile_alignment_cache if regression == 'alignment_cache' else run_n1_cu_limit)(check=check)
     print(f"test_gemm->test_func: DenseGemm,m:{m},n:{n},k:{k},data_type:{d},quant_type:{quant_type}")
-    if d == torch.float32 or args.get('accumulate', 'none') != 'none':
+    # Keep the ordinary dense harness; opt into the stronger API regression
+    # checks for explicit configurations, budgets, boundaries or accumulation.
+    api_check = d in (torch.bfloat16, 'bf16_bf16_fp32') and (
+        args.get('check_api') or min(m, n, k) == 0 or any(key in args for key in
+        ('configs', 'num_sms', 'expect_error', 'offset_a', 'offset_b', 'offset_d', 'output_alias', 'c_stride')))
+    if api_check or d == torch.float32 or args.get('accumulate', 'none') != 'none':
         return test_dense_gemm_api(args)
     bias = None
     if args.get('with_bias', False):
@@ -1806,7 +1838,242 @@ def test_k_grouped_gemm_contiguous(args) -> None:
             "measurement_status": "COMPLETE"}), flush=True)
 
 
+_GROUPED_BF16_MODES = ("alias", "alias", "separate")
+
+
+def _exercise_grouped_bf16(lengths, n, k, modes, *, configs=None, c_offset=0,
+                           check=True, device="cpu", benchmark=False, compact=False, transpose_b=False):
+    alignment = 1 if compact else get_m_alignment_for_contiguous_layout()
+    m = sum(round_up(length, alignment) for length in lengths)
+    rng = torch.Generator(device=device).manual_seed(103)
+
+    def values(shape):
+        return torch.randint(-4, 5, shape, dtype=torch.int32, device=device, generator=rng).bfloat16().div_(8)
+
+    a, b, initial = values((m, k)), values((len(lengths), n, k)), values((m, n))
+    if m and k >= 2:
+        # Distinguish FP32 accumulation from rounding the product to BF16 before adding C.
+        expert = next(i for i, length in enumerate(lengths) if length)
+        a[0].zero_()
+        a[0, :2] = a.new_tensor([1, 1 / 256])
+        b[expert, 0].zero_()
+        b[expert, 0, :2] = 1
+        initial[0, 0] = 1 / 256
+
+    ids = torch.full((m,), -1, dtype=torch.int32, device=device)
+    products = []
+    start = 0
+    for expert, length in enumerate(lengths):
+        rows = slice(start, start + length)
+        ids[rows] = expert
+        if check and length:
+            products.append(a[rows].float() @ b[expert].float().T)
+        start += round_up(length, alignment)
+    layout = torch.tensor(lengths, dtype=torch.int32, device="cuda").cumsum(0, dtype=torch.int32) if compact else ids.cuda()
+    a = a.cuda()
+    b = b.transpose(1, 2).contiguous().cuda().transpose(1, 2) if transpose_b else b.cuda()
+
+    c_store = torch.full((m * n + 32 + c_offset,), -117, device="cuda", dtype=torch.bfloat16)
+    d_store = torch.full((m * n + 32,), -117, device="cuda", dtype=torch.bfloat16)
+    c, d = c_store[16 + c_offset:-16].view(m, n), d_store[16:-16].view(m, n)
+    c.copy_(initial)
+    d.copy_(initial)
+    op = deep_gemm.m_grouped_bf16_gemm_nt_contiguous
+    if check:
+        valid = ids >= 0
+        expected = initial_valid = initial[valid]
+        product = torch.cat(products) if products else initial.new_empty((0, n), dtype=torch.float32)
+    for mode in modes:
+        source = {"alias": d, "separate": c}.get(mode)
+        kwargs = {} if mode == "overwrite" else {"c": source}
+        run = functools.partial(op, a, b, d, layout, configs=configs,
+                                use_psum_layout=compact, ensure_zero_padding=not compact or mode == "none", **kwargs)
+        run()
+        if check:
+            addend = expected if mode == "alias" else initial_valid
+            expected = (product + addend.float() if source is not None else product).bfloat16()
+            torch.testing.assert_close(d.to(device)[valid], expected, rtol=0, atol=0)
+        if benchmark:
+            seconds = bench_kineto(run, 'gemm', suppress_kineto_output=True)
+            print(f"Grouped BF16 {mode}: {seconds * 1e6:.2f} us, {2 * sum(lengths) * n * k / seconds / 1e12:.2f} TFLOPS")
+    if check:
+        torch.testing.assert_close(c.to(device), initial, rtol=0, atol=0)
+        for storage, first in ((d_store, 16), (c_store, 16 + c_offset)):
+            assert (storage[:first] == -117).all() and (storage[-16:] == -117).all()
+        if transpose_b and not compact:
+            bad = torch.empty((len(lengths), k, n + 8), device="cuda", dtype=b.dtype)[..., :n].transpose(1, 2)
+            _reject_grouped_bf16(d, a, bad, d, layout, message="packed K-major or packed MN-major")
+
+
+def _reject_grouped_bf16(d, /, *args, error=RuntimeError, message=None, **kwargs):
+    original = d.clone()
+    try:
+        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(*args, **kwargs)
+    except error as exc:
+        if message is not None:
+            assert message in str(exc), str(exc)
+        torch.testing.assert_close(d, original, rtol=0, atol=0)
+    else:
+        raise AssertionError("Invalid grouped BF16 arguments were accepted")
+
+
+def _check_grouped_bf16_graph(a, b, d, ends, replays):
+    op = functools.partial(deep_gemm.m_grouped_bf16_gemm_nt_contiguous, a, b, d, ends, use_psum_layout=True)
+    op()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op()
+    for offsets in replays:
+        ends.copy_(ends.new_tensor(offsets))
+        d.fill_(-117)
+        graph.replay()
+        start = 0
+        for expert, end in enumerate(offsets):
+            assert (d[start:end] == (expert + 1) * a.size(1)).all()
+            start = end
+        assert (d[start:] == -117).all()
+
+
+def _check_grouped_bf16_layout(args, lengths, configs, check):
+    m, n, k = (args[key] for key in ("m", "n", "k"))
+    a_rows, d_rows = (args[key] for key in ("a_rows", "d_rows"))
+    padding = args.get("leading_padding", 0)
+    assert min(a_rows, d_rows) >= m
+    a = torch.ones((a_rows, k), device="cuda", dtype=torch.bfloat16)
+    a[m:].fill_(float("nan"))
+    weights = torch.ones((len(lengths), k, n), device="cuda", dtype=torch.bfloat16)
+    counts = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    experts = torch.arange(len(lengths), device="cuda", dtype=torch.int32)
+    weights.mul_((experts + 1)[:, None, None])
+    b = weights.transpose(1, 2)
+    packed = b.contiguous()
+    ids = torch.repeat_interleave(experts, counts, output_size=m - padding)
+    ids = torch.cat((ids.new_full((padding,), -1), ids))
+    ends = counts.cumsum(0, dtype=torch.int32)
+    d = torch.empty((d_rows, n), device="cuda", dtype=torch.bfloat16)
+
+    op = deep_gemm.m_grouped_bf16_gemm_nt_contiguous
+    modes = (args.get("accumulate", "none"),) if padding or "accumulate" in args else ("none", "alias")
+    layouts = (False,) if padding or n % 8 or k % 8 else (False, True)
+    for compact in layouts:
+        d.fill_(-117)
+        expected = -117
+        for mode in modes:
+            alias = mode == "alias"
+            rhs = b if alias and not padding else packed
+            op(a, rhs, d, ends if compact else ids, use_psum_layout=compact,
+               c=d if alias else None, configs=configs if alias or padding else None)
+            if check:
+                product = (ids[padding:].float() + 1) * k
+                expected = (product + expected if alias else product).bfloat16()
+                assert (d[padding:m] == expected[:, None]).all()
+                assert (d[:padding] == -117).all() and (d[m:] == -117).all()
+
+    if check and not padding:
+        too_many = ids.new_zeros(min(a_rows, d_rows) + 1)
+        _reject_grouped_bf16(d, a, b, d, too_many, message="m_indices row count must fit in A and D")
+        d.fill_(-117)
+        op(a, b, d, ids[:0])
+        assert (d == -117).all()
+        if "graph_ends" in args:
+            _check_grouped_bf16_graph(a, packed, d, ends, args["graph_ends"])
+
+
+def _check_grouped_bf16_interface(m, n, k, configs):
+    a = torch.ones((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.ones((1, n, k), device="cuda", dtype=torch.bfloat16)
+    d = torch.full((m, n), 3, device="cuda", dtype=torch.bfloat16)
+    ids = torch.zeros(m, device="cuda", dtype=torch.int32)
+    op = deep_gemm.m_grouped_bf16_gemm_nt_contiguous
+    op(lhs=a, rhs=b, out=d, m_indices=ids, c=d)
+    assert (d == 3 + k).all()
+    op(a, b, d, ids, "nk", False, True, None, configs, d)
+    assert (d == 3 + 2 * k).all()
+
+    square = torch.ones_like(d)
+    _reject_grouped_bf16(square, square, square.unsqueeze(0), square, ids,
+                         message="out overlaps a grouped GEMM input")
+    _reject_grouped_bf16(d, a=a, b=b, d=d, grouped_layout=ids, error=TypeError)
+
+
+def _run_grouped_bf16_bad_ends(m, out_m, n, k, ends):
+    a = torch.ones((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.ones((len(ends), n, k), device="cuda", dtype=torch.bfloat16)
+    d = torch.empty((out_m, n), device="cuda", dtype=torch.bfloat16)
+    valid = torch.full((len(ends),), min(m, out_m), device="cuda", dtype=torch.int32)
+    op = deep_gemm.m_grouped_bf16_gemm_nt_contiguous
+    op(a, b, d, valid, use_psum_layout=True)
+    torch.cuda.synchronize()
+    print("valid compact layout passed", flush=True)
+    op(a, b, d, valid.new_tensor(ends), use_psum_layout=True)
+    torch.cuda.synchronize()
+
+
+def _check_grouped_bf16_bad_ends(lengths, n, k):
+    import json
+    import sys
+
+    m = sum(lengths)
+    a = torch.ones((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.ones((len(lengths), n, k), device="cuda", dtype=torch.bfloat16)
+    d = torch.full((m, n), -117, device="cuda", dtype=torch.bfloat16)
+    ends = torch.tensor(lengths, device="cuda", dtype=torch.int32).cumsum(0, dtype=torch.int32)
+    _reject_grouped_bf16(d, a, b, d, ends.long(), use_psum_layout=True)
+
+    # A device assert can invalidate the CUDA context, so run each bad offset in a child.
+    child = ("import json, sys; sys.path[:] = json.loads(sys.argv[1]); "
+             "from utils import _run_grouped_bf16_bad_ends; _run_grouped_bf16_bad_ends(*json.loads(sys.argv[2]))")
+    offsets = [sum(lengths[:i + 1]) for i in range(len(lengths))]
+    offsets[-1] += 1
+    for a_rows, d_rows in ((m, m + 2), (m + 2, m)):
+        spec = json.dumps((a_rows, d_rows, n, k, offsets))
+        proc = subprocess.run([sys.executable, "-c", child, json.dumps(sys.path), spec], capture_output=True, text=True)
+        output = proc.stdout + proc.stderr
+        rejected = "cu_seqlens must" in output or "device-side assert" in output
+        assert proc.returncode != 0 and "valid compact layout passed" in proc.stdout and rejected, output
+
+
+def _run_grouped_bf16_case(args):
+    accumulation = args.get("accumulate", "none")
+    b_layout = args.get("b_layout", "k_major")
+    regression = args.get("bf16_regression")
+    part = args.get("regression_part")
+    check = get_acc_check() and not os.environ.get("HGGC_WARM_UP") and deep_gemm.get_compile_mode() != 1
+    if args["data_type"] != torch.bfloat16 or accumulation not in ("none", "alias", "separate"):
+        raise ValueError("Expected a grouped BF16 case")
+    if b_layout not in ("k_major", "mn_major"):
+        raise ValueError(f"Unknown grouped BF16 B layout {b_layout}")
+    lengths = construct_group_m_list(args["distribution"], args["groups"], args["m"])
+    n, k = args["n"], args["k"]
+    configs = (*args["configs"], (0, 0, 0)) if "configs" in args else None
+    if regression and (len(lengths) != args["groups"] or sum(lengths) + args.get("leading_padding", 0) != args["m"]):
+        raise ValueError("Grouped BF16 distribution and leading padding must match groups and m")
+    if regression == "layout" and "a_rows" in args:
+        return _check_grouped_bf16_layout(args, lengths, configs, check)
+    if (regression, part) == ("accumulation", "interface"):
+        if check:
+            _check_grouped_bf16_interface(args["m"], n, k, configs)
+        return
+    if (regression, part) == ("accumulation", "invalid_ends"):
+        if check:
+            _check_grouped_bf16_bad_ends(lengths, n, k)
+        return
+    if part is not None or regression not in (None, "accumulation", "layout"):
+        raise ValueError(f"Unknown grouped BF16 regression {regression}, part {part}")
+
+    modes = tuple(args.get("accumulation_modes", _GROUPED_BF16_MODES)) if regression else (accumulation,)
+    device = "cpu" if regression or (check and get_ref_backend() == "host") else "cuda"
+    _exercise_grouped_bf16(lengths, n, k, modes, configs=configs, c_offset=args.get("c_offset", 0),
+                           check=check, device=device, benchmark=get_benchmark() and not regression,
+                           compact=bool(args.get("use_psum_layout")), transpose_b=b_layout == "mn_major")
+
+
 def test_m_grouped_gemm_contiguous(args) -> None:
+    if ("b_layout" in args or args.get("bf16_regression") or args.get("accumulate", "none") != "none"
+            or args.get("use_psum_layout")):
+        return _run_grouped_bf16_case(args)
+
     print('Testing grouped contiguous GEMM:')
     num_groups, m, n, k, d, distribution = args['groups'], args['m'], args['n'], args['k'], args['data_type'], args['distribution']
     expected_m_per_group = ceil_div(m, num_groups) if "em" not in args.keys() else args["em"]
@@ -2249,9 +2516,8 @@ def ref_fp8_mqa_logits(q: torch.Tensor, kv: torch.Tensor, weights: torch.Tensor,
     q = q.float()
     k = k.float()
 
-    mask_lo = torch.arange(0, seq_len_kv, device='cuda')[None, :] >= cu_seqlen_ks[:, None]
-    mask_hi = torch.arange(0, seq_len_kv, device='cuda')[None, :] < cu_seqlen_ke[:, None]
-    mask = mask_lo & mask_hi
+    positions = torch.arange(seq_len_kv, device=q.device)[None, :]
+    mask = (positions >= cu_seqlen_ks[:, None]) & (positions < cu_seqlen_ke[:, None])
 
     score = torch.einsum('mhd,nd->hmn', q, k)
     if avg:
@@ -2270,7 +2536,6 @@ def ref_paged_mqa_logits(q: torch.Tensor, kv_cache: torch.Tensor,
     batch_size, next_n, heads, dim = q.size()
     num_block, block_size, _, dim = kv_cache.size()
     logits = torch.full([batch_size * next_n, max_model_len], float('-inf'), device=q.device, dtype=torch.float32)
-    # 2D context_lens: use last token's context_len (maximum) as KV range, matching kernel behavior
     context_lens_max = context_lens[:, -1].tolist()
     for i in range(batch_size):
         context_len = context_lens_max[i]
@@ -2288,13 +2553,14 @@ def ref_paged_mqa_logits(q: torch.Tensor, kv_cache: torch.Tensor,
             if avg:
                 # Avg variant: unweighted head sum scaled by 1/sqrt(head_dim), weights unused
                 if avg_bf16_rounding:
-                    assert heads == 4
-                    heads_bf16 = torch.relu(s).to(torch.bfloat16).float()
-                    pair0 = (heads_bf16[0] + heads_bf16[1]).to(torch.bfloat16).float()
-                    pair1 = (heads_bf16[2] + heads_bf16[3]).to(torch.bfloat16).float()
-                    total = (pair0 + pair1).to(torch.bfloat16).float()
+                    assert heads in (4, 8)
+                    total = torch.relu(s).to(torch.bfloat16).float()
+                    # Adjacent head pairs, then a balanced tree, rounding every
+                    # stage to match the packed BF16 kernel reduction.
+                    while total.size(0) > 1:
+                        total = (total[0::2] + total[1::2]).to(torch.bfloat16).float()
                     scale = total.new_tensor(dim ** -0.5).to(torch.bfloat16).float()
-                    s = (total * scale).to(torch.bfloat16)
+                    s = (total[0] * scale).to(torch.bfloat16)
                 else:
                     s = torch.relu(s).sum(dim=0) * (dim ** -0.5)
             else:
@@ -2340,7 +2606,7 @@ def test_mqa_logits(args) -> None:
     print("test_mqa_logits->test_func: {},data_type:{},seq_len_q:{},seq_len_kv:{},num_heads:{},head_dim:{},c4_compressed:{},compressed_logits:{},weights_dtype:{},logits_dtype:{},q_scale:{}".format(args.get('gemm_type', 'MqaLogits'), data_type, seq_len_q, seq_len_kv, num_heads, head_dim, c4_compressed, compressed_logits, weights_dtype, logits_dtype, q_scale_mode))
 
     if is_avg:
-        assert data_type in (torch.float8_e4m3fn, torch.uint8), "MQA Avg Logits supports fp8 or fp4 only"
+        assert data_type in (torch.float8_e4m3fn, torch.uint8, torch.int8)
         assert logits_dtype in (torch.float32, torch.bfloat16), "MQA Avg Logits supports float32 or bf16 logits"
 
     q = torch.randn(seq_len_q, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
@@ -2377,8 +2643,15 @@ def test_mqa_logits(args) -> None:
         q_int8_scale = q_int8_scale.reshape(seq_len_q, num_heads)
         weights_int8 = weights * q_int8_scale.to(weights.dtype)
         kv_int8 = per_token_cast_to_int8(kv)
-        logits = deep_gemm.int8_mqa_logits(q_int8, kv_int8, weights_int8, ks, ke,
-                                           clean_logits=clean_logits_arg, max_seqlen_k=max_seqlen_k)
+        if is_avg:
+            assert logits_dtype == torch.bfloat16 and q_scale_mode == 0
+            logits = deep_gemm.int8_mqa_avg_logits((q_int8, q_int8_scale), kv_int8, ks, ke, max_seqlen_k)
+            # Compare the kernel with the represented quantized operands, not quantization error.
+            q = q_int8.float() * q_int8_scale.unsqueeze(-1)
+            kv = kv_int8[0].float() * kv_int8[1].view(-1, 1)
+        else:
+            logits = deep_gemm.int8_mqa_logits(q_int8, kv_int8, weights_int8, ks, ke,
+                                               clean_logits=clean_logits_arg, max_seqlen_k=max_seqlen_k)
     elif data_type == torch.uint8:  # FP4
         q_fp4 = per_token_cast_to_fp4(q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
         q_in = (q_fp4[0].view(seq_len_q, num_heads, head_dim // 2), q_fp4[1].view(seq_len_q, num_heads))
@@ -2413,7 +2686,12 @@ def test_mqa_logits(args) -> None:
     ref_logits = None
     if get_acc_check():
         assert get_ref_backend() == "device", "ref_backend only supports 'device' for MQA Logits"
-        ref_logits, _ = ref_fp8_mqa_logits(q=q, kv=kv, weights=weights.float(), cu_seqlen_ks=ks, cu_seqlen_ke=ke, avg=is_avg)
+        ref_q, ref_kv = q, kv
+        if not is_avg and data_type == torch.float8_e4m3fn and num_heads == 8:
+            # Weighted H8 compares against the values represented by FP8 Q and K.
+            ref_q = q_fp8.float()
+            ref_kv = kv_fp8[0].float() * kv_fp8[1].reshape(-1, 1)
+        ref_logits, _ = ref_fp8_mqa_logits(q=ref_q, kv=ref_kv, weights=weights.float(), cu_seqlen_ks=ks, cu_seqlen_ke=ke, avg=is_avg)
         # q_scale is an extra multiplier applied inside the kernel (per-row vector or broadcast scalar)
         if is_avg and q_scale is not None:
             ref_logits = ref_logits * (q_scale if q_scale.numel() == 1 else q_scale.view(-1, 1))
@@ -2438,6 +2716,9 @@ def test_mqa_logits(args) -> None:
         logits_masked = logits.masked_fill(neginf_mask, 0)
         ref_logits_masked = ref_logits.masked_fill(ref_neginf_mask, 0)
 
+        if is_avg and data_type == torch.int8:
+            torch.testing.assert_close(logits_masked.float(), ref_logits_masked.to(logits_dtype).float(),
+                                       rtol=8e-3, atol=2e-3)
         diff = calc_diff(logits_masked, ref_logits_masked)
         if torch.isnan(diff) or diff >= 1e-3:
             print(f"ERROR: Accuracy check failed, diff={diff}")
@@ -2450,7 +2731,7 @@ def test_paged_mqa_logits(args) -> None:
     print('Testing Paged MQA Logits:')
     data_type = args['data_type']
     batch_size = args['batch_size']
-    next_n = args['next_n']
+    next_n = args.get('next_n', 1)
     avg_context_len = args.get('avg_context_len', 8192)
     distribution = args.get('distribution', [])
     pre_distribution = args.get('pre_distribution', [])
@@ -2461,6 +2742,33 @@ def test_paged_mqa_logits(args) -> None:
     # Avg variant (gemm_type 'PagedMqaAvgLogits'): no weights input, /sqrt(head_dim) inside kernel
     # (aligned with PAI: the paged avg kernel takes no q_scale)
     is_avg = args.get('gemm_type') == 'PagedMqaAvgLogits'
+    varlen_indices = args.get('varlen_indices')
+    query_contexts = args.get('context_lens')
+    is_varlen = args.get('is_varlen', varlen_indices is not None or query_contexts is not None)
+    tokens_per_request = []
+    fp8_h8 = not is_avg and data_type == torch.float8_e4m3fn and num_heads == 8
+    if is_varlen:
+        assert not is_avg and next_n == 1, \
+            "varlen replay requires weighted logits with next_n=1"
+        assert not args.get('implicit_indices', False), "varlen requires explicit indices"
+        assert not pre_distribution, "varlen replay requires current metadata contexts"
+        assert args.get('context_pattern') is None, "use context_lens for exact varlen lengths"
+        if not varlen_indices:
+            varlen_indices = list(range(batch_size))
+            if query_contexts is None and (not isinstance(distribution, list) or not distribution):
+                distribution = [avg_context_len] * batch_size
+        assert isinstance(varlen_indices, list) and len(varlen_indices) == batch_size
+        assert all(isinstance(idx, int) and idx >= 0 for idx in varlen_indices)
+        run_ids = []
+        for idx in varlen_indices:
+            if run_ids and idx == run_ids[-1]:
+                tokens_per_request[-1] += 1
+            else:
+                run_ids.append(idx)
+                tokens_per_request.append(1)
+        assert run_ids == list(range(len(run_ids))), "UT request IDs must be dense consecutive runs"
+    else:
+        assert varlen_indices is None and query_contexts is None, "varlen fields require is_varlen=1"
     if not is_avg:
         assert next_n == 1, "weighted next_n must be 1"
         if data_type == torch.uint8:
@@ -2476,10 +2784,11 @@ def test_paged_mqa_logits(args) -> None:
     print("test_paged_mqa_logits->test_func: {},data_type:{},batch_size:{},next_n:{},avg_context_len:{},num_heads:{},head_dim:{},logits_dtype:{},weights_dtype:{}".format(args.get('gemm_type', 'PagedMqaLogits'), data_type, batch_size, next_n, avg_context_len, num_heads, head_dim, logits_dtype, weights_dtype))
 
     if is_avg:
-        assert data_type in (torch.float8_e4m3fn, torch.uint8), "Paged MQA Avg Logits supports fp8 or fp4 only"
+        assert data_type in (torch.float8_e4m3fn, torch.uint8, torch.int8)
         assert logits_dtype in (torch.float32, torch.bfloat16), "Paged MQA Avg Logits supports float32 or bf16 logits"
 
     max_model_len = args.get('max_context_len', 262144)
+    assert max_model_len >= 0
     pagesize = args.get('page_kv', 64)
     assert pagesize == 32 or (pagesize > 0 and pagesize % 64 == 0)
 
@@ -2488,27 +2797,69 @@ def test_paged_mqa_logits(args) -> None:
 
     # Generate context_lens (2D [batch_size, next_n] for DeepGEMM 2D context_lens support)
     context_pattern = args.get('context_pattern')
-    if context_pattern is not None:
+    if query_contexts is not None:
+        assert isinstance(query_contexts, list) and len(query_contexts) == batch_size
+        assert all(isinstance(v, int) and 0 <= v <= max_model_len for v in query_contexts)
+        context_lens = torch.tensor(query_contexts, device='cuda', dtype=torch.int32)
+    elif is_varlen:
+        # Distribution contains one base per request; token j
+        # sees base+j unless exact per-query context_lens were supplied.
+        assert isinstance(distribution, list) and len(distribution) == len(tokens_per_request)
+        lengths = [base + j for base, count in zip(distribution, tokens_per_request) for j in range(count)]
+        assert all(isinstance(v, int) and 0 <= v <= max_model_len for v in lengths)
+        context_lens = torch.tensor(lengths, device='cuda', dtype=torch.int32)
+    elif context_pattern is not None:
         assert isinstance(context_pattern, list) and len(context_pattern) > 0
+        assert all(isinstance(v, int) and 0 <= v <= max_model_len for v in context_pattern)
         context_lens = torch.tensor([context_pattern[i % len(context_pattern)] for i in range(batch_size)],
                                     device='cuda', dtype=torch.int32)
     elif distribution and isinstance(distribution, list):
         assert(len(distribution) == batch_size)
+        assert all(isinstance(v, int) and 0 <= v <= max_model_len for v in distribution)
         context_lens = torch.tensor(distribution[:batch_size], device='cuda', dtype=torch.int32)
     else:
-        context_lens = torch.randint(int(0.7 * avg_context_len), int(1.3 * avg_context_len), (batch_size, )).cuda().to(torch.int32)
+        assert avg_context_len >= 0
+        low = min(int(0.7 * avg_context_len), max_model_len)
+        high = min(max(low + 1, int(1.3 * avg_context_len)), max_model_len + 1)
+        context_lens = torch.randint(low, high, (batch_size,), device='cuda', dtype=torch.int32)
 
-    max_block_len = (context_lens.max().item() + pagesize - 1) // pagesize
-    num_blocks = int(((context_lens + pagesize - 1) // pagesize).sum().item() * 1.3)  # 30% slack
+    max_generated_len = context_lens.max().item()
+    assert max_generated_len <= max_model_len
+    max_block_len = max(1, (max_generated_len + pagesize - 1) // pagesize)
+    request_indices = None
+    if is_varlen:
+        # Allocate each run's physical KV pages once, then expand its table row.
+        # MXFP4 requires the last length to be the maximum.
+        row_lengths = query_contexts if query_contexts is not None else lengths
+        request_pages = []
+        start = 0
+        for count in tokens_per_request:
+            end = start + count
+            longest = max(row_lengths[start:end])
+            if data_type == torch.uint8:
+                assert row_lengths[end - 1] == longest, \
+                    "each MXFP4 request's last query must have its maximum context length"
+            request_pages.append(ceil_div(longest, pagesize))
+            start = end
+        num_blocks = max(1, sum(request_pages))
+        request_indices = torch.tensor(varlen_indices, device=q.device, dtype=torch.int32)
+    else:
+        num_blocks = max(1, int(((context_lens + pagesize - 1) // pagesize).sum().item() * 1.3))
     kv_cache = torch.randn((num_blocks, pagesize, 1, head_dim), device='cuda', dtype=torch.bfloat16)
-
     block_tables = torch.full((batch_size, max_block_len), fill_value=0, device='cuda', dtype=torch.int32)
     block_idx_pool = torch.randperm(num_blocks, device='cuda', dtype=torch.int32)
     counter = 0
-    for i in range(batch_size):
-        nblk = ceil_div(context_lens[i].item(), pagesize)
-        block_tables[i, :nblk] = block_idx_pool[counter:counter+nblk]
-        counter += nblk
+    if is_varlen:
+        start = 0
+        for count, nblk in zip(tokens_per_request, request_pages):
+            block_tables[start:start + count, :nblk] = block_idx_pool[counter:counter + nblk]
+            counter += nblk
+            start += count
+    else:
+        for i in range(batch_size):
+            nblk = ceil_div(context_lens[i].item(), pagesize)
+            block_tables[i, :nblk] = block_idx_pool[counter:counter+nblk]
+            counter += nblk
 
     # Generate 2D context_lens for main kernel
     if next_n == 1:
@@ -2523,6 +2874,7 @@ def test_paged_mqa_logits(args) -> None:
     # Generate pre_context_lens for get_paged_mqa_logits_metadata (may differ from main kernel context_lens in MTP + CUDA graph)
     if pre_distribution and isinstance(pre_distribution, list):
         assert next_n == 1
+        assert all(isinstance(v, int) and 0 <= v <= max_model_len for v in pre_distribution)
         pre_context_lens = torch.tensor(pre_distribution, device='cuda', dtype=torch.int32).unsqueeze(-1)
     else:
         pre_context_lens = context_lens
@@ -2533,11 +2885,12 @@ def test_paged_mqa_logits(args) -> None:
         q_fp8 = q.to(torch.float8_e4m3fn)
         kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache)
         metadata_extra = (next_n, num_heads, head_dim, torch.float8_e4m3fn)
-        schedule_metadata = get_metadata_kernel(pre_context_lens, pagesize, deep_gemm.get_num_sms(), metadata_extra=metadata_extra)
+        schedule_metadata = get_metadata_kernel(pre_context_lens, pagesize, deep_gemm.get_num_sms(),
+                                                indices=request_indices, metadata_extra=metadata_extra)
         if is_avg:
             logits = deep_gemm.fp8_paged_mqa_avg_logits(q_fp8, kv_cache_fp8, context_lens, block_tables, schedule_metadata, max_model_len, logits_dtype=logits_dtype)
         else:
-            logits = deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=False)
+            logits = deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=False, indices=request_indices)
     elif data_type == torch.int8:
         q_int8, q_int8_scale = per_token_cast_to_int8(q.reshape(batch_size * next_n * num_heads, head_dim))
         q_int8 = q_int8.reshape(batch_size, next_n, num_heads, head_dim)
@@ -2545,8 +2898,21 @@ def test_paged_mqa_logits(args) -> None:
         weights_int8 = weights * q_int8_scale.to(weights.dtype)
         kv_cache_int8 = kv_cache_cast_to_int8(kv_cache)
         metadata_extra = (next_n, num_heads, head_dim, torch.int8)
-        schedule_metadata = get_metadata_kernel(pre_context_lens, pagesize, deep_gemm.get_num_sms(), metadata_extra=metadata_extra)
-        logits = deep_gemm.int8_paged_mqa_logits(q_int8, kv_cache_int8, weights_int8, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=False)
+        schedule_metadata = get_metadata_kernel(pre_context_lens, pagesize, deep_gemm.get_num_sms(),
+                                                indices=request_indices, metadata_extra=metadata_extra)
+        if is_avg:
+            assert logits_dtype == torch.bfloat16
+            qs = q_int8_scale.view(batch_size, next_n, num_heads)
+            logits = deep_gemm.int8_paged_mqa_avg_logits(
+                (q_int8, qs), kv_cache_int8, context_lens, block_tables, schedule_metadata, max_model_len)
+            q = q_int8.float() * qs.unsqueeze(-1)
+            packed = kv_cache_int8.view(num_blocks, -1)
+            values = packed[:, :pagesize * head_dim].contiguous().view(torch.int8)
+            scales = packed[:, pagesize * head_dim:].contiguous().view(torch.float32)
+            kv_cache = values.view(num_blocks, pagesize, 1, head_dim).float() * scales[:, :, None, None]
+        else:
+            logits = deep_gemm.int8_paged_mqa_logits(q_int8, kv_cache_int8, weights_int8, context_lens, block_tables,
+                                                     schedule_metadata, max_model_len, clean_logits=False, indices=request_indices)
     elif data_type == torch.uint8:  # FP4
         q_fp4 = per_token_cast_to_fp4(q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
         q_in = (q_fp4[0].view(batch_size, next_n, num_heads, head_dim // 2), q_fp4[1].view(batch_size, next_n, num_heads))
@@ -2554,8 +2920,10 @@ def test_paged_mqa_logits(args) -> None:
         kv_cache_fp4, kv_cache_dequant = kv_cache_cast_to_fp4(kv_cache)
         q, kv_cache = q_dequant, kv_cache_dequant
         metadata_extra = (next_n, num_heads, head_dim, torch.int8)
+        if not is_avg and request_indices is None:
+            request_indices = torch.arange(batch_size, device=q.device, dtype=torch.int32)
         schedule_metadata = get_metadata_kernel(pre_context_lens, pagesize, deep_gemm.get_num_sms(),
-                                                metadata_extra=metadata_extra)
+                                                indices=request_indices, metadata_extra=metadata_extra)
         if is_avg:
             logits = deep_gemm.fp8_fp4_paged_mqa_avg_logits(
                 q=q_in, fused_kv_cache=kv_cache_fp4,
@@ -2568,7 +2936,7 @@ def test_paged_mqa_logits(args) -> None:
                 q=q_in, kv_cache=kv_cache_fp4, weights=weights,
                 context_lens=context_lens, block_table=block_tables,
                 schedule_meta=schedule_metadata, max_context_len=max_model_len,
-                indices=torch.arange(batch_size, device=q.device, dtype=torch.int32),
+                indices=request_indices,
             )
     else:
         print("ERROR: Unsupported dtype for Paged MQA Logits, please check!")
@@ -2581,9 +2949,16 @@ def test_paged_mqa_logits(args) -> None:
     if get_acc_check():
         assert get_ref_backend() == "device", "ref_backend only supports 'device' for Paged MQA Logits"
         # FP4 AVG uses represented Q/K values and FP32 dot products. Its BF16
-        # output rounds each head, both reduction stages, and the final scale.
-        ref_q = q.float() if is_avg and data_type == torch.uint8 else q
-        ref_kv = kv_cache.float() if is_avg and data_type == torch.uint8 else kv_cache
+        # output rounds each head, every reduction stage, and the final scale.
+        if fp8_h8:
+            packed = kv_cache_fp8.view(num_blocks, -1)
+            values = packed[:, :pagesize * head_dim].contiguous().view(torch.float8_e4m3fn)
+            scales = packed[:, pagesize * head_dim:].contiguous().view(torch.float32)
+            ref_q = q_fp8.float()
+            ref_kv = values.float().view(num_blocks, pagesize, 1, head_dim) * scales.view(num_blocks, pagesize, 1, 1)
+        else:
+            ref_q = q.float() if is_avg and data_type == torch.uint8 else q
+            ref_kv = kv_cache.float() if is_avg and data_type == torch.uint8 else kv_cache
         ref_logits = ref_paged_mqa_logits(
             ref_q, ref_kv, weights, context_lens, block_tables, max_model_len, avg=is_avg,
             avg_bf16_rounding=is_avg and data_type == torch.uint8 and logits_dtype == torch.bfloat16,
@@ -2601,7 +2976,7 @@ def test_paged_mqa_logits(args) -> None:
         logits_masked = logits.masked_fill(ref_neginf_mask, 0)
         ref_logits_masked = ref_logits.masked_fill(ref_neginf_mask, 0)
 
-        if is_avg and data_type == torch.uint8:
+        if is_avg and data_type in (torch.uint8, torch.int8):
             # Check each valid token/K pair: an aggregate error can hide a bad
             # request switch or a missing token in the next_n=5/6 tail.
             is_bf16 = logits_dtype == torch.bfloat16
@@ -2610,7 +2985,7 @@ def test_paged_mqa_logits(args) -> None:
                 rtol=8e-3 if is_bf16 else 1e-4,
                 atol=2e-3 if is_bf16 else 1e-4,
             )
-        diff = calc_diff(logits_masked, ref_logits_masked)
+        diff = torch.as_tensor(calc_diff(logits_masked, ref_logits_masked))
         threshold = 1.5e-3 if logits_dtype == torch.bfloat16 else 1e-3
         if torch.isnan(diff) or diff >= threshold:
             print(f"ERROR: Accuracy check failed, diff={diff}")
@@ -2679,6 +3054,9 @@ def gather_sparse_reference(full_logits: torch.Tensor, sparse_indices: torch.Ten
     valid_mask = torch.arange(token_indices.size(1), device='cuda')[None, :] < num_valid_tokens[:, None]
     valid_mask &= token_indices >= context_starts.long()[:, None]
     valid_mask &= token_indices < context_lens.long()[:, None]
+    if full_logits.size(1) == 0:
+        assert not valid_mask.any().item(), "zero-width dense reference has valid sparse candidates"
+        return full_logits.new_zeros(token_indices.shape), valid_mask
     full_token_indices = (token_indices - context_starts.long()[:, None]).clamp(
         min=0, max=full_logits.size(1) - 1)
     return full_logits.gather(1, full_token_indices), valid_mask
@@ -2692,21 +3070,22 @@ def ref_sparse_mqa_logits(q: torch.Tensor, kv_gathered: torch.Tensor, weights: t
     logits = (score.relu() * weights.float().transpose(0, 1).unsqueeze(-1)).sum(dim=0)
     return logits * valid_mask  # zero out non-valid slots
 
+
 # ------------------------------------------------------------ sparse metadata reference checks
 
 # Layout mirrors deep_gemm/include/deep_gemm/impls/sparse_mqa_logits_layout.cuh
 SPARSE_SPLIT_KV = 128
-SPARSE_CTAS_PER_CU = 7
 SPARSE_INVALID_SLOT = 0xFFFF
 SPARSE_CONTIGUOUS_FLAG = 0x80000000
 # KVBlockInfo slot fields are raw 16-bit offsets (no present bit; the present bit only exists in
 # the metadata kernel's shared-memory merge packing, which is never written out)
 SPARSE_SLOT_MASK = 0xFFFF
 
+
 def decode_sparse_metadata(metadata: torch.Tensor, sparse_block_kv: int) -> dict:
     """Decode the metadata buffer produced by the sparse metadata kernel (contiguous layout)."""
-    # Schedule table columns = resident CTAs of the sparse main kernel = num_cu x tb_per_cu
-    num_slots = SPARSE_CTAS_PER_CU * deep_gemm.get_num_sms()
+    # One schedule column per launched persistent CTA; this is not measured residency.
+    num_slots = deep_gemm.get_num_sms() * (4 if get_arch_version() == 80 else 7)
     words = metadata.view(torch.int32).cpu().numpy()
     num_kv_splits, num_waves, use_unaligned_ks = int(words[0]), int(words[1]), int(words[2])
     blocks_per_split = SPARSE_SPLIT_KV // sparse_block_kv
@@ -2799,7 +3178,7 @@ def verify_sparse_metadata(decoded: dict, ref: dict, total_q_tokens: int) -> Non
     """Compare the kernel's decoded metadata against the Python reference. Split reservation order
     is nondeterministic, so split lists are canonically sorted by (q_token_base, q0_slot_base,
     q1_slot_base); the schedule is validated structurally (exact tiling, slot evenness, Q-block cuts)."""
-    num_slots = SPARSE_CTAS_PER_CU * deep_gemm.get_num_sms()
+    num_slots = deep_gemm.get_num_sms() * (4 if get_arch_version() == 80 else 7)
     if decoded['num_kv_splits'] != ref['num_kv_splits']:
         print(f"ERROR: metadata num_kv_splits mismatch: {decoded['num_kv_splits']} vs {ref['num_kv_splits']}")
         exit(1)
@@ -2863,6 +3242,9 @@ def ref_paged_sparse_metadata(sparse_indices: torch.Tensor, num_blocks_per_q: li
     KV window = [0, context_lens[q]) per token (logical values are raw block ids), Q blocks pair
     only tokens of the same request (from the request start), and physical =
     block_table[q_token_base][logical // blocks_per_page] * blocks_per_page + logical % blocks_per_page.
+    Mark a split contiguous only if every logical block is consecutive and belongs to one
+    logical page, including partial splits. Check the full logical sequence independently
+    of the kernel's endpoint proof; aliased physical endpoints alone prove nothing.
     Split reservation order is nondeterministic (atomic); callers compare via canonical sorting."""
     blocks_per_split = SPARSE_SPLIT_KV // sparse_block_kv
     blocks_per_page = page_kv // sparse_block_kv
@@ -2874,10 +3256,11 @@ def ref_paged_sparse_metadata(sparse_indices: torch.Tensor, num_blocks_per_q: li
     # Per-token pairing: base t pairs with t+1 iff t is request-aligned and t+1 is the same request
     paired = [False] * num_q_tokens
     q_token_bases = []
+    r_start = 0
     for t in range(num_q_tokens):
-        r_start = t
-        while r_start > 0 and req[r_start - 1] == req[t]:
-            r_start -= 1
+        # Linear scan of contiguous runs: an ID may reappear after another ID.
+        if t == 0 or req[t - 1] != req[t]:
+            r_start = t
         if (t - r_start) % 2 != 0:
             continue
         q_token_bases.append(t)
@@ -2908,6 +3291,11 @@ def ref_paged_sparse_metadata(sparse_indices: torch.Tensor, num_blocks_per_q: li
         for split_offset in range(num_splits):
             blocks_in_split = merged[split_offset * blocks_per_split:(split_offset + 1) * blocks_per_split]
             q0_slot_base, q1_slot_base = blocks_in_split[0][1], blocks_in_split[0][2]
+            logical_ids = [block[0] for block in blocks_in_split]
+            is_contiguous = (all(logical == logical_ids[0] + offset
+                                 for offset, logical in enumerate(logical_ids)) and
+                             all(logical // blocks_per_page == logical_ids[0] // blocks_per_page
+                                 for logical in logical_ids))
             block_records = []
             for logical, i0, i1, in_q0, in_q1 in blocks_in_split:
                 logical_page_idx = logical // blocks_per_page
@@ -2917,16 +3305,18 @@ def ref_paged_sparse_metadata(sparse_indices: torch.Tensor, num_blocks_per_q: li
                 block_records.append((physical, q0_off, q1_off))
             block_records += [(0, SPARSE_INVALID_SLOT, SPARSE_INVALID_SLOT)] * (blocks_per_split - len(block_records))
             splits.append(dict(q_token_base=q_token_base, num_kv_blocks=len(blocks_in_split),
-                               is_contiguous=False, q0_slot_base=q0_slot_base,
+                               is_contiguous=is_contiguous, q0_slot_base=q0_slot_base,
                                q1_slot_base=q1_slot_base if paired[q_token_base] else SPARSE_INVALID_SLOT,
                                blocks=block_records))
     return dict(num_kv_splits=len(splits), splits=splits, use_unaligned_ks=0)
 
 def verify_paged_sparse_metadata(decoded: dict, ref: dict, total_q_tokens: int,
                                  request_ids: torch.Tensor) -> None:
-    """Paged schedule check: entries tile [0, num_kv_splits) exactly; each entry stays inside its
-    Q block's split range with a pairing count matching the request-aligned pairs."""
-    num_slots = SPARSE_CTAS_PER_CU * deep_gemm.get_num_sms()
+    """Check split contents, request-local pairing and exact schedule coverage.
+
+    Validate semantics without prescribing the per-slot load-balancing policy.
+    """
+    num_slots = deep_gemm.get_num_sms() * (4 if get_arch_version() == 80 else 7)
     if decoded['num_kv_splits'] != ref['num_kv_splits']:
         print(f"ERROR: metadata num_kv_splits mismatch: {decoded['num_kv_splits']} vs {ref['num_kv_splits']}")
         exit(1)
@@ -2945,17 +3335,30 @@ def verify_paged_sparse_metadata(decoded: dict, ref: dict, total_q_tokens: int,
                     exit(1)
             print("ERROR: metadata blocks mismatch (no differing block found?!)")
             exit(1)
-    # Paged schedule: entries (any slot order, balanced across waves) must tile the split space.
+    # The paged schedule must tile the split space exactly.
     # Schedule entries carry *kernel* split indices, so Q-block ranges come from the decoded
     # splits in kernel order (one base's range is contiguous — a CTA reserves it atomically).
     req = request_ids.cpu().numpy().tolist()
+    run_begins, run_begin = [], 0
+    for index in range(total_q_tokens):
+        if index == 0 or req[index - 1] != req[index]:
+            run_begin = index
+        run_begins.append(run_begin)
     base_ranges, base_pairing = {}, {}
     for idx, s in enumerate(decoded['splits']):
         b = s['q_token_base']
+        assert 0 <= b < total_q_tokens and (b - run_begins[b]) % 2 == 0
+        expected_pairing = 2 if (b + 1 < total_q_tokens and req[b + 1] == req[b]) else 1
+        header_pairing = 1 + int(s['q1_slot_base'] != SPARSE_INVALID_SLOT)
+        # A paired Q1 with context=0 still has valid_q=2. Conversely, an
+        # unpaired Q0 followed by a different request must keep valid_q=1.
+        assert header_pairing == expected_pairing, (b, header_pairing, expected_pairing)
         if b not in base_ranges:
             base_ranges[b] = [idx, idx + 1]
-            base_pairing[b] = 2 if (b + 1 < total_q_tokens and req[b + 1] == req[b]) else 1
+            base_pairing[b] = header_pairing
         else:
+            assert base_ranges[b][1] == idx, f'Q pair {b} has noncontiguous split reservation'
+            assert base_pairing[b] == header_pairing
             base_ranges[b][1] = idx + 1
     total = ref['num_kv_splits']
     num_waves = decoded['num_waves']
@@ -2989,26 +3392,6 @@ def verify_paged_sparse_metadata(decoded: dict, ref: dict, total_q_tokens: int,
         print(f"ERROR: paged schedule covers [0,{expect_begin}) but total splits = {total}")
         exit(1)
 
-    # Verify the stable wave ordering, not only coverage: equal-sized entries
-    # retain Q order, and rotation (including the reversed two-wave tail) is exact.
-    ordered = []
-    for base, (begin, end) in sorted(base_ranges.items()):
-        entry_count = ceil_div(end - begin, 8)
-        size, larger = divmod(end - begin, entry_count)
-        for i in range(entry_count):
-            next_begin = begin + size + (i < larger)
-            ordered.append((begin, next_begin, base, base_pairing[base]))
-            begin = next_begin
-    expected_waves = max(1, ceil_div(len(ordered), num_slots))
-    assert num_waves == expected_waves, (num_waves, expected_waves)
-    ordered += [(0, 0, 0, 0)] * (num_waves * num_slots - len(ordered))
-    for wave in range(num_waves):
-        entries = sorted(ordered[wave * num_slots:(wave + 1) * num_slots], key=lambda e: e[1] - e[0])
-        for rank, entry in enumerate(entries):
-            slot = (num_slots - 1 - rank if num_waves == 2 and wave == 1 else
-                    (rank + num_slots - wave * num_slots // num_waves) % num_slots)
-            actual = tuple(decoded['schedule'][wave * num_slots + slot])
-            assert actual == entry, f"Paged wave ordering mismatch at wave {wave}, slot {slot}: {actual} vs {entry}"
 
 def test_sparse_mqa_logits(args) -> None:
     print('Testing Sparse MQA Logits:')
@@ -3025,14 +3408,15 @@ def test_sparse_mqa_logits(args) -> None:
               args.get('gemm_type', 'SparseMqaLogits'), data_type, seq_len_q, seq_len_kv, num_heads, head_dim,
               sparse_block_kv, num_max_sparse_blocks, use_unaligned_ks))
 
-    assert data_type == torch.uint8, "Sparse MQA Logits supports MXFP4 only"
+    assert data_type in (torch.int8, torch.uint8), "Sparse MQA Logits supports INT8 or MXFP4"
+    assert 'request_q_lens' not in args and 'request_kv_lens' not in args, "Use standard sparse shape cases"
+    is_int8 = data_type == torch.int8
     assert num_heads == 32 and head_dim == 128, "num_heads/head_dim are sparse layout constants (32/128)"
     assert num_max_sparse_blocks % 4 == 0 and num_max_sparse_blocks <= 4096
     assert sparse_block_kv in (8, 16)
 
     if args.get('gemm_type', 'SparseMqaLogits') == 'PagedSparseMqaLogits':
-        # Paged KV: ks = 0 per token, ke = context_lens[q]; the fused fp4
-        # cache interleaves a trailing 4B SF per token row; block_table resolves logical pages.
+        # Paged KV uses SoA pages: all K bytes followed by all scale words.
         page_kv = args.get('page_kv', 64)
         assert page_kv > 0 and page_kv % sparse_block_kv == 0
         rng = random.Random(seq_len_q * 1000003 + seq_len_kv + sparse_block_kv)
@@ -3046,9 +3430,11 @@ def test_sparse_mqa_logits(args) -> None:
 
         # Page table: per-request page lists drawn from a permuted pool; tokens of one request
         # share their row content (the kernel only reads the Q block base token's row)
-        max_pages = ceil_div(max(context_lens_list), page_kv)
-        total_pages = sum(ceil_div(max(context_lens_list[i] for i, rr in enumerate(request_indices) if rr == r),
-                                   page_kv) for r in range(num_requests))
+        # Empty windows still require positive page-table/cache capacity. The
+        # dummy page is never selected; keep the logical context lengths zero.
+        max_pages = max(1, ceil_div(max(context_lens_list), page_kv))
+        total_pages = max(1, sum(ceil_div(max(context_lens_list[i] for i, rr in enumerate(request_indices) if rr == r),
+                                          page_kv) for r in range(num_requests)))
         pool = torch.randperm(total_pages, device='cuda', dtype=torch.int32)
         req_page_lists, counter = [], 0
         for r in range(num_requests):
@@ -3060,21 +3446,32 @@ def test_sparse_mqa_logits(args) -> None:
             [req_page_lists[request_indices[t]] + [0] * (max_pages - len(req_page_lists[request_indices[t]]))
              for t in range(seq_len_q)], device='cuda', dtype=torch.int32)
 
-        # Fused fp4 cache: [num_pages, page_kv, 1, head_dim/2 + 4] uint8 (SF trails each row),
-        # page stride padded to 512B (upstream test construction; the kernel asserts it)
+        # INT8 and FP4 share page addressing; only K width and scale encoding differ.
         kv_x = torch.randn(total_pages, page_kv, 1, head_dim, device='cuda', dtype=torch.bfloat16)
-        kv_raw = kv_cache_cast_to_fp4(kv_x)[0]
-        page_stride_bytes = ceil_div(page_kv * (head_dim // 2 + 4), 512) * 512
+        packed_dim = head_dim if is_int8 else head_dim // 2
+        if is_int8:
+            k, scales = per_token_cast_to_int8(kv_x.view(-1, head_dim))
+            kv_raw = torch.cat((k.view(torch.uint8).view(total_pages, -1),
+                                scales.float().view(torch.uint8).view(total_pages, -1)), dim=1)
+            kv_raw = kv_raw.view(total_pages, page_kv, 1, packed_dim + 4)
+        else:
+            kv_raw = kv_cache_cast_to_fp4(kv_x)[0]
+        page_stride_bytes = ceil_div(page_kv * (packed_dim + 4), 512) * 512
         kv_storage = torch.zeros((total_pages, page_stride_bytes), device='cuda', dtype=torch.uint8)
-        kv_cache_fp4 = kv_storage.as_strided((total_pages, page_kv, 1, head_dim // 2 + 4),
-                                             (page_stride_bytes, head_dim // 2 + 4, head_dim // 2 + 4, 1))
-        kv_cache_fp4.copy_(kv_raw)
+        kv_cache = kv_storage.as_strided((total_pages, page_kv, 1, packed_dim + 4),
+                                         (page_stride_bytes, packed_dim + 4, packed_dim + 4, 1))
+        kv_cache.copy_(kv_raw)
 
         torch.manual_seed(0)
         q = torch.randn(seq_len_q, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
         weights = torch.randn(seq_len_q, num_heads, device='cuda', dtype=torch.bfloat16)
-        q_fp4 = per_token_cast_to_fp4(q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
-        q_in = (q_fp4[0].view(seq_len_q, 1, num_heads, head_dim // 2), q_fp4[1].view(seq_len_q, 1, num_heads))
+        if is_int8:
+            q_quant, q_scale = per_token_cast_to_int8(q.view(-1, head_dim))
+            q_in = q_quant.view(seq_len_q, 1, num_heads, head_dim)
+            weights *= q_scale.view(seq_len_q, num_heads).to(weights.dtype)
+        else:
+            q_fp4 = per_token_cast_to_fp4(q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+            q_in = (q_fp4[0].view(seq_len_q, 1, num_heads, packed_dim), q_fp4[1].view(seq_len_q, 1, num_heads))
 
         # ks = 0 for every token: absolute sparse block ids from the pool start
         sparse_indices, num_blocks_per_q = make_sparse_kv_block_indices(
@@ -3082,40 +3479,48 @@ def test_sparse_mqa_logits(args) -> None:
             seed=seq_len_q + seq_len_kv + sparse_block_kv, request_indices=request_indices)
 
         # Ground truth (acc mode only — perf mode must not launch the dense kernel into the
-        # cycle CSV): dense paged fp4 kernel, gathered at the selected positions
+        # cycle CSV): the matching dense kernel, gathered at the selected positions
         gathered_ref, valid_mask = None, None
         # Precompile the dense JIT reference without inspecting its outputs.
         if get_acc_check() or os.environ.get('HGGC_WARM_UP'):
-            if page_kv == 64:
+            if max(context_lens_list) == 0:
+                full_logits = torch.empty((seq_len_q, 0), device='cuda', dtype=torch.bfloat16)
+            elif not is_int8 and page_kv == 64:
                 context_lens_2d = context_lens.unsqueeze(-1)
+                # Schedule each reference row independently of sparse request groups.
+                dense_indices = torch.arange(seq_len_q, device=q_in[0].device, dtype=torch.int32)
                 schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
                     context_lens_2d, page_kv, deep_gemm.get_num_sms(),
+                    indices=dense_indices,
                     metadata_extra=(1, num_heads, head_dim, torch.int8))
                 full_logits = deep_gemm.fp8_fp4_paged_mqa_logits(
-                    q=q_in, kv_cache=kv_cache_fp4, weights=weights, context_lens=context_lens_2d,
+                    q=q_in, kv_cache=kv_cache, weights=weights, context_lens=context_lens_2d,
                     block_table=block_table, schedule_meta=schedule_meta,
-                    max_context_len=max(context_lens_list), indices=request_ids)
+                    max_context_len=max(context_lens_list), indices=dense_indices)
             else:
                 # Reconstruct logical KV so the reference is independent of dense page-size support.
-                page_data = kv_cache_fp4.view(total_pages, -1)
-                packed_dim = head_dim // 2
+                page_data = kv_cache.view(total_pages, -1)
                 page_fp = page_data[:, :page_kv * packed_dim].view(total_pages, page_kv, packed_dim)
-                page_sf = page_data[:, page_kv * packed_dim:].view(torch.int32)
+                page_sf = page_data[:, page_kv * packed_dim:].view(torch.float32 if is_int8 else torch.int32)
                 full_logits = torch.full((seq_len_q, max(context_lens_list)), float('-inf'),
                                          device='cuda', dtype=torch.bfloat16)
                 begin = 0
                 for size in request_sizes:
                     end = begin + size
                     num_pages = ceil_div(max(context_lens_list[begin:end]), page_kv)
+                    if num_pages == 0:
+                        begin = end
+                        continue
                     pages = block_table[begin, :num_pages].long()
                     logical_fp = page_fp[pages].reshape(-1, packed_dim).view(torch.int8)
                     logical_sf = page_sf[pages].reshape(-1)
-                    request_q = (q_in[0][begin:end].view(size, num_heads, packed_dim),
-                                 q_in[1][begin:end].view(size, num_heads))
-                    request_logits = deep_gemm.fp8_fp4_mqa_logits(
-                        q=request_q, kv=(logical_fp, logical_sf), weights=weights[begin:end],
-                        cu_seq_len_k_start=torch.zeros(size, device='cuda', dtype=torch.int32),
-                        cu_seq_len_k_end=context_lens[begin:end],
+                    request_q = (q_in[begin:end, 0] if is_int8 else
+                                 (q_in[0][begin:end].view(size, num_heads, packed_dim),
+                                  q_in[1][begin:end].view(size, num_heads)))
+                    dense_kernel = deep_gemm.int8_mqa_logits if is_int8 else deep_gemm.fp8_fp4_mqa_logits
+                    request_logits = dense_kernel(
+                        request_q, (logical_fp, logical_sf), weights[begin:end],
+                        torch.zeros(size, device='cuda', dtype=torch.int32), context_lens[begin:end],
                         max_seqlen_k=int(logical_fp.size(0)))
                     width = min(full_logits.size(1), request_logits.size(1))
                     full_logits[begin:end, :width] = request_logits[:, :width]
@@ -3127,7 +3532,7 @@ def test_sparse_mqa_logits(args) -> None:
 
         metadata = deep_gemm.get_paged_sparse_mqa_logits_metadata(
             context_lens=context_lens, block_table=block_table, indices=request_ids, page_kv=page_kv,
-            sparse_kv_block_indices=sparse_indices, qk_dtype=q_in[0].dtype, sparse_block_kv=sparse_block_kv)
+            sparse_kv_block_indices=sparse_indices, qk_dtype=torch.int8, sparse_block_kv=sparse_block_kv)
         if args.get('check_metadata', 0) and get_acc_check():
             decoded = decode_sparse_metadata(metadata, sparse_block_kv)
             ref_meta = ref_paged_sparse_metadata(
@@ -3135,12 +3540,13 @@ def test_sparse_mqa_logits(args) -> None:
                 sparse_block_kv, num_max_sparse_blocks)
             verify_paged_sparse_metadata(decoded, ref_meta, seq_len_q, request_ids)
             print("Metadata check passed")
-        sparse_logits = deep_gemm.fp8_fp4_paged_sparse_mqa_logits(
-            q=q_in, kv_cache=kv_cache_fp4, weights=weights, metadata=metadata,
+        sparse_kernel = deep_gemm.int8_paged_sparse_mqa_logits if is_int8 else deep_gemm.fp8_fp4_paged_sparse_mqa_logits
+        sparse_logits = sparse_kernel(
+            q=q_in, kv_cache=kv_cache, weights=weights, metadata=metadata,
             num_max_sparse_blocks=num_max_sparse_blocks, sparse_block_kv=sparse_block_kv)
         if get_acc_check():
             torch.cuda.synchronize()
-            if not torch.equal(sparse_logits[valid_mask], gathered_ref[valid_mask]):
+            if not torch.equal(sparse_logits[:, :valid_mask.size(1)][valid_mask], gathered_ref[valid_mask]):
                 print("ERROR: paged sparse MQA logits mismatch against gathered dense paged reference")
                 exit(1)
             print("Accuracy check passed\n")
@@ -3176,64 +3582,71 @@ def test_sparse_mqa_logits(args) -> None:
     q = torch.randn(seq_len_q, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
     kv = torch.randn(num_kv_tokens, head_dim, device='cuda', dtype=torch.bfloat16)
     weights = torch.randn(seq_len_q, num_heads, device='cuda', dtype=torch.bfloat16)
-    q_fp4 = per_token_cast_to_fp4(q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
-    q_in = (q_fp4[0].view(seq_len_q, num_heads, head_dim // 2), q_fp4[1].view(seq_len_q, num_heads))
-    q_dequant = cast_back_from_fp4(q_fp4[0], q_fp4[1], gran_k=32, use_packed_ue8m0=True).view(
-        seq_len_q, num_heads, head_dim).to(torch.bfloat16)
-    kv_fp4 = per_token_cast_to_fp4(kv, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
-    kv_in = (kv_fp4[0], kv_fp4[1].squeeze(-1))
-    kv_dequant = cast_back_from_fp4(kv_fp4[0], kv_fp4[1], gran_k=32, use_packed_ue8m0=True).view(
-        num_kv_tokens, head_dim).to(torch.bfloat16)
+    if is_int8:
+        q_quant, q_scale = per_token_cast_to_int8(q.view(-1, head_dim))
+        q_in = q_quant.view(seq_len_q, num_heads, head_dim)
+        weights *= q_scale.view(seq_len_q, num_heads).to(weights.dtype)
+        k_quant, k_scale = per_token_cast_to_int8(kv)
+        kv_in = (k_quant, k_scale.flatten())
+    else:
+        q_fp4 = per_token_cast_to_fp4(q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+        q_in = (q_fp4[0].view(seq_len_q, num_heads, head_dim // 2), q_fp4[1].view(seq_len_q, num_heads))
+        q_dequant = cast_back_from_fp4(q_fp4[0], q_fp4[1], gran_k=32, use_packed_ue8m0=True).view(
+            seq_len_q, num_heads, head_dim).to(torch.bfloat16)
+        kv_fp4 = per_token_cast_to_fp4(kv, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+        kv_in = (kv_fp4[0], kv_fp4[1].squeeze(-1))
+        kv_dequant = cast_back_from_fp4(kv_fp4[0], kv_fp4[1], gran_k=32, use_packed_ue8m0=True).view(
+            num_kv_tokens, head_dim).to(torch.bfloat16)
 
     sparse_indices, num_blocks_per_q = make_sparse_kv_block_indices(
         context_ends, context_starts, sparse_block_kv, num_max_sparse_blocks,
         seed=seq_len_q + num_kv_tokens + sparse_block_kv, request_indices=request_indices)
 
     # Ground truth (acc mode only — perf mode must not launch the dense kernel into the cycle
-    # CSV): dense MXFP4 kernel with bf16 logits (compressed relative columns), gathered at the
-    # selected positions. The sparse kernel must match this bitwise (same block-scale MMA
-    # grouping and same ReLU+weighted-sum epilogue).
+    # CSV): matching dense kernel with BF16 logits, gathered at the selected positions.
+    # Sparse and dense use the same quantized inputs and weighted epilogue.
     gathered_ref, valid_mask = None, None
     # Precompile the dense JIT reference without inspecting its outputs.
     if get_acc_check() or os.environ.get('HGGC_WARM_UP'):
-        full_logits = deep_gemm.fp8_fp4_mqa_logits(
-            q=q_in, kv=kv_in, weights=weights, cu_seq_len_k_start=context_starts, cu_seq_len_k_end=context_ends,
-            max_seqlen_k=int(num_kv_tokens))
+        dense_kernel = deep_gemm.int8_mqa_logits if is_int8 else deep_gemm.fp8_fp4_mqa_logits
+        full_logits = dense_kernel(q_in, kv_in, weights, context_starts, context_ends,
+                                   max_seqlen_k=int(num_kv_tokens))
         if get_acc_check():
             # gather_sparse_reference already converts absolute block positions
             # to columns relative to each query's context start.
             gathered_ref, valid_mask = gather_sparse_reference(
                 full_logits, sparse_indices, num_blocks_per_q, context_starts, context_ends, sparse_block_kv)
 
-            # Reference harness self-check: FP32 torch recompute at the gathered positions vs the
-            # gathered dense output. This validates generation/gather/mask logic.
-            if not valid_mask.any():
-                # All-empty selections (e.g. seq_len_kv:0 edge case): nothing to compare; the sparse
-                # kernel flow below must still run (empty selection is a legal metadata case)
-                print("Sparse reference harness check skipped (no valid positions)")
-            elif seq_len_q * num_max_sparse_blocks * sparse_block_kv > (1 << 25):
-                # FP32 torch recompute materializes q_width x head_dim gathered KV (~256B/position);
-                # skip on V4.1-scale cases (candidate_topk_blocks=2048) to avoid tens-of-GB spikes —
-                # the dense-gather bitwise compare below remains the correctness check
-                print("Sparse reference harness check skipped (case too large for FP32 recompute)")
-            else:
-                kv_offsets = torch.arange(sparse_block_kv, device='cuda', dtype=torch.int64)
-                block_offsets = (context_starts % sparse_block_kv).to(torch.int64)
-                token_indices = (sparse_indices.long().unsqueeze(-1) * sparse_block_kv
-                                 + block_offsets[:, None, None] + kv_offsets).flatten(1)
-                kv_gathered = kv_dequant[token_indices.clamp(min=0, max=num_kv_tokens - 1)]
-                ref_logits = ref_sparse_mqa_logits(q_dequant, kv_gathered, weights, valid_mask)
-                diff = calc_diff(gathered_ref.masked_fill(~valid_mask, 0).float(), ref_logits.float())
-                threshold = 1.5e-3
-                if torch.isnan(diff) or diff >= threshold:
-                    print(f"ERROR: Sparse reference harness check failed, diff={diff}")
-                    exit(1)
+            if not is_int8:
+                # Reference harness self-check: FP32 torch recompute at the gathered positions vs the
+                # gathered dense output. This validates generation/gather/mask logic.
+                if not valid_mask.any():
+                    # All-empty selections (e.g. seq_len_kv:0 edge case): nothing to compare; the sparse
+                    # kernel flow below must still run (empty selection is a legal metadata case)
+                    print("Sparse reference harness check skipped (no valid positions)")
+                elif seq_len_q * num_max_sparse_blocks * sparse_block_kv > (1 << 25):
+                    # FP32 torch recompute materializes q_width x head_dim gathered KV (~256B/position);
+                    # skip on V4.1-scale cases (candidate_topk_blocks=2048) to avoid tens-of-GB spikes —
+                    # the dense-gather bitwise compare below remains the correctness check
+                    print("Sparse reference harness check skipped (case too large for FP32 recompute)")
                 else:
-                    print("Sparse reference harness check passed")
+                    kv_offsets = torch.arange(sparse_block_kv, device='cuda', dtype=torch.int64)
+                    block_offsets = (context_starts % sparse_block_kv).to(torch.int64)
+                    token_indices = (sparse_indices.long().unsqueeze(-1) * sparse_block_kv
+                                     + block_offsets[:, None, None] + kv_offsets).flatten(1)
+                    kv_gathered = kv_dequant[token_indices.clamp(min=0, max=num_kv_tokens - 1)]
+                    ref_logits = ref_sparse_mqa_logits(q_dequant, kv_gathered, weights, valid_mask)
+                    diff = calc_diff(gathered_ref.masked_fill(~valid_mask, 0).float(), ref_logits.float())
+                    threshold = 1.5e-3
+                    if torch.isnan(diff) or diff >= threshold:
+                        print(f"ERROR: Sparse reference harness check failed, diff={diff}")
+                        exit(1)
+                    else:
+                        print("Sparse reference harness check passed")
 
     metadata = deep_gemm.get_sparse_mqa_logits_metadata(
         cu_seq_len_k_start=context_starts, cu_seq_len_k_end=context_ends, num_kv_tokens=int(num_kv_tokens),
-        sparse_kv_block_indices=sparse_indices, qk_dtype=q_in[0].dtype,
+        sparse_kv_block_indices=sparse_indices, qk_dtype=torch.int8,
         sparse_block_kv=sparse_block_kv, use_unaligned_ks=use_unaligned_ks)
     if args.get('check_metadata', 0) and get_acc_check():
         # Decode the kernel's metadata and verify against the Python reference
@@ -3245,22 +3658,19 @@ def test_sparse_mqa_logits(args) -> None:
         num_contiguous = sum(s["is_contiguous"] for s in decoded["splits"])
         print(f"Contiguous splits: {num_contiguous}/{decoded['num_kv_splits']}")
         print("Metadata check passed")
-    sparse_logits = deep_gemm.fp8_fp4_sparse_mqa_logits(
-        q=q_in, kv=kv_in, weights=weights, metadata=metadata,
-        num_max_sparse_blocks=num_max_sparse_blocks, sparse_block_kv=sparse_block_kv,
-        use_unaligned_ks=use_unaligned_ks)
+    sparse_kernel = deep_gemm.int8_sparse_mqa_logits if is_int8 else deep_gemm.fp8_fp4_sparse_mqa_logits
+    sparse_logits = sparse_kernel(q_in, kv_in, weights, metadata, num_max_sparse_blocks,
+                                  sparse_block_kv, use_unaligned_ks=use_unaligned_ks)
 
     # Bitwise comparison against the gathered dense output (single kernel call per UT convention)
     if get_acc_check():
-        if not torch.equal(sparse_logits[valid_mask], gathered_ref[valid_mask]):
+        if not torch.equal(sparse_logits[:, :valid_mask.size(1)][valid_mask], gathered_ref[valid_mask]):
             print("ERROR: sparse MQA logits mismatch against gathered dense reference")
             exit(1)
         print("Accuracy check passed\n")
     return
 
 def test_batch_gemm(args) -> None:
-    if args['data_type'] == torch.bfloat16:
-        return test_native_batch_gemm(args)
     # BatchGemm describes [groups, m, k] @ [groups, n, k].T using einsum.
     normalized = dict(args)
     for axis, field in (("b", "m"), ("h", "groups"), ("r", "k"), ("d", "n")):
@@ -3344,18 +3754,18 @@ def test_mega_mhc(args):
     mode = args.get('mode', 'shifted')
     if dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise ValueError('MegaMhc supports data_type:bf16 or fp8')
-    if mode != 'shifted':
-        raise ValueError('MegaMhc only supports V4.1 Flash shifted mode')
+    if mode not in ('shifted', 'normal'):
+        raise ValueError('MegaMhc supports mode:shifted or normal')
     if dtype == torch.bfloat16 and ('sf_layout' in args or 'shared_sf_block_m' in args):
         raise ValueError('MegaMhc BF16 output does not use scale layouts')
     if get_acc_check() and get_ref_backend() != 'device':
         raise ValueError("ref_backend only supports 'device' for MegaMhc")
-    kwargs = dict(tokens=args['m'], hidden=args.get('hidden', 5120),
+    kwargs = dict(tokens=args['m'], hidden=args.get('hidden', 4096 if mode == 'normal' else 5120),
                   num_sinkhorn_iters=args.get('sinkhorn_iters', 20),
                   benchmark=get_benchmark(), check_accuracy=get_acc_check(),
                   sf_layout=args.get('sf_layout', 'col') if dtype == torch.float8_e4m3fn else 'bf16',
                   shared_sf_block_m=args.get('shared_sf_block_m', 224),
-                  store_bf16=args.get('store_bf16', 1))
+                  store_bf16=args.get('store_bf16', 1), mode=mode)
     if kwargs['store_bf16'] not in (0, 1):
         raise ValueError('MegaMhc store_bf16 must be 0 or 1')
     if dtype == torch.float8_e4m3fn and kwargs['sf_layout'] not in ('col', 'extra', 'token'):
@@ -3365,10 +3775,105 @@ def test_mega_mhc(args):
     try:
         if num_sms is not None:
             deep_gemm.set_num_sms(num_sms)
+        if args.get('case') == 'layout' and get_acc_check():
+            from test_mega_mhc import check_layout
+            return check_layout(kwargs['tokens'])
+        if args.get('case') == 'interface_graph':
+            from test_mega_mhc import check_graph
+            if os.environ.get('HGGC_WARM_UP') or deep_gemm.get_compile_mode() == 1:
+                return check_graph(warmup=True, mode=mode)
+            if get_acc_check():
+                from test_mega_mhc import check_interface
+                check_interface()
+                return check_graph(mode=mode)
         return check(**kwargs)
     finally:
         if num_sms is not None:
             deep_gemm.set_num_sms(original_num_sms)
+
+
+@torch.no_grad()
+def test_mega_gate(args):
+    from test_mega_gate import make_inputs, make_outputs, run_mega_gate, run_reference_gemm, check_topk_weights
+
+    if args['data_type'] != torch.bfloat16:
+        raise ValueError('MegaGate only supports data_type:bf16')
+    scoring_func = args.get('scoring_func', 'sqrtsoftplus')
+    if scoring_func not in ('sqrtsoftplus', 'sigmoid'):
+        raise ValueError(f'Unsupported MegaGate scoring_func: {scoring_func}')
+    if get_acc_check() and get_ref_backend() != 'device':
+        raise ValueError("MegaGate accuracy checks require --ref_backend=device")
+
+    def flag(name, default=False):
+        value = args.get(name, int(default))
+        if value not in (0, 1):
+            raise ValueError(f'{name} requires 0 or 1')
+        return bool(value)
+
+    t, h, e = args['num_tokens'], args['hidden'], args['num_routed_experts']
+    topk, shared = args.get('num_topk', 6), args.get('num_shared_experts', 1)
+    use_shared = flag('use_shared_as_routed')
+    with_unmapped = flag('with_unmapped_topk_idx')
+    with_fixed, with_random = flag('with_fix_routing_mask'), flag('with_force_random')
+    if with_fixed and not with_unmapped:
+        raise ValueError('with_fix_routing_mask requires with_unmapped_topk_idx:1')
+    scale, rank = args.get('routed_scaling_factor', 1.5), args.get('ep_rank', 0)
+    inputs = make_inputs(t, h, e, use_shared, with_bias=flag('with_bias', True),
+                         with_image_bias=flag('with_image_bias'), with_mask=flag('with_mask'),
+                         with_physical_map=flag('with_physical_map', True), num_shared_experts=shared)
+    outputs = make_outputs(inputs, use_shared, with_unmapped, topk, shared)
+    token = torch.arange(t, device='cuda')
+    fixed = token % 3 == 0 if with_fixed else None
+    random_mask = token % 5 == 0 if with_random else None
+    if with_fixed:
+        fixed_indices = torch.rand((t, e), device='cuda').topk(topk, dim=1).indices
+        outputs['unmapped_topk_idx'].copy_(fixed_indices)
+
+    def test_func():
+        return run_mega_gate(inputs, outputs, use_shared, num_topk=topk, num_shared_experts=shared,
+                             routed_scaling_factor=scale, ep_rank=rank,
+                             fix_routing_mask=fixed, force_random=random_mask, scoring_func=scoring_func)
+
+    test_func()
+    if get_acc_check():
+        logits = run_reference_gemm(inputs)
+        diff = check_topk_weights(inputs, outputs, logits, inputs['mask'], random_mask, fixed,
+                                  num_topk=topk, routed_scaling_factor=scale, scoring_func=scoring_func)
+        active = inputs['mask'] if inputs['mask'] is not None else torch.ones_like(token, dtype=torch.bool)
+        if with_unmapped:
+            # Random routing samples physical IDs directly and has no logical mapping.
+            mapped = active if random_mask is None else active & ~random_mask
+            logical = outputs['unmapped_topk_idx'][mapped]
+            if use_shared:
+                shared_ids = torch.arange(e, e + shared, device=token.device, dtype=torch.int64)
+                logical = torch.cat([logical, shared_ids.expand(logical.shape[0], -1)], dim=1)
+            expected = logical
+            if inputs['to_physical_map'] is not None:
+                token_hash = (rank + token[mapped, None] * 23333) & 0xFFFFFFFF
+                replica = token_hash % inputs['logical_count'][logical]
+                expected = inputs['to_physical_map'][logical, replica]
+            assert torch.equal(outputs['topk_idx'][mapped], expected), 'Physical expert IDs mismatch'
+        if with_fixed:
+            kept = active & fixed
+            if with_random:
+                kept &= ~random_mask
+            assert torch.equal(outputs['unmapped_topk_idx'][kept], fixed_indices[kept])
+        if with_random:
+            sampled = active & random_mask
+            ids, weights = outputs['topk_idx'][sampled], outputs['topk_weights'][sampled]
+            count = inputs['logical_count'].sum() if inputs['logical_count'] is not None else e + (shared if use_shared else 0)
+            assert torch.all((ids >= 0) & (ids < count)).item()
+            assert torch.all(weights > 0).item()
+            ordered = ids.sort(dim=1).values
+            assert torch.all(ordered[:, 1:] != ordered[:, :-1]).item()
+            if with_unmapped:
+                assert torch.all(outputs['unmapped_topk_idx'][sampled] == -1).item()
+        print(f'Passed with acc_check, diff={diff:.3g}\n')
+    else:
+        print('Passed without acc_check\n')
+    if get_benchmark():
+        elapsed = bench_kineto(test_func, 'mega_gate', suppress_kineto_output=True)
+        print(f' > MegaGate (T={t}, H={h}, E={e}, topk={topk}): {elapsed * 1e6:.3f} us')
 
 
 def read_cmds_from_file(casefile):

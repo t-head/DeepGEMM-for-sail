@@ -36,6 +36,7 @@
 #include <deep_gemm/common/utils_cutlass3.cuh>
 #include <deep_gemm/layout/dispatch_layout.cuh>
 #include <deep_gemm/tix/ld_st.cuh>
+#include <deep_gemm/comm/barrier.cuh>
 #include <math.h>
 
 namespace cutlass::gemm::collective {
@@ -516,17 +517,7 @@ struct CollectiveMmaScaleFp4
         if (warp_idx == 0 && ks_flags != nullptr &&
             ks_loaded_k >= ks_next_bnd) {
           const uint32_t stripe_ready = ks_cur_stripe + 1;
-          // Generation is an independent full-width field.  The pointer already
-          // names this tile's global M-block flag, so no M-block bits are packed
-          // into the value consumed here.  Three low bits are reserved for the
-          // monotonically increasing stripe number. The accepted window contains
-          // only this generation's completed stripes; reused tags are cleared
-          // before metadata-ready is published.
-          const uint32_t tagged_ready =
-              (ks_generation << 3) | stripe_ready;
-          constexpr uint32_t kTagWindowEnd = 7u;
-          while (deep_gemm::tix::ld_ready_flag_uncached(ks_flags) - tagged_ready >
-                 kTagWindowEnd - stripe_ready) { }
+          deep_gemm::comm::wait_copy_stripe(ks_flags, ks_generation, stripe_ready);
           ++ks_cur_stripe;
           ks_next_bnd += ks_ktpf;
         }

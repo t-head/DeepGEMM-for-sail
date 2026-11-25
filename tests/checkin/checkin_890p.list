@@ -99,6 +99,22 @@ MegaMhc,data_type:bf16,m:9984,hidden:5120,mode:shifted,sinkhorn_iters:20
 MegaMhc,data_type:fp8,m:1248,hidden:5120,mode:shifted,sinkhorn_iters:20,sf_layout:token,store_bf16:1
 MegaMhc,data_type:fp8,m:1248,hidden:5120,mode:shifted,sinkhorn_iters:20,sf_layout:col,store_bf16:1
 MegaMhc,data_type:fp8,m:1248,hidden:5120,mode:shifted,sinkhorn_iters:20,sf_layout:extra,shared_sf_block_m:224,store_bf16:1
+MegaMhc,data_type:bf16,m:65,hidden:4096,mode:normal,sinkhorn_iters:20
+MegaMhc,data_type:bf16,m:624,hidden:4096,mode:normal,sinkhorn_iters:20
+MegaMhc,data_type:bf16,m:1024,hidden:4096,mode:normal,sinkhorn_iters:20
+MegaMhc,data_type:bf16,m:1024,hidden:4096,mode:normal,sinkhorn_iters:20,case:interface_graph
+MegaMhc,data_type:bf16,m:8192,hidden:4096,mode:normal,sinkhorn_iters:20
+MegaMhc,data_type:fp8,m:1025,hidden:7168,mode:normal,sinkhorn_iters:20,sf_layout:col,store_bf16:1
+MegaMhc,data_type:fp8,m:1025,hidden:7168,mode:normal,sinkhorn_iters:20,sf_layout:extra,shared_sf_block_m:224,store_bf16:1
+
+# ============ MegaGate ============
+
+MegaGate,data_type:bf16,num_tokens:16,hidden:5120,num_routed_experts:384,num_topk:6
+MegaGate,data_type:bf16,num_tokens:129,hidden:5120,num_routed_experts:384,num_topk:6,use_shared_as_routed:1,with_image_bias:1,with_mask:1,with_unmapped_topk_idx:1,routed_scaling_factor:1.25,ep_rank:1
+MegaGate,data_type:bf16,num_tokens:8192,hidden:5120,num_routed_experts:384,num_topk:6
+MegaGate,data_type:bf16,num_tokens:32,hidden:5120,num_routed_experts:128,num_topk:3,with_bias:0,with_physical_map:0
+MegaGate,data_type:bf16,num_tokens:8192,hidden:5120,num_routed_experts:128,num_topk:3
+MegaGate,data_type:bf16,num_tokens:128,hidden:6144,num_routed_experts:256,num_topk:8,scoring_func:sigmoid,with_mask:1,with_unmapped_topk_idx:1,with_fix_routing_mask:1,with_force_random:1
 
 # ============ BatchGemm ============
 
@@ -228,6 +244,29 @@ GroupedNoPad,data_type:w4a8_nvfp4,groups:6,m:512,n:7168,k:5120,distribution:[86,
 GroupedContiguous,data_type:bf16,groups:16,m:4096,n:4096,k:7168,distribution:gaussian
 GroupedContiguous,data_type:bf16,groups:32,m:8192,n:2048,k:2048,distribution:uniform
 
+# Optional C with row IDs and prefix sums, including repeated in-place accumulation.
+GroupedContiguous,data_type:bf16,groups:4,m:479,n:256,k:256,distribution:[119,0,247,113],bf16_regression:accumulation,configs:[1,128,128,64,32,32,3],c_offset:1
+GroupedContiguous,data_type:bf16,groups:5,m:143,n:456,k:192,distribution:[0,3,139,1,0],bf16_regression:accumulation,configs:[1,128,256,64,32,64,2],use_psum_layout:1
+
+# Transposed B with N/K tails and an empty expert.
+GroupedContiguous,data_type:bf16,groups:3,m:146,n:136,k:72,distribution:[17,0,129],bf16_regression:layout,b_layout:mn_major,c_offset:1,accumulation_modes:["overwrite","separate","alias"]
+GroupedContiguous,data_type:bf16,groups:3,m:146,n:136,k:72,distribution:[17,0,129],bf16_regression:layout,b_layout:mn_major,use_psum_layout:1,accumulation_modes:["overwrite","separate","alias"]
+
+# Independent A/D capacities and Graph replay with dynamic prefix sums.
+GroupedContiguous,data_type:bf16,groups:2,m:392,n:136,k:72,distribution:[256,136],bf16_regression:layout,a_rows:400,d_rows:408,configs:[1,256,256,64,64,64,3],graph_ends:[[128,136],[0,0],[256,392]]
+GroupedContiguous,data_type:bf16,groups:2,m:392,n:136,k:72,distribution:[256,136],bf16_regression:layout,a_rows:408,d_rows:400,configs:[1,256,256,64,64,64,3]
+
+# Odd N no-C writeback must preserve the spare output row.
+GroupedContiguous,data_type:bf16,groups:1,m:1,n:137,k:64,distribution:[1],bf16_regression:layout,a_rows:2,d_rows:2,accumulate:none
+
+# All-padding no-C tile and wide tile spanning experts with C.
+GroupedContiguous,data_type:bf16,groups:1,m:256,n:256,k:64,distribution:[128],bf16_regression:layout,a_rows:384,d_rows:400,leading_padding:128,configs:[1,128,128,64,32,32,3]
+GroupedContiguous,data_type:bf16,groups:2,m:319,n:256,k:192,distribution:[128,63],bf16_regression:layout,a_rows:319,d_rows:319,leading_padding:128,configs:[1,256,256,64,64,64,3],accumulate:alias
+
+# API compatibility and prefix sums exceeding either buffer's capacity.
+GroupedContiguous,data_type:bf16,groups:1,m:128,n:128,k:64,distribution:[128],bf16_regression:accumulation,regression_part:interface,configs:[1,128,128,64,32,32,3]
+GroupedContiguous,data_type:bf16,groups:3,m:5,n:136,k:72,distribution:[0,3,2],bf16_regression:accumulation,regression_part:invalid_ends
+
 # --- GroupedContiguous / int8 ---
 GroupedContiguous,data_type:int8,groups:4,m:128,n:512,k:1024,distribution:uniform
 
@@ -287,6 +326,9 @@ GroupedFused,data_type:w4a8_nvfp4,groups:4,num_token:17,topk:3,n:256,k:256,execu
 # ============ MqaLogits ============
 
 # --- MqaLogits / fp8 ---
+MqaLogits,data_type:fp8,seq_len_q:129,seq_len_kv:512,num_heads:8,head_dim:64,compressed_logits:1
+MqaLogits,data_type:fp8,seq_len_q:129,seq_len_kv:512,num_heads:8,head_dim:128,compressed_logits:1
+MqaLogits,data_type:fp8,seq_len_q:513,seq_len_kv:32768,num_heads:8,head_dim:128,compressed_logits:1
 MqaLogits,data_type:fp8,seq_len_q:129,seq_len_kv:512,num_heads:64,head_dim:64
 MqaLogits,data_type:fp8,seq_len_q:1024,seq_len_kv:1024,num_heads:64,head_dim:128
 MqaLogits,data_type:fp8,seq_len_q:8192,seq_len_kv:8192,num_heads:64,head_dim:128
@@ -300,6 +342,11 @@ MqaLogits,data_type:fp4,seq_len_q:1024,seq_len_kv:8192,num_heads:64,head_dim:128
 # ============ PagedMqaLogits ============
 
 # --- PagedMqaLogits / fp8 ---
+PagedMqaLogits,data_type:fp8,batch_size:4,next_n:1,num_heads:8,head_dim:64,distribution:[0,1,127,257],page_kv:64,max_context_len:512
+PagedMqaLogits,data_type:fp8,batch_size:10,next_n:1,num_heads:8,head_dim:64,page_kv:128,is_varlen:1,varlen_indices:[0,0,0,0,0,0,0,1,2,2],context_lens:[257,0,1,63,129,128,65,0,256,1],max_context_len:257
+PagedMqaLogits,data_type:fp8,batch_size:4,next_n:1,num_heads:8,head_dim:128,distribution:[0,1,127,257],page_kv:64,max_context_len:512
+PagedMqaLogits,data_type:fp8,batch_size:10,next_n:1,num_heads:8,head_dim:128,page_kv:128,is_varlen:1,varlen_indices:[0,0,0,0,0,0,0,1,2,2],context_lens:[257,0,1,63,129,128,65,0,256,1],max_context_len:257
+PagedMqaLogits,data_type:fp8,batch_size:20,next_n:1,num_heads:8,head_dim:128,page_kv:128,is_varlen:1,varlen_indices:[0,0,0,0,0,1,1,1,1,1,2,2,2,2,2,3,3,3,3,3],distribution:[8188,8188,8188,8188],max_context_len:8192
 PagedMqaLogits,data_type:fp8,batch_size:4,next_n:1,num_heads:64,head_dim:64,distribution:[0,1,127,512],page_kv:64,max_context_len:1024
 PagedMqaLogits,data_type:fp8,batch_size:4,next_n:1,num_heads:64,head_dim:128,distribution:[20,10,0,0],page_kv:32,logits_dtype:fp32
 PagedMqaLogits,data_type:fp8,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192,page_kv:128,logits_dtype:fp32
@@ -307,6 +354,12 @@ PagedMqaLogits,data_type:fp8,batch_size:64,next_n:1,num_heads:64,head_dim:128,av
 # --- PagedMqaLogits / fp4 ---
 PagedMqaLogits,data_type:fp4,batch_size:16,next_n:1,num_heads:32,head_dim:128,distribution:[4090,0,1,0,1,0,1,0,1,0,1,0,1,0,1,1],page_kv:64
 PagedMqaLogits,data_type:fp4,batch_size:64,next_n:1,num_heads:64,head_dim:128,avg_context_len:8192,page_kv:64
+# Request-grouped FP4 DSA: ragged masks, generic run shapes and multi-cluster KV reuse.
+PagedMqaLogits,data_type:fp4,batch_size:15,next_n:1,num_heads:32,head_dim:128,is_varlen:1,varlen_indices:[0,1,1,1,2,2,2,2,2,3,3,4,4,4,4],context_lens:[1,0,33,64,65,1,127,128,129,1,255,257,63,0,513],page_kv:32,max_context_len:1024
+PagedMqaLogits,data_type:fp4,batch_size:8,next_n:1,num_heads:32,head_dim:128,is_varlen:1,varlen_indices:[0,0,0,0,0,0,0,0],context_lens:[33,64,127,128,129,255,256,257],page_kv:64,max_context_len:512
+PagedMqaLogits,data_type:fp4,batch_size:1,next_n:1,num_heads:32,head_dim:128,is_varlen:1,varlen_indices:[0],context_lens:[0],page_kv:64,max_context_len:256
+PagedMqaLogits,data_type:fp4,batch_size:6,next_n:1,num_heads:32,head_dim:128,is_varlen:1,varlen_indices:[0,0,0,0,0,0],context_lens:[131072,131071,65537,0,131069,131073],page_kv:128,max_context_len:131584
+PagedMqaLogits,data_type:fp4,batch_size:7,next_n:1,num_heads:64,head_dim:128,is_varlen:1,varlen_indices:[0,0,0,1,1,1,1],context_lens:[257,0,4097,128,129,63,4096],page_kv:64,max_context_len:4608
 
 # ============ MqaAvgLogits ============
 
@@ -326,6 +379,12 @@ MqaAvgLogits,data_type:fp4,seq_len_q:4096,seq_len_kv:4096,num_heads:4,head_dim:1
 MqaAvgLogits,data_type:fp4,seq_len_q:4096,seq_len_kv:4096,num_heads:4,head_dim:128,q_scale:1,logits_dtype:bf16,compressed_logits:1
 MqaAvgLogits,data_type:fp4,seq_len_q:4096,seq_len_kv:4096,num_heads:4,head_dim:128,q_scale:2,logits_dtype:bf16,compressed_logits:1
 
+# --- MqaAvgLogits / fp4 H8 ---
+# BF16 compressed output: three Q-scale modes and Q/KV tails.
+MqaAvgLogits,data_type:fp4,seq_len_q:129,seq_len_kv:258,num_heads:8,head_dim:128,q_scale:0,logits_dtype:bf16,compressed_logits:1
+MqaAvgLogits,data_type:fp4,seq_len_q:257,seq_len_kv:1025,num_heads:8,head_dim:128,q_scale:1,logits_dtype:bf16,compressed_logits:1
+MqaAvgLogits,data_type:fp4,seq_len_q:1025,seq_len_kv:2049,num_heads:8,head_dim:128,q_scale:2,logits_dtype:bf16,compressed_logits:1
+
 # ============ PagedMqaAvgLogits ============
 
 # --- PagedMqaAvgLogits / fp8 ---
@@ -340,6 +399,12 @@ PagedMqaAvgLogits,data_type:fp4,batch_size:7,next_n:4,num_heads:4,head_dim:128,d
 PagedMqaAvgLogits,data_type:fp4,batch_size:1249,next_n:5,num_heads:4,head_dim:128,context_pattern:[17,0,1,63,64,65,129,257,513],page_kv:64,max_context_len:1024,logits_dtype:fp32
 PagedMqaAvgLogits,data_type:fp4,batch_size:1,next_n:6,num_heads:4,head_dim:128,distribution:[129],page_kv:128,max_context_len:256,logits_dtype:bf16
 
+# --- PagedMqaAvgLogits / fp4 H8 ---
+# next_n 1/3/5 cover each pair, partial Q tiles, page boundaries and request switches.
+PagedMqaAvgLogits,data_type:fp4,batch_size:1249,next_n:1,num_heads:8,head_dim:128,page_kv:32,logits_dtype:bf16,context_pattern:[0,1,63,31,32,33,65],max_context_len:96
+PagedMqaAvgLogits,data_type:fp4,batch_size:7,next_n:3,num_heads:8,head_dim:128,page_kv:192,logits_dtype:bf16,context_pattern:[0,1,63,191,192,193,385],max_context_len:576
+PagedMqaAvgLogits,data_type:fp4,batch_size:7,next_n:5,num_heads:8,head_dim:128,page_kv:512,logits_dtype:bf16,context_pattern:[0,1,63,511,512,513,1025],max_context_len:1536
+
 # ============ SparseMqaLogits ============
 
 # --- SparseMqaLogits / fp4 ---
@@ -352,6 +417,7 @@ SparseMqaLogits,data_type:fp4,seq_len_q:2,seq_len_kv:0,num_heads:32,head_dim:128
 # ============ PagedSparseMqaLogits ============
 
 # --- PagedSparseMqaLogits / fp4 ---
+PagedSparseMqaLogits,data_type:fp4,seq_len_q:1,seq_len_kv:0,sparse_block_kv:8,num_max_sparse_blocks:4,check_metadata:1
 PagedSparseMqaLogits,data_type:fp4,seq_len_q:313,seq_len_kv:1023,num_heads:32,head_dim:128,sparse_block_kv:8,num_max_sparse_blocks:128,check_metadata:1
 PagedSparseMqaLogits,data_type:fp4,seq_len_q:512,seq_len_kv:65536,num_heads:32,head_dim:128,sparse_block_kv:16,num_max_sparse_blocks:128,check_metadata:1
 

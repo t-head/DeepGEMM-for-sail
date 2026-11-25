@@ -1,15 +1,13 @@
 #pragma once
 
-#include <deep_gemm/layout/mega_moe.cuh>
-#include <deep_gemm/scheduler/sm89_mega_moe.cuh>
-
+#include <cstdint>
+#include <type_traits>
+#include <utility>
 #include <hggc_runtime.h>
+#include <deep_gemm/layout/dispatch_layout.cuh>
+#include <deep_gemm/layout/mega_moe.cuh>
 
-#include <deep_gemm/common/exception.cuh>
-#include <deep_gemm/impls/expert_preprocess.cuh>
-#include <deep_gemm/mma/fp4_mma.cuh>
-
-namespace deep_gemm {
+namespace deep_gemm::mega_moe_common {
 
 // Copy CTAs reuse GEMM shared storage for the current M-block's rank metadata.
 template <uint32_t BlockM, uint32_t NumRanks>
@@ -19,17 +17,13 @@ struct alignas(16) CopyRankMetadataShared {
     uint64_t row_addr[BlockM];
 };
 
-__device__ __forceinline__ uint32_t resolve_fused_round_generation(const volatile layout::MegaMoESignals& signals) {
-    // Stream order makes one cached load enough to read Quant's generation.
-    return signals.preprocess_ready[0] & ~kPreprocessMetadataReadyBit;
-}
-
-// Turn CTA0's rank prefixes into row addresses for this M-block.
+// Turn CTA0's rank prefixes into row addresses. RowBytes is the physical byte stride,
+// including packed FP4 rows.
 template <uint32_t BlockM, uint32_t NumRanks,
-          uint32_t ShapeK,
-          uint32_t SourceCapacity, uint32_t TopK>
+          uint32_t RowBytes,
+          uint32_t SourceCapacity, uint32_t TopK, class SchedulerArguments>
 __device__ __forceinline__ void build_copy_row_map(
-    const sched::MegaMoESchedulerArguments& sched, uint32_t expert_local,
+    const SchedulerArguments& sched, uint32_t expert_local,
     uint32_t m_block_in_expert, uint32_t generation,
     CopyRankMetadataShared<BlockM, NumRanks>& metadata) {
     const auto* token_topk = sched.dispatch_token_topk +
@@ -55,9 +49,9 @@ __device__ __forceinline__ void build_copy_row_map(
         const uint64_t source_index = (uint64_t(expert_local) * NumRanks + owner) * SourceCapacity +
             (query - begin);
         const uint32_t source_token = __ldbl(token_topk + source_index) / TopK;
-        const uint8_t* source = sched.sym_buffer.map(sched.dispatch_fp4, owner);
+        const uint8_t* source = sched.sym_buffer.map(sched.dispatch_data, owner);
         metadata.row_addr[row] = reinterpret_cast<uint64_t>(source) +
-            static_cast<uint64_t>(source_token) * ShapeK;
+            static_cast<uint64_t>(source_token) * RowBytes;
     }
     // Finish row lookup before replacing the global prefixes.
     __syncthreads();
@@ -91,6 +85,13 @@ __device__ __forceinline__ int4 ld_bulk_class(const int4* ptr) {
     return *reinterpret_cast<const int4*>(&v);
 }
 
+// Compile-time indices keep bulk-copy temporaries in registers without tying
+// the shared transport to one ACTLIZE generation.
+template <class Function, size_t... Indices>
+__device__ __forceinline__ void for_each_copy_index(std::index_sequence<Indices...>, Function f) {
+    (f(std::integral_constant<size_t, Indices>{}), ...);
+}
+
 // Load a row window, then store it with the matching bulk instructions.
 template <bool UseRemote, uint32_t ChunksPerRow, uint32_t RowDepth,
           bool HalfLastWave = false>
@@ -101,7 +102,7 @@ __device__ __forceinline__ void copy_bulk_window(
     constexpr uint32_t kBulkLanes = 32;
     const int4* sources[RowDepth];
     int4* destinations[RowDepth];
-    cute::for_each(cute::make_int_sequence<RowDepth>{}, [&](auto r) {
+    for_each_copy_index(std::make_index_sequence<RowDepth>{}, [&](auto r) {
         constexpr uint32_t kR = decltype(r)::value;
         uint32_t compact_row = row0 + kR * row_stride;
         uint32_t global_row;
@@ -117,9 +118,9 @@ __device__ __forceinline__ void copy_bulk_window(
     });
     int4 values[RowDepth][ChunksPerRow];
     uint2 half_values[RowDepth];
-    cute::for_each(cute::make_int_sequence<RowDepth>{}, [&](auto r) {
+    for_each_copy_index(std::make_index_sequence<RowDepth>{}, [&](auto r) {
         constexpr uint32_t kR = decltype(r)::value;
-        cute::for_each(cute::make_int_sequence<ChunksPerRow>{}, [&](auto c) {
+        for_each_copy_index(std::make_index_sequence<ChunksPerRow>{}, [&](auto c) {
             constexpr uint32_t kC = decltype(c)::value;
             if constexpr (HalfLastWave && kC + 1 == ChunksPerRow) {
                 const auto* tail = (sources[kR] - lane) + kC * kBulkLanes;
@@ -133,9 +134,9 @@ __device__ __forceinline__ void copy_bulk_window(
             }
         });
     });
-    cute::for_each(cute::make_int_sequence<RowDepth>{}, [&](auto r) {
+    for_each_copy_index(std::make_index_sequence<RowDepth>{}, [&](auto r) {
         constexpr uint32_t kR = decltype(r)::value;
-        cute::for_each(cute::make_int_sequence<ChunksPerRow>{}, [&](auto c) {
+        for_each_copy_index(std::make_index_sequence<ChunksPerRow>{}, [&](auto c) {
             constexpr uint32_t kC = decltype(c)::value;
             if constexpr (HalfLastWave && kC + 1 == ChunksPerRow) {
                 auto* tail = (destinations[kR] - lane) + kC * kBulkLanes;
@@ -252,19 +253,19 @@ __device__ __forceinline__ void copy_rank_rows(
     };
 
     if (stripe_int4s == capacity_int4s) {
-        copy_stripe(cute::Int<FullStripeChunks>{}, cute::Int<0>{});
+        copy_stripe(std::integral_constant<int, FullStripeChunks>{}, std::integral_constant<int, 0>{});
     } else {
-        copy_stripe(cute::Int<LastStripeChunks>{}, cute::Int<HalfLastStripe>{});
+        copy_stripe(std::integral_constant<int, LastStripeChunks>{}, std::integral_constant<int, HalfLastStripe>{});
     }
 }
 
 template <uint32_t BlockM, uint32_t NumRanks,
           uint32_t BlockK,
           uint32_t KTilesPerFlag, uint32_t ShapeK, uint32_t NumThreads,
-          uint32_t SourceCapacity, uint32_t TopK>
+          uint32_t SourceCapacity, uint32_t TopK, class SchedulerArguments, class BeforePublish>
 __device__ void run_copy_block(
-    const sched::MegaMoESchedulerArguments& sched, uint32_t total_m_blocks,
-    char* smem_buf, uint32_t generation)
+    const SchedulerArguments& sched, uint32_t total_m_blocks,
+    char* smem_buf, uint32_t generation, BeforePublish before_publish)
 {
     constexpr uint32_t kStripeVectors = KTilesPerFlag * BlockK / 16;
     constexpr uint32_t kRowVectors = ShapeK / 16;
@@ -309,7 +310,7 @@ __device__ void run_copy_block(
 
         uint64_t row_base = static_cast<uint64_t>(gl.w) +
             static_cast<uint64_t>(m_block_in_expert) * BlockM;
-        auto* local_block_dst = reinterpret_cast<int4*>(sched.local_fp4_buf + row_base * ShapeK);
+        auto* local_block_dst = reinterpret_cast<int4*>(sched.local_data_buf + row_base * ShapeK);
 
         for (uint32_t ks = 0; ks < kNumStripes; ++ks) {
             uint32_t stripe_col_start =
@@ -330,6 +331,7 @@ __device__ void run_copy_block(
             __ppu_threadfence_uncache();
             __syncthreads();
             if (threadIdx.x == 0) {
+                before_publish(gl.x, ks + 1 == kNumStripes);
                 __stbl(const_cast<uint32_t*>(sched.copy_ready_flags + mb),
                        (generation << 3) | (ks + 1u));
             }
@@ -337,123 +339,4 @@ __device__ void run_copy_block(
     }
 }
 
-template <class TileScheduler, uint32_t BlockM, uint32_t NumThreads>
-__device__ __forceinline__ void prepare_expert_layout_and_reshape_sfa(
-    const sched::MegaMoESchedulerArguments& sched, layout::MegaMoESignals* signals,
-    char* smem_buf, uint32_t generation) {
-    constexpr uint32_t kNumRanks = TileScheduler::kNumRanks;
-    constexpr uint32_t kNumLocalExperts = TileScheduler::kNumGroups;
-    constexpr uint32_t kNumTotalExperts =
-        kNumRanks * kNumLocalExperts;
-    constexpr uint32_t kSourceCapacity =
-        TileScheduler::kSourceCapacity;
-    constexpr uint32_t kHidden = TileScheduler::SHAPE_K * 2;
-    constexpr uint32_t kSfaPartitions =
-        FusedSfaPartitionLayout::kNumPartitions;
-    constexpr uint32_t kReshapeWork =
-        kNumLocalExperts * kSfaPartitions;
-    const layout::MegaMoEBuffer buffers(
-        kNumRanks, kNumTotalExperts, kSourceCapacity, TileScheduler::kNumTopK,
-        kHidden, TileScheduler::SHAPE_N / 2, sched.staging);
-
-    volatile uint32_t* ready = signals->preprocess_ready;
-    uint32_t metadata_ready = kPreprocessMetadataReadyBit | generation;
-    auto* smem = reinterpret_cast<uint32_t*>(smem_buf);
-    uint32_t parity = generation & 1u;
-    const uint32_t* local_pushed_counts = buffers.staging_counts[parity].data<uint32_t>(signals);
-
-    if (blockIdx.x == 0) {
-        // Generation tags avoid clearing ready flags every round.
-        if (generation == 2u) {
-            // Clear every view's tagged flags before publishing metadata_ready.
-            const uint32_t num_copy_ready_flags = buffers.copy_ready.bytes / sizeof(uint32_t);
-            for (uint32_t i = threadIdx.x; i < num_copy_ready_flags;
-                 i += NumThreads)
-                __stbl(const_cast<uint32_t*>(sched.copy_ready_flags + i), 0u);
-            constexpr uint32_t kNumPreprocessReadyFlags =
-                layout::MegaMoESignals::kNumMaxExperts * kSfaPartitions;
-            for (uint32_t i = threadIdx.x; i < kNumPreprocessReadyFlags;
-                 i += NumThreads)
-                __stbl(const_cast<uint32_t*>(ready + 1 + i), 0u);
-        }
-
-        prepare_expert_metadata<
-            BlockM, kNumRanks, kNumLocalExperts, NumThreads>(
-                signals->dispatch_arrivals, generation, sched.copy_grouped_layout,
-                const_cast<uint32_t*>(sched.expert_rank_prefix), sched.expert_base,
-                reinterpret_cast<uint32_t*>(sched.grouped_layout), smem, local_pushed_counts,
-                sched.cumulative_local_expert_recv_stats, gridDim.x - TileScheduler::kNumCopyBlocks,
-                const_cast<uint32_t*>(ready + 1));
-
-        // Reset the GEMM1 tile counter before this round's metadata is ready.
-        // Header word zero remains the M-block count; records start at word four.
-        if (threadIdx.x == 0) sched.copy_grouped_layout[1] = 0;
-
-        // Publish metadata before its ready flag.
-        __threadfence();
-        __syncthreads();
-        if (threadIdx.x == 0)
-            __stbl(const_cast<uint32_t*>(ready), metadata_ready);
-    } else {
-        const bool is_compute_cta = blockIdx.x >= TileScheduler::kNumCopyBlocks;
-        if (threadIdx.x == 0) {
-            while (tix::ld_ready_flag_uncached(ready) != metadata_ready) { }
-        }
-        if (is_compute_cta) {
-            __syncthreads();
-            const uint32_t work_stride = gridDim.x - TileScheduler::kNumCopyBlocks;
-            if (__ldbl(sched.copy_grouped_layout + 2) != 0) {
-                const uint32_t total_m_blocks = __ldbl(sched.copy_grouped_layout);
-                for (uint32_t work = blockIdx.x - TileScheduler::kNumCopyBlocks;
-                     work < total_m_blocks; work += work_stride) {
-                    const int4 entry = __ldbl(reinterpret_cast<const int4*>(sched.copy_grouped_layout + 4) + work);
-                    if (threadIdx.x == 0)
-                        smem[kNumRanks] = entry.w;
-                    const uint32_t row_begin = (work - entry.z) * BlockM;
-                    reshape_sfa<kNumRanks, TileScheduler::kNumTopK, kSourceCapacity, kHidden, NumThreads, true>(
-                        buffers.staging_scales[parity].data<uint16_t>(signals),
-                        buffers.staging_tokens[parity].data<uint32_t>(signals), sched.expert_rank_prefix,
-                        entry.x, 0, sched.local_sfa_buf, smem, sched.src_info, row_begin, BlockM);
-                    __ppu_threadfence_uncache();
-                    __syncthreads();
-                    if (threadIdx.x == 0) {
-                        // Every chunk writes the whole K range. Count once;
-                        // the final writer publishes the remaining partitions.
-                        auto* flags = const_cast<uint32_t*>(ready + 1 +
-                            entry.x * kSfaPartitions);
-                        const uint32_t previous = atomicAdd(flags, 1u);
-                        if (previous + 1u == generation) {
-                            #pragma unroll
-                            for (uint32_t part = 1; part < kSfaPartitions; ++part)
-                                __stbl(flags + part, generation);
-                        }
-                    }
-                }
-            } else {
-                for (uint32_t work = blockIdx.x - TileScheduler::kNumCopyBlocks;
-                     work < kReshapeWork; work += work_stride) {
-                    const uint32_t expert_local = work / kSfaPartitions;
-                    if (threadIdx.x == 0)
-                        smem[kNumRanks] = __ldbl(sched.expert_base + expert_local);
-                    reshape_sfa<kNumRanks, TileScheduler::kNumTopK, kSourceCapacity, kHidden, NumThreads>(
-                        buffers.staging_scales[parity].data<uint16_t>(signals),
-                        buffers.staging_tokens[parity].data<uint32_t>(signals), sched.expert_rank_prefix,
-                        expert_local, work % kSfaPartitions, sched.local_sfa_buf, smem, sched.src_info);
-
-                    __ppu_threadfence_uncache();
-                    __syncthreads();
-                    if (threadIdx.x == 0) {
-                        __stbl(const_cast<uint32_t*>(
-                            ready + 1 + work), generation);
-                    }
-                }
-            }
-        }
-    }
-
-    // Finish readiness stores before returning.
-    __syncthreads();
-    __threadfence();
-}
-
-}  // namespace deep_gemm
+}  // namespace deep_gemm::mega_moe_common

@@ -34,8 +34,8 @@ if __name__ == "__main__":
 import deep_gemm
 from deep_gemm.testing import calc_diff
 from test_mega_moe import (
-    CASES, MAX_DIFF, _check_mega_moe,
-    _make_routes, _make_weights, _process_group, _reference_mega_moe,
+    CASES, INT8_CASES, MAX_DIFF, _check_mega_moe,
+    _make_routes, _make_weights, _mega_moe_entry, _pre_dispatch, _process_group, _reference_mega_moe,
     _relative_l2, _transform_weights,
 )
 
@@ -340,13 +340,13 @@ def _benchmark_case(case, group, args, buffer_type, skip_reason):
     # Match the correctness runner's generation order, including workspace capacity.
     source = torch.randn(case.capacity, case.hidden, device="cuda", dtype=torch.bfloat16,
                          generator=rng) * .5
-    w1_raw = _make_weights(case.experts // world, 2 * case.intermediate, case.hidden, .5, rng)
-    w2_raw = _make_weights(case.experts // world, case.hidden, case.intermediate, .125, rng)
+    w1_raw = _make_weights(case.experts // world, 2 * case.intermediate, case.hidden, .5, rng, case.precision)
+    w2_raw = _make_weights(case.experts // world, case.hidden, case.intermediate, .125, rng, case.precision)
     w1, w2, replica_options = _transform_weights(w1_raw, w2_raw, case.activation, args.replicas)
     baseline = None
     workspace = deep_gemm.SymmBuffer(
         group, case.experts, case.capacity, case.topk, case.hidden, case.intermediate,
-        activation=case.activation)
+        activation=case.activation, mma_type=case.mma_type)
     try:
         if buffer_type is not None:
             baseline = _DeepEPBaseline(buffer_type, case, group, w1_raw, w2_raw, args.baseline)
@@ -363,11 +363,8 @@ def _benchmark_case(case, group, args, buffer_type, skip_reason):
             y = torch.empty_like(x)
 
             def run_mega():
-                deep_gemm.mega_moe_pre_dispatch(
-                    x, routed_ids, routed_weights,
-                    workspace.x, workspace.x_sf, workspace.topk_idx, workspace.topk_weights,
-                    num_tokens=x.shape[0], group_size=32, mma_type="fp4xfp4")
-                deep_gemm.fp4_fp4_mega_moe(
+                _pre_dispatch(x, routed_ids, routed_weights, workspace)
+                _mega_moe_entry(case)(
                     y, w1, w2, workspace, activation=case.activation,
                     activation_clamp=case.clamp, fast_math=bool(args.fast_math),
                     situ_beta=case.situ_beta, situ_linear_beta=case.situ_linear_beta,
@@ -384,7 +381,8 @@ def _benchmark_case(case, group, args, buffer_type, skip_reason):
                 check=not args.no_check, reference_tokens=args.reference_tokens,
                 replicas=args.replicas, edge_cases=args.edge_cases, verbose=False,
                 routing_weights=routed_weights, routing_ids=routed_ids,
-                high_precision_reference=lambda checked: _reference_mega_moe(
+                max_relative_l2=0.015 if case.precision == "int8_channelwise" else None,
+                high_precision_reference=None if case.precision == "int8_channelwise" else lambda checked: _reference_mega_moe(
                     case, source, ids, weights, w1_raw, w2_raw, tokens, checked,
                     quantization_aware=False))
             mega_expected = run_mega().clone() if not args.no_check else None
@@ -486,15 +484,18 @@ def _benchmark_precision_case(case, group, args):
 
 def main(argv=None, *, cases=None):
     precision_parser = argparse.ArgumentParser(add_help=False)
-    precision_parser.add_argument("--precision", choices=("w4a4", "fp8_channelwise", "fp8_blockwise", "w4a16", "w4a8"))
+    precision_parser.add_argument("--precision", choices=("w4a4", "int8_channelwise", "fp8_channelwise", "fp8_blockwise", "w4a16", "w4a8"))
     selection, _ = precision_parser.parse_known_args(argv)
     if cases is None:
-        if selection.precision and selection.precision != "w4a4":
+        if selection.precision and selection.precision not in ("w4a4", "int8_channelwise"):
             from test_mega_moe_precisions import CASES as precision_cases
             cases = precision_cases
         else:
-            cases = CASES
-    if selection.precision:
+            cases = (*CASES, *INT8_CASES)
+    if selection.precision in ("w4a4", "int8_channelwise"):
+        cases = tuple(replace(c, precision=selection.precision)
+                      for c in cases if c.precision in ("w4a4", "int8_channelwise"))
+    elif selection.precision:
         cases = tuple(c for c in cases if c.precision == selection.precision)
 
     if not cases:
@@ -545,6 +546,9 @@ def main(argv=None, *, cases=None):
         parser.error("DeepEP normal requires eager timing because dispatch returns CPU expert counts; "
                      "both paths must use the same timing mode")
     with _process_group() as group:
+        arch = (8, 0) if case.precision == "int8_channelwise" else (8, 9)
+        if torch.cuda.get_device_capability() != arch:
+            raise ValueError(f"{case.precision} MegaMoE requires SM{arch[0]}{arch[1]}")
         world = dist.get_world_size()
         if args.ep is not None and world != args.ep:
             raise ValueError(f"--ep={args.ep} requires {args.ep} launched ranks; got {world}")
@@ -555,7 +559,7 @@ def main(argv=None, *, cases=None):
         buffer_type, skip_reason = _import_baseline() if args.baseline != "none" else (None, None)
         if skip_reason is not None and dist.get_rank() == 0:
             print("DeepEP baseline skipped: " + skip_reason, file=sys.stderr, flush=True)
-        if case.precision == "w4a4":
+        if case.precision in ("w4a4", "int8_channelwise"):
             _benchmark_case(case, group, args, buffer_type, skip_reason)
         else:
             _benchmark_precision_case(case, group, args)

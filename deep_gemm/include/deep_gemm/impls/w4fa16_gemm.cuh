@@ -1,5 +1,7 @@
 #pragma once
 #include <deep_gemm/impls/mega_moe_io.cuh>
+#include <deep_gemm/epilogue/gated_activation.cuh>
+#include <deep_gemm/epilogue/activation_quant_ops.cuh>
 #include <deep_gemm/scheduler/mega_moe_work_queue.cuh>
 #include <deep_gemm/scheduler/sm89_mega_moe.cuh>
 #pragma clang diagnostic push
@@ -33,8 +35,9 @@ template <int ShapeN, int ShapeK,
           int BlockM, int BlockN, int BlockK,
           int WarpM, int WarpN, int WarpK,
           int kNumGroups, int kNumStages, GemmType kGemmType,
-          int N_EXPAND = 1, bool kMoeScatter = false, bool kFusedSitu = false,
-          bool kUseReplicaWeights = false, bool kDynamicWork = false, int kNumRanks = 1>
+          int N_EXPAND = 1, bool kMoeScatter = false, bool kFusedActivation = false,
+          bool kUseReplicaWeights = false, bool kDynamicWork = false, int kNumRanks = 1,
+          deep_gemm::GatedActivation Activation = deep_gemm::GatedActivation::SiTU>
 class W4A16GEMM_MMA {
 public:
   using ElementA = cutlass::bfloat16_t;
@@ -46,10 +49,10 @@ public:
   // basic
   static constexpr bool Fused = (kGemmType == GemmType::MGroupedFused);
   static constexpr bool E8M0_scale = true;
-  static constexpr bool kExtendedParams = kMoeScatter || kFusedSitu || kUseReplicaWeights;
+  static constexpr bool kExtendedParams = kMoeScatter || kFusedActivation || kUseReplicaWeights;
   static_assert(!kMoeScatter || kGemmType == GemmType::MGroupedNoPad, "Scatter requires grouped no-pad");
-  static_assert(!kFusedSitu || kGemmType == GemmType::MGroupedNoPad, "SiTU requires grouped no-pad");
-  static_assert(!(kMoeScatter && kFusedSitu), "Scatter and SiTU are separate epilogues");
+  static_assert(!kFusedActivation || kGemmType == GemmType::MGroupedNoPad, "Gated activation requires grouped no-pad");
+  static_assert(!(kMoeScatter && kFusedActivation), "Scatter and gated activation are separate epilogues");
 
   static constexpr bool scale_use_ld_matrix = true;
   static constexpr int N = ShapeN;
@@ -84,7 +87,7 @@ public:
   using ArchTag = cutlass::arch::PPU0015;
   static constexpr int WarpsOnM = BlockM / WarpM;
   static constexpr int WarpsOnN = BlockN / WarpN;
-  static_assert(WarpN == 64 || (kFusedSitu && BlockM == 128 && WarpM == 128 && WarpN == 32),
+  static_assert(WarpN == 64 || (kFusedActivation && BlockM == 128 && WarpM == 128 && WarpN == 32),
                 "32-column warps require the BM128 SiTU layout");
   static constexpr int WarpsOnK = BlockK / WarpK;
 
@@ -386,7 +389,7 @@ public:
     const auto fetch_work = [&]() {
       if constexpr (!kDynamicWork) return deep_scheduler.fetch_next_work(m_block_idx, n_block_idx);
       else {
-        static_assert(kFusedSitu && kNumGroups < 128 && N_EXPAND == 1);
+        static_assert(kFusedActivation && kNumGroups < 128 && N_EXPAND == 1);
         const deep_gemm::mega_moe::WorkQueue queue{params.queue_counter, &queue_ticket};
         queue.prime(thread_idx);
         const uint32_t work = queue.current();
@@ -409,7 +412,7 @@ public:
       n_block_idx *= N_EXPAND;
       int activation_rows = 0;
       if constexpr (!Fused) activation_rows = deep_scheduler.curr_group_m;
-      if constexpr (kFusedSitu || kMoeScatter) {
+      if constexpr (kFusedActivation || kMoeScatter) {
         if (params.valid_m_rows != nullptr)
           activation_rows = __ldg(params.valid_m_rows + coord_l);
         // Keep padded expert offsets, but neither load nor compute empty tiles.
@@ -599,7 +602,7 @@ public:
 
         constexpr int align_elems = 2;
         Tensor tDcD = thr_mma.partition_C(cD);
-        if constexpr(kFusedSitu) {
+        if constexpr(kFusedActivation) {
 #if defined(__HGGC_ARCH__)
           static_assert(__HGGC_ARCH__ == 150,
                         "W4A16 fused SiTU requires PPU0015.");
@@ -612,15 +615,11 @@ public:
           // The PPU0015 m16n16 accumulator assigns one thread's G=8 physical
           // gate/up pair as [gate row0 x2, gate row1 x2, up row0 x2,
           // up row1 x2]. Pair these register fragments directly. This keeps
-          // the required FP32 -> BF16 activation boundary while eliminating
+          // FP32 gate/up values through activation while eliminating
           // the dense shared tile and both CTA barriers from the first fused
           // implementation.
           static_assert(size(tDcD) % 8 == 0,
                         "SiTU accumulator groups must contain gate/up pairs.");
-          const float inv_beta = deep_gemm::mega_moe::detail::moe_reciprocal<DG_MOE_FAST_MATH>(params.situ_beta);
-          const float inv_linear_beta =
-              params.situ_linear_beta > 0
-                  ? deep_gemm::mega_moe::detail::moe_reciprocal<DG_MOE_FAST_MATH>(params.situ_linear_beta) : 0.0f;
           CUTLASS_PRAGMA_UNROLL
           for (int group = 0; group < size(tDcD); group += 8) {
             CUTLASS_PRAGMA_UNROLL
@@ -632,30 +631,21 @@ public:
               const int physical_gate_col =
                   static_cast<int>(get<1>(tDcD(gate_idx)));
 
-              const uint32_t gate_bits = deep_gemm::tix::cvt_rte_bf16x2_f32(
-                  accum(gate_idx + 1), accum(gate_idx));
-              const uint32_t up_bits = deep_gemm::tix::cvt_rte_bf16x2_f32(
-                  accum(up_idx + 1), accum(up_idx));
-              const auto gate_pair =
-                  *reinterpret_cast<const __ppu_bfloat162*>(&gate_bits);
-              const auto up_pair =
-                  *reinterpret_cast<const __ppu_bfloat162*>(&up_bits);
-              const float2 gate = __bfloat1622float2(gate_pair);
-              const float2 up = __bfloat1622float2(up_pair);
+              const float2 gate = make_float2(accum(gate_idx), accum(gate_idx + 1));
+              const float2 up = make_float2(accum(up_idx), accum(up_idx + 1));
 
-              const float gate_out0 = params.situ_beta
-                  * deep_gemm::mega_moe::detail::moe_tanh<DG_MOE_FAST_MATH>(gate.x * inv_beta)
-                  * deep_gemm::mega_moe::detail::moe_sigmoid<DG_MOE_FAST_MATH>(gate.x);
-              const float gate_out1 = params.situ_beta
-                  * deep_gemm::mega_moe::detail::moe_tanh<DG_MOE_FAST_MATH>(gate.y * inv_beta)
-                  * deep_gemm::mega_moe::detail::moe_sigmoid<DG_MOE_FAST_MATH>(gate.y);
-              // Zero denotes an absent linear_beta, matching MegaMoE's optional up softcap.
-              const float up_out0 = params.situ_linear_beta > 0 ? params.situ_linear_beta
-                  * deep_gemm::mega_moe::detail::moe_tanh<DG_MOE_FAST_MATH>(up.x * inv_linear_beta) : up.x;
-              const float up_out1 = params.situ_linear_beta > 0 ? params.situ_linear_beta
-                  * deep_gemm::mega_moe::detail::moe_tanh<DG_MOE_FAST_MATH>(up.y * inv_linear_beta) : up.y;
-
-              const uint32_t out_bits = deep_gemm::tix::cvt_rte_bf16x2_f32(gate_out1 * up_out1, gate_out0 * up_out0);
+              // Keep the two scalar slots ABI-compatible with scatter. They
+              // carry beta/linear_beta for SiTU and clamp/alpha otherwise.
+              const auto activate = [&](float g, float u) {
+                if constexpr (Activation == deep_gemm::GatedActivation::SiTU)
+                  return deep_gemm::routed_gated_activation<Activation, bool(DG_MOE_FAST_MATH)>(
+                      g, u, -1.0f, 1.702f, params.situ_beta, params.situ_linear_beta);
+                else
+                  return deep_gemm::routed_gated_activation<Activation, bool(DG_MOE_FAST_MATH)>(
+                      g, u, params.situ_beta, params.situ_linear_beta, 4.0f, 25.0f);
+              };
+              const uint32_t out_bits = deep_gemm::epilogue::quant::bf16_pair(
+                  activate(gate.x, up.x), activate(gate.y, up.y));
               const int64_t global_m =
                   static_cast<int64_t>(deep_scheduler.curr_cumsum_m)
                   + static_cast<int64_t>(m_block_idx) * BlockM + local_m;
@@ -846,10 +836,10 @@ public:
           epilogue_no_tsm();
         }
       };
-      if constexpr ((kFusedSitu || kMoeScatter) && BlockM == 128 &&
-                    (WarpM == 64 || (kFusedSitu && WarpM == 128 && WarpN == 32))) {
+      if constexpr ((kFusedActivation || kMoeScatter) && BlockM == 128 &&
+                    (WarpM == 64 || (kFusedActivation && WarpM == 128 && WarpN == 32))) {
         constexpr int rows_per_fragment = WarpsOnM * 16;
-        if (kFusedSitu && rows_per_fragment == 16 && residual_m <= 16) run_m_tile(cute::Int<1>{});
+        if (kFusedActivation && rows_per_fragment == 16 && residual_m <= 16) run_m_tile(cute::Int<1>{});
         else if (residual_m <= 32) run_m_tile(cute::Int<32 / rows_per_fragment>{});
         else if (residual_m <= 64) run_m_tile(cute::Int<64 / rows_per_fragment>{});
         else if (residual_m <= 96) run_m_tile(cute::Int<96 / rows_per_fragment>{});

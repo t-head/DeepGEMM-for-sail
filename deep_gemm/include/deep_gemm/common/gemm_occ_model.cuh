@@ -21,8 +21,8 @@
 //     the host-side JIT generator (bf16/int8/fp8_gemm.hpp generate_impl) from
 //     hggcDeviceGetAttribute queries, so the model carries no hardcoded spec
 //     values and new SKUs require no code change.
-//   - All quantities are computed purely from template parameters (constexpr), no
-//     runtime cost.
+//   - GemmOccModel evaluates the shared estimator at compile time. Runtime
+//     configuration selection calls estimate_gemm_occupancy with the same formulas.
 
 #include <hggc_runtime_api.h>
 
@@ -68,6 +68,110 @@ private:
         total_vreg_per_cu = regs / 32;
     }
 };
+
+// Shared by runtime configuration selection and the constexpr launch-bounds wrapper.
+// Resource-infeasible runtime candidates return occ == 0.
+struct GemmOccEstimate {
+    int acc_copies = 0;
+    int warp_on_m = 0;
+    int warp_on_n = 0;
+    int warp_on_k = 0;
+    int warps_per_cta = 0;
+    int smem_occ = 0;
+    int thread_occ = 0;
+    int acc = 0;
+    int mma_k_a = 0;
+    int mma_k_b = 0;
+    int vreg_a = 0;
+    int vreg_b = 0;
+    int mma_rows = 0;
+    int mma_rows_per_thread = 0;
+    int vreg_sfa = 0;
+    int vreg_per_warp = 0;
+    int we_per_cu = 0;
+    int vreg_per_we = 0;
+    int max_warps_per_we = 0;
+    int warps_per_we = 0;
+    int vreg_occ = 0;
+    int occ = 0;
+};
+
+constexpr GemmOccEstimate estimate_gemm_occupancy(
+    int bm, int bn, int bk, int wm, int wn, int wk, int smem_bytes_per_cta,
+    int bits_a, int bits_b, int bits_acc, int tsm_per_cu, int max_threads_per_cta,
+    int max_warps_per_cu, int total_vreg_per_cu,
+    bool is_blockwise = false, int vreg_overhead = 0) {
+  GemmOccEstimate result{};
+  if (bm <= 0 || bn <= 0 || bk <= 0 || wm <= 0 || wn <= 0 || wk <= 0 ||
+      bm % wm || bn % wn || bk % wk || bits_a <= 0 || bits_b <= 0 ||
+      256 % bits_a || 256 % bits_b || bits_acc <= 0 || bits_acc % 8 ||
+      smem_bytes_per_cta <= 0 || smem_bytes_per_cta > tsm_per_cu ||
+      (bm / wm) * (bn / wn) * (bk / wk) * 32 > max_threads_per_cta ||
+      max_warps_per_cu <= 0 || total_vreg_per_cu <= 0)
+      return result;
+  // Blockwise quantization keeps a running dequant accumulator alongside the raw MMA
+  // accumulator, i.e. 2x the ACC VREG footprint (see fp8_occ_model_doc.md section 5).
+  result.acc_copies = is_blockwise ? 2 : 1;
+
+  // ---- CTA geometry ----
+  result.warp_on_m = bm / wm;
+  result.warp_on_n = bn / wn;
+  result.warp_on_k = bk / wk;
+  result.warps_per_cta = result.warp_on_m * result.warp_on_n * result.warp_on_k;
+
+  // =========================================================================
+  // 1) SMEM occupancy
+  // =========================================================================
+  result.smem_occ = tsm_per_cu / smem_bytes_per_cta;
+
+  // =========================================================================
+  // 2) Thread/warp occupancy
+  // =========================================================================
+  result.thread_occ = max_warps_per_cu / result.warps_per_cta;
+
+  // =========================================================================
+  // 3) VREG occupancy
+  // =========================================================================
+  result.acc = wm * wn * bits_acc / 8 / 128;
+  result.mma_k_a = 256 / bits_a;
+  result.mma_k_b = 256 / bits_b;
+  // A/B operand VREG footprint carries a `* 2` factor that models double-buffered
+  // (ping-pong) operand registers: the next MMA operand set is loaded while the
+  // current one is being consumed, so up to two full copies may be live at once.
+  //
+  // This 2x is a conservative upper bound, NOT an exact figure. The compiler's real
+  // allocation falls somewhere between 1x and 2x, because it can partially overlap
+  // and reuse operand registers instead of always keeping two full live copies.
+  result.vreg_a = wm * result.mma_k_a * 2 * bits_a / 8 / 128;
+  result.vreg_b = wn * result.mma_k_b * 2 * bits_b / 8 / 128;
+  // The current PPU 16x16 MMA accumulator layout gives each lane two M rows.
+  // FP32 SFA broadcasts over N; only the current K scale fragment is resident.
+  result.mma_rows = 16;
+  result.mma_rows_per_thread = 2;
+  result.vreg_sfa =
+      is_blockwise ? math::ceil_div(wm, result.mma_rows) * result.mma_rows_per_thread : 0;
+  result.vreg_per_warp =
+      result.acc_copies * result.acc + result.vreg_a + result.vreg_b + result.vreg_sfa + vreg_overhead;
+
+  result.we_per_cu = 8;
+  result.vreg_per_we = total_vreg_per_cu / result.we_per_cu;
+  result.max_warps_per_we = max_warps_per_cu / result.we_per_cu;
+  // A single warp's VREG footprint must fit within one WE's VREG budget.
+  if (result.vreg_per_warp <= 0 || result.vreg_per_warp > result.vreg_per_we)
+      return result;
+  result.warps_per_we =
+      cute::min(result.max_warps_per_we, result.vreg_per_we / result.vreg_per_warp);
+
+  result.vreg_occ = result.we_per_cu * result.warps_per_we >= result.warps_per_cta
+            ? (result.we_per_cu * result.warps_per_we) / result.warps_per_cta : 1;
+
+  // =========================================================================
+  // Final occupancy = min of the three independent constraints.
+  // =========================================================================
+  result.occ =
+      cute::min(cute::min(result.smem_occ, result.thread_occ), result.vreg_occ);
+  return result;
+}
 
 // ---------------------------------------------------------------------------
 // GemmOccModel
@@ -128,71 +232,40 @@ struct GemmOccModel {
   static_assert(kBitsAcc % 8 == 0,
                 "kBitsAcc must be byte-aligned (ACC VREG uses whole bytes)");
 
-  // Blockwise quantization keeps a running dequant accumulator alongside the raw MMA
-  // accumulator, i.e. 2x the ACC VREG footprint (see fp8_occ_model_doc.md section 5).
-  static constexpr int kAccCopies = kIsBlockwise ? 2 : 1;
+  static constexpr auto kEstimate = estimate_gemm_occupancy(
+      BM, BN, BK, WM, WN, WK, kSmemBytesPerCta, kBitsA, kBitsB, kBitsAcc,
+      kTsmPerCu, kMaxThreadsPerCta, kMaxWarpsPerCu, kTotalVregPerCu,
+      kIsBlockwise, kVregOverhead);
 
-  // ---- CTA geometry ----
-  static constexpr int kWarpOnM     = BM / WM;
-  static constexpr int kWarpOnN     = BN / WN;
-  static constexpr int kWarpOnK     = BK / WK;
-  static constexpr int kWarpsPerCta = kWarpOnM * kWarpOnN * kWarpOnK;
+  static constexpr int kAccCopies = kEstimate.acc_copies;
+  static constexpr int kWarpOnM = kEstimate.warp_on_m;
+  static constexpr int kWarpOnN = kEstimate.warp_on_n;
+  static constexpr int kWarpOnK = kEstimate.warp_on_k;
+  static constexpr int kWarpsPerCta = kEstimate.warps_per_cta;
+  static constexpr int kSmemOcc = kEstimate.smem_occ;
+  static constexpr int kThreadOcc = kEstimate.thread_occ;
+  static constexpr int kAcc = kEstimate.acc;
+  static constexpr int kMmaKA = kEstimate.mma_k_a;
+  static constexpr int kMmaKB = kEstimate.mma_k_b;
+  static constexpr int kVregA = kEstimate.vreg_a;
+  static constexpr int kVregB = kEstimate.vreg_b;
+  static constexpr int kMmaRows = kEstimate.mma_rows;
+  static constexpr int kMmaRowsPerThread = kEstimate.mma_rows_per_thread;
+  static constexpr int kVregSFA = kEstimate.vreg_sfa;
+  static constexpr int kVregPerWarp = kEstimate.vreg_per_warp;
+  static constexpr int kWePerCu = kEstimate.we_per_cu;
+  static constexpr int kVregPerWe = kEstimate.vreg_per_we;
+  static constexpr int kMaxWarpsPerWe = kEstimate.max_warps_per_we;
+  static constexpr int kWarpsPerWe = kEstimate.warps_per_we;
+  static constexpr int kVregOcc = kEstimate.vreg_occ;
+  static constexpr int kOcc = kEstimate.occ;
 
-  // =========================================================================
-  // 1) SMEM occupancy
-  // =========================================================================
   static_assert(kSmemBytesPerCta <= kTsmPerCu,
                 "SMEM footprint must fit in the per-CU TSM limit");
-  static constexpr int kSmemOcc = kTsmPerCu / kSmemBytesPerCta;
-
-  // =========================================================================
-  // 2) Thread/warp occupancy
-  // =========================================================================
-  static_assert(kWarpsPerCta * 32 <= kMaxThreadsPerCta,
+  static_assert((BM / WM) * (BN / WN) * (BK / WK) * 32 <= kMaxThreadsPerCta,
                 "CTA thread count exceeds the per-block thread limit");
-  static constexpr int kThreadOcc = kMaxWarpsPerCu / kWarpsPerCta;
-
-  // =========================================================================
-  // 3) VREG occupancy
-  // =========================================================================
-  static constexpr int kAcc   = WM * WN * kBitsAcc / 8 / 128;
-  static constexpr int kMmaKA = 256 / kBitsA;
-  static constexpr int kMmaKB = 256 / kBitsB;
-  // A/B operand VREG footprint carries a `* 2` factor that models double-buffered
-  // (ping-pong) operand registers: the next MMA operand set is loaded while the
-  // current one is being consumed, so up to two full copies may be live at once.
-  //
-  // This 2x is a conservative upper bound, NOT an exact figure. The compiler's real
-  // allocation falls somewhere between 1x and 2x, because it can partially overlap
-  // and reuse operand registers instead of always keeping two full live copies.
-  static constexpr int kVregA = WM * kMmaKA * 2 * kBitsA / 8 / 128;
-  static constexpr int kVregB = WN * kMmaKB * 2 * kBitsB / 8 / 128;
-  // The current PPU 16x16 MMA accumulator layout gives each lane two M rows.
-  // FP32 SFA broadcasts over N; only the current K scale fragment is resident.
-  static constexpr int kMmaRows = 16;
-  static constexpr int kMmaRowsPerThread = 2;
-  static constexpr int kVregSFA =
-      kIsBlockwise ? cute::ceil_div(WM, kMmaRows) * kMmaRowsPerThread : 0;
-  static constexpr int kVregPerWarp =
-      kAccCopies * kAcc + kVregA + kVregB + kVregSFA + kVregOverhead;
-
-  static constexpr int kWePerCu       = 8;
-  static constexpr int kVregPerWe     = kTotalVregPerCu / kWePerCu;
-  static constexpr int kMaxWarpsPerWe = kMaxWarpsPerCu / kWePerCu;
-  // A single warp's VREG footprint must fit within one WE's VREG budget.
   static_assert(kVregPerWarp <= kVregPerWe,
                 "per-warp VREG exceeds the per-WE budget; occupancy would be 0");
-  static constexpr int kWarpsPerWe =
-      cute::min(kMaxWarpsPerWe, kVregPerWe / kVregPerWarp);
-
-  static constexpr int kVregOcc = kWePerCu * kWarpsPerWe >= kWarpsPerCta
-            ? (kWePerCu * kWarpsPerWe) / kWarpsPerCta : 1;
-
-  // =========================================================================
-  // Final occupancy = min of the three independent constraints.
-  // =========================================================================
-  static constexpr int kOcc =
-      cute::min(cute::min(kSmemOcc, kThreadOcc), kVregOcc);
 
   static constexpr uint32_t kMinBlocksPerMultiprocessor = uint32_t(kOcc);
 };

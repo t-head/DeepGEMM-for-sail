@@ -646,7 +646,7 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
                  GemmType gemm_type = GemmType::Normal, int max_block_n = 256,
                  std::optional<deep_gemm_lut::RuntimeLutKind> runtime_lut_kind = std::nullopt,
                  bool* from_runtime_lut = nullptr, std::optional<int> fixed_block_n = std::nullopt,
-                        const std::vector<int>* allowed_block_ms = nullptr) {
+                 const std::vector<int>* allowed_block_ms = nullptr, int min_block_n = 0) {
     TORCH_CHECK(!fixed_block_n ||
         (is_ppu1v5_device() && gemm_type == GemmType::MGroupedNoPad &&
          *fixed_block_n >= 32 && *fixed_block_n <= max_block_n &&
@@ -691,6 +691,7 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
     if (is_ppu1v5_device()) {
         return get_best_configs_ppu1v5(m, n, k, num_groups, num_sms, gemm_type, max_block_n, fixed_block_n, allowed_block_ms);
     }
+    // The SM80 MegaMoE caller's min_block_n also constrains the heuristic below.
     // FIXME: block m can add 16, and blockM/N could be 512, and 48, 96 blockM.
     std::vector<int> block_ms;
     if (gemm_type != GemmType::MGroupedContiguous) {
@@ -715,7 +716,8 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
     }
 
     int start = (k > 384) ? (bit_length - 1) : (bit_length - 2);
-    for (int x = start; x > 4; --x) {
+    // MegaMoE SM80 Stage2 requires a wider scatter tile; other callers keep the native candidates.
+    for (int x = start; x > 4 && (1 << x) >= min_block_n; --x) {
         block_ns.push_back(1 << x);
     }
 
@@ -840,7 +842,7 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
     // for m16
     if (m < 6 && n < 512) {
         best_block_m = 16;
-        best_block_n = 64;
+        best_block_n = std::max(64, min_block_n);
     }
 
     if ((best_block_m - 10 <= m && m <= best_block_m) && best_block_m == 16 && k > 384) {
@@ -909,7 +911,7 @@ get_best_configs(int m, int n, int k, int num_groups, int num_sms,
         warp_n = (best_block_n <= 128) ? best_block_n / 2 : best_block_n / 4;
     } else if (best_block_m == 16) {
         warp_m = 16;
-        best_block_n = (n <= 512) ? 64 : best_block_n;
+        best_block_n = (n <= 512) ? std::max(64, min_block_n) : best_block_n;
         warp_n = (best_block_n <= 128) ? best_block_n / 4 : best_block_n / 8;
     } else if (best_block_n == 128 || best_block_n == 256) {
         warp_m = (best_block_m != 32) ? best_block_m / 2 : best_block_m;

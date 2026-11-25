@@ -6,7 +6,7 @@
 #include <deep_gemm/layout/mega_gate.cuh>
 #include <deep_gemm/tix/utils.cuh>
 #include <deep_gemm/epilogue/ppu_mega_gate.cuh>
-#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 150
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 100
 #include <deep_gemm/cute_free/copy/aiu_g2s_atom.cuh>
 #include <deep_gemm/cute_free/copy/tsm_s2r_atom.cuh>
 #include <deep_gemm/cute_free/mma/mma_atom.cuh>
@@ -16,6 +16,18 @@
 
 namespace deep_gemm {
 namespace mega_gate_detail {
+
+// Coordinates of the first score in an MMA accumulator register pair.
+__device__ __forceinline__ void score_coords(int tile_token, int tile_expert, int lane, int r,
+                                             int& token, int& expert) {
+#if __HGGC_ARCH__ == 100
+    token = tile_token + lane / 4 + (r / 4) * 8;
+    expert = tile_expert + (lane % 4) + (r % 4) * 4;
+#else
+    token = tile_token + lane / 4 + ((r / 2) % 2) * 8;
+    expert = tile_expert + (lane % 4) * 2 + (r / 4) * 8;
+#endif
+}
 
 __device__ __forceinline__ uint32_t ordered_score_key(float value) {
     const uint32_t bits = __float_as_uint(value == 0.0f ? 0.0f : value);
@@ -116,16 +128,20 @@ __device__ __forceinline__ void ppu_mega_gate_topk_impl(mega_gate_layout::Kernel
     using namespace mega_gate_layout;
     using namespace epilogue::mega_gate;
     constexpr int M = BlockTokens, Warps = Threads / 32;
-    if constexpr (!(Features & 1)) a.mask = nullptr;
-    if constexpr (!(Features & 2)) a.force_random = nullptr;
-    if constexpr (!(Features & 4)) a.fix_routing_mask = nullptr;
-    if constexpr (!(Features & 8)) a.bias = nullptr;
-    if constexpr (!(Features & 16)) a.image_token_mask = nullptr, a.image_bias = nullptr;
-    if constexpr (!(Features & 32)) a.routing.num_shared_experts = 0;
-    const bool score_for_ranking = Features < 0 ? (a.bias or a.image_token_mask) : bool(Features & 24);
+    if constexpr (!(Features & kTokenMask)) a.mask = nullptr;
+    if constexpr (!(Features & kForceRandom)) a.force_random = nullptr;
+    if constexpr (!(Features & kFixRouting)) a.fix_routing_mask = nullptr;
+    if constexpr (!(Features & kExpertBias)) a.bias = nullptr;
+    if constexpr (!(Features & kImageTokenMask)) a.image_token_mask = nullptr, a.image_bias = nullptr;
+    if constexpr (!(Features & kSharedExperts)) a.routing.num_shared_experts = 0;
+    constexpr bool UseSigmoid = Features >= 0 and (Features & kSigmoidScore);
+    // Rank rounded sigmoid scores even without bias so saturation ties use expert ID.
+    const bool score_for_ranking = UseSigmoid or
+        (Features < 0 ? (a.bias or a.image_token_mask) : bool(Features & (kExpertBias | kImageTokenMask)));
     const int lane = threadIdx.x % 32, warp = WarpLocal ? 0 : threadIdx.x / 32;
-    constexpr bool PruneCandidates = !PreActivated and !CompactScores and E >= 256 and ((M >= 32 and M > Warps) or (WarpLocal and Topk * 2 <= E / 32)) and Features >= 0 and (Features & 8) and !(Features & 16);
-    constexpr bool CacheBias = Features >= 0 and (Features & 8) and !(Features & 16) and (M > Warps or WarpLocal);
+    // The candidate bound below is specific to sqrtsoftplus.
+    constexpr bool PruneCandidates = !UseSigmoid and !PreActivated and !CompactScores and E >= 256 and ((M >= 32 and M > Warps) or (WarpLocal and Topk * 2 <= E / 32)) and Features >= 0 and (Features & kExpertBias) and !(Features & kImageTokenMask);
+    constexpr bool CacheBias = Features >= 0 and (Features & kExpertBias) and !(Features & kImageTokenMask) and (M > Warps or WarpLocal);
     float bias_cache[E / 32];
     if constexpr (CacheBias) {
         #pragma unroll
@@ -206,9 +222,9 @@ __device__ __forceinline__ void ppu_mega_gate_topk_impl(mega_gate_layout::Kernel
                 device_check(fixed >= 0 and fixed < a.routing.num_routed_experts);
                 selected = int(fixed);
                 value = mega_gate_detail::reduced_score<E,S,CompactScores,ScoreStride,ScoreBlockTokens>(a, token, selected);
-                if (!PreActivated or !score_for_ranking) value = sqrt_softplus(value);
+                if (!PreActivated or !score_for_ranking) value = gate_score<UseSigmoid>(value);
             }
-            gate_is_valid &= store_topk_token<Topk, HasUnmapped, HasPhysicalMap>(a.routing, a.routing.logical_count, token, lane, selected, value);
+            gate_is_valid &= store_topk_token<Topk, HasUnmapped, HasPhysicalMap, UseSigmoid>(a.routing, a.routing.logical_count, token, lane, selected, value);
             continue;
         }
         const float* bias = a.image_token_mask and a.image_token_mask[token] ? a.image_bias : a.bias;
@@ -228,6 +244,8 @@ __device__ __forceinline__ void ppu_mega_gate_topk_impl(mega_gate_layout::Kernel
             const int expert = (v / 4) * 128 + lane * 4 + v % 4;
             values[v] = CompactScores and expert >= a.routing.num_routed_experts ? 0.0f :
                 mega_gate_detail::reduced_score<E,S,CompactScores,ScoreStride,ScoreBlockTokens>(a, token, expert);
+            if constexpr (UseSigmoid && S > 1)
+                gate_is_valid &= expert >= a.routing.num_routed_experts || !isnan(values[v]);
         }
         if constexpr (PruneCandidates) {
             if (worth_pruning) {
@@ -303,7 +321,7 @@ __device__ __forceinline__ void ppu_mega_gate_topk_impl(mega_gate_layout::Kernel
                             }
                             const float chosen_score = __shfl_sync(0xffffffff, score, selected_lane);
                             const float selected_score = lane < Topk ? chosen_score : 0.0f;
-                            gate_is_valid &= store_topk_token<Topk, HasUnmapped, HasPhysicalMap>(a.routing, a.routing.logical_count, token, lane, selected, selected_score);
+                            gate_is_valid &= store_topk_token<Topk, HasUnmapped, HasPhysicalMap, UseSigmoid>(a.routing, a.routing.logical_count, token, lane, selected, selected_score);
                             continue;
                         }
                     }
@@ -334,12 +352,12 @@ __device__ __forceinline__ void ppu_mega_gate_topk_impl(mega_gate_layout::Kernel
                             rank_keys[1]=0x007fffffu;experts[1]=-1;scores[1]=0.0f;
                         }
                     }
-                    gate_is_valid &= store_topk_token<Topk, HasUnmapped, HasPhysicalMap>(a.routing, a.routing.logical_count, token, lane, selected, selected_score);
+                    gate_is_valid &= store_topk_token<Topk, HasUnmapped, HasPhysicalMap, UseSigmoid>(a.routing, a.routing.logical_count, token, lane, selected, selected_score);
                     continue;
                 }
             }
         }
-        if (score_for_ranking and !PreActivated) sqrt_softplus(values);
+        if (score_for_ranking and !PreActivated) gate_score<UseSigmoid>(values);
         #pragma unroll
         for (int v = 0; v < Values; ++v) {
             const int expert = (v / 4) * 128 + lane * 4 + v % 4;
@@ -358,7 +376,7 @@ __device__ __forceinline__ void ppu_mega_gate_topk_impl(mega_gate_layout::Kernel
             value = select_warp_expert_value<Waves>(values, selected);
         }
         if (!score_for_ranking and lane < Topk) value = sqrt_softplus(value);
-        gate_is_valid &= store_topk_token<Topk, HasUnmapped, HasPhysicalMap>(a.routing, a.routing.logical_count, token, lane, selected, value);
+        gate_is_valid &= store_topk_token<Topk, HasUnmapped, HasPhysicalMap, UseSigmoid>(a.routing, a.routing.logical_count, token, lane, selected, value);
     }
 }
 
@@ -370,12 +388,12 @@ __device__ void ppu_bf16_mega_gate_impl(mega_gate_layout::KernelArgs a) {
     using namespace epilogue::mega_gate;
     // Specialize optional routing controls so unused RNG/control paths cannot
     // inflate the GEMM kernel's register footprint.
-    if constexpr (!(Features & 1)) a.mask = nullptr;
-    if constexpr (!(Features & 2)) a.force_random = nullptr;
-    if constexpr (!(Features & 4)) a.fix_routing_mask = nullptr;
-    if constexpr (!(Features & 8)) a.bias = nullptr;
-    if constexpr (!(Features & 16)) a.image_token_mask = nullptr, a.image_bias = nullptr;
-    if constexpr (!(Features & 32)) a.routing.num_shared_experts = 0;
+    if constexpr (!(Features & kTokenMask)) a.mask = nullptr;
+    if constexpr (!(Features & kForceRandom)) a.force_random = nullptr;
+    if constexpr (!(Features & kFixRouting)) a.fix_routing_mask = nullptr;
+    if constexpr (!(Features & kExpertBias)) a.bias = nullptr;
+    if constexpr (!(Features & kImageTokenMask)) a.image_token_mask = nullptr, a.image_bias = nullptr;
+    if constexpr (!(Features & kSharedExperts)) a.routing.num_shared_experts = 0;
     constexpr int WarpM = WarpMOverride ? WarpMOverride : M >= 128 ? 64 : M >= 32 ? 32 : 16;
     constexpr int WarpN = WarpNOverride ? WarpNOverride : N >= 256 ? 64 : M >= 32 ? 32 : 16;
     constexpr int WarpsM = M / WarpM, WarpsN = N / WarpN, WarpsMN = WarpsM * WarpsN;
@@ -385,7 +403,7 @@ __device__ void ppu_bf16_mega_gate_impl(mega_gate_layout::KernelArgs a) {
     static_assert(Producers == 1 or Cooperative, "Multiple producers require a resident cooperative grid");
     static_assert(H % (S * K) == 0 and E % N == 0 and E <= 512);
     constexpr bool PruneAfterReduction = S > 1 and Groups == 1 and E >= 256 and M >= 32 and M > Warps and
-        Features >= 0 and (Features & 8) and !(Features & 16);
+        Features >= 0 and (Features & kExpertBias) and !(Features & kImageTokenMask);
     // Wide-K routers benefit from contiguous rows within each K plane; shorter
     // reductions retain the cheaper legacy indexing at the measured crossover.
     constexpr bool GroupedScores = PruneAfterReduction and H >= 16 * E;
@@ -412,11 +430,13 @@ __device__ void ppu_bf16_mega_gate_impl(mega_gate_layout::KernelArgs a) {
     const int tile_stride = PersistentGroups ? gridDim.x / Producers : token_tiles;
     const int rounds = PersistentGroups ? (token_tiles - first_token_tile + tile_stride - 1) / tile_stride : 1;
     bool gate_is_valid = true;
-    const bool check_activated = S == 1 and (Features < 0 ? (a.bias or a.image_token_mask) : bool(Features & 24));
+    constexpr bool UseSigmoid = Features >= 0 and (Features & kSigmoidScore);
+    const bool check_activated = !UseSigmoid and S == 1 and
+        (Features < 0 ? (a.bias or a.image_token_mask) : bool(Features & (kExpertBias | kImageTokenMask)));
     for (int round = 0; round < rounds; ++round) {
     const int token_tile = first_token_tile + round * tile_stride;
     const int token_base = token_tile * M;
-#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 150
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 100
     {
         // Reuse the library's AIU + swizzled TSM + register-buffered MMA pipeline.
         using Element = cutlass::bfloat16_t;
@@ -463,11 +483,12 @@ __device__ void ppu_bf16_mega_gate_impl(mega_gate_layout::KernelArgs a) {
                     hi += partial[k * Plane + base + 32];
                 }
                 const int mi = e / (8 * (WarpN / 16)), ni = (e / 8) % (WarpN / 16), r = e % 8;
-                const int token = token_base + warp_m * WarpM + mi * 16 + lane / 4 + ((r / 2) % 2) * 8;
-                const int expert = expert_base + warp_n * WarpN + ni * 16 + (lane % 4) * 2 + (r / 4) * 8;
+                int token, expert;
+                mega_gate_detail::score_coords(token_base + warp_m * WarpM + mi * 16,
+                                               expert_base + warp_n * WarpN + ni * 16, lane, r, token, expert);
                 const int64_t score_row = GroupedScores ?
                     (int64_t(token / M) * S + split) * M + token % M : int64_t(token) * S + split;
-                store_checked_scores(a.scratch + score_row * E + expert, lo, hi, check_activated, gate_is_valid);
+                store_checked_scores<UseSigmoid, S>(a, token, expert, a.scratch + score_row * E + expert, lo, hi, check_activated, gate_is_valid);
             }
         } else {
         epilogue::WarpKReduce<WarpK, WarpsMN, WarpM / 16, WarpN / 16, 8, Stages * (M + N) * K / 2>::run(
@@ -483,12 +504,13 @@ __device__ void ppu_bf16_mega_gate_impl(mega_gate_layout::KernelArgs a) {
                 for (int ni = 0; ni < WarpN / 16; ++ni) {
                     #pragma unroll
                     for (int r = 0; r < 8; r += 2) {
-                        const int token = token_base + warp_m * WarpM + mi * 16 + lane / 4 + ((r / 2) % 2) * 8;
-                        const int expert = expert_base + warp_n * WarpN + ni * 16 + (lane % 4) * 2 + (r / 4) * 8;
+                        int token, expert;
+                        mega_gate_detail::score_coords(token_base + warp_m * WarpM + mi * 16,
+                                                       expert_base + warp_n * WarpN + ni * 16, lane, r, token, expert);
                         const int row = token - a.scratch_token_base;
                         const int64_t score_row = GroupedScores ?
                             (int64_t(row / M) * S + split) * M + row % M : int64_t(row) * S + split;
-                        store_checked_scores(a.scratch + score_row * E + expert, acc[mi][ni][r],
+                        store_checked_scores<UseSigmoid, S>(a, token, expert, a.scratch + score_row * E + expert, acc[mi][ni][r],
                                              acc[mi][ni][r + 1], check_activated, gate_is_valid);
                     }
                 }

@@ -7,7 +7,7 @@ import deep_gemm
 from utils import parse_deepgemm_string_re, read_cmds_from_file, get_arch_version
 from utils import test_gemm, test_m_grouped_gemm_contiguous, test_m_grouped_gemm_masked, test_m_grouped_gemm_nopad, test_m_grouped_gemm_fused
 from utils import test_k_grouped_gemm_contiguous
-from utils import test_hc_prenorm_gemm, test_mqa_logits, test_paged_mqa_logits, test_sparse_mqa_logits, test_mega_mhc
+from utils import test_hc_prenorm_gemm, test_mqa_logits, test_paged_mqa_logits, test_sparse_mqa_logits, test_mega_mhc, test_mega_gate
 from utils import test_batch_gemm
 from utils import get_acc_check, set_acc_check, set_benchmark
 from utils import judge_device_type, set_ref_backend
@@ -21,9 +21,13 @@ def device_version_supported(one_case):
     caselist can run on both PPU1.0 and PPU1.5.
     """
     data_type = one_case.get('data_type')
-    if (one_case.get('gemm_type') in ('MqaLogits', 'PagedMqaLogits')
+    if (one_case.get('gemm_type') in ('MqaLogits', 'PagedMqaLogits', 'MqaAvgLogits', 'PagedMqaAvgLogits')
             and data_type == torch.int8 and get_arch_version() != 80):
         return False, 'INT8 indexer requires 810E'
+    sparse_int8 = (one_case.get('gemm_type') in ('SparseMqaLogits', 'PagedSparseMqaLogits')
+                   and data_type == torch.int8)
+    if sparse_int8 and get_arch_version() != 80:
+        return False, 'INT8 sparse MQA logits requires PPU1.0 (ZW810E, sm_80)'
     if one_case.get('device') == '810e' and 'ZW810E' not in torch.cuda.get_device_name():
         return False, 'This regression case requires ZW810E'
     if one_case.get('gemm_type') == 'Activation' or data_type in ('w4fa16_mma', 'w4fa8_mma', 'w4a8_nvfp4'):
@@ -32,9 +36,19 @@ def device_version_supported(one_case):
     if one_case.get('gemm_type') == 'KGroupedContiguous':
         if get_arch_version() != 89 or 'M890' not in torch.cuda.get_device_name():
             return False, 'KGroupedContiguous currently requires Zhenwu M890P (sm_89)'
+    if (one_case.get('gemm_type') == 'GroupedContiguous'
+            and one_case.get('bf16_regression') in ('accumulation', 'layout')
+            and get_arch_version() != 89):
+        return False, 'Grouped BF16 regression requires PPU1.5 (sm_89)'
     if one_case.get('gemm_type') == 'MegaMhc':
-        if get_arch_version() != 89 or 'M890' not in torch.cuda.get_device_name():
-            return False, 'Mega-mHC requires Zhenwu M890P (sm_89)'
+        arch = get_arch_version()
+        if arch not in (80, 89):
+            return False, 'Mega-mHC requires PPU1.0 or PPU1.5'
+        if one_case.get('mode', 'shifted') == 'normal' and arch != 89:
+            return False, 'Normal Mega-mHC requires Zhenwu M890 (sm_89)'
+        if data_type == torch.float8_e4m3fn and arch != 89:
+            return False, 'Mega-mHC FP8 output requires PPU1.5'
+        return True, ''
     # fp4 (mxfp4, ue8m0 scale) GEMM/attention kernels require PPU1.5 (sm_89) or later,
     # see the PPU0015 ArchTag in csrc/jit_kernels/impls/fp4_gemm.hpp
     if data_type == torch.uint8 and get_arch_version() < 89:
@@ -97,6 +111,7 @@ def call_test_func(gemm_type, func_args):
         "Preprocess": run_preprocessing_regression,
         "Activation": run_activation_regression,
         "MoeAlign": run_moe_align,
+        "MegaGate": test_mega_gate,
     }
 
     if gemm_type in supported_call_funcs.keys():

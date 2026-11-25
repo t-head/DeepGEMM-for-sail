@@ -2,6 +2,16 @@
 #include <cstdint>
 
 namespace deep_gemm::layout::mega_gate {
+// Flags packed by the host into the device kernel's Features template argument.
+// Features = -1 checks routing options at runtime and keeps sqrtsoftplus.
+constexpr int kTokenMask       = 1 << 0;
+constexpr int kForceRandom     = 1 << 1;
+constexpr int kFixRouting      = 1 << 2;
+constexpr int kExpertBias      = 1 << 3;
+constexpr int kImageTokenMask  = 1 << 4;
+constexpr int kSharedExperts   = 1 << 5;
+constexpr int kSigmoidScore    = 1 << 6;  // Clear for the default sqrtsoftplus.
+
 constexpr uint32_t BLOCK_K = 64;
 constexpr uint32_t kBlockTokens = 16;
 constexpr uint32_t kExpertAlignment = 128;

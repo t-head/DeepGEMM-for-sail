@@ -23,11 +23,8 @@ public:
         int num_tokens, hidden, num_max_tokens_per_rank, num_experts;
         int scale_tiles, scale_block_n, shift;
         layout::SymBuffer<> sym_buffer;
-        int32_t* barrier_flag;
         int rank_idx, num_ranks;
-        int32_t* barrier_done;
-        uint64_t* dispatch_counts;
-        int num_dispatch_counts;
+        layout::RoutedMoESignals* signals;
     };
 
     struct Args {
@@ -50,8 +47,7 @@ static void __instantiate_kernel() {{
         auto& p = args.kernel_params;
         DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, p.combine_buffer, p.combine_scales,
             p.topk_weights, p.topk_idx, p.y, p.num_tokens, p.hidden, p.num_max_tokens_per_rank, p.num_experts, p.scale_tiles,
-            p.scale_block_n, p.shift, p.sym_buffer, p.barrier_flag, p.rank_idx, p.num_ranks, p.barrier_done,
-            p.dispatch_counts, p.num_dispatch_counts));
+            p.scale_block_n, p.shift, p.sym_buffer, p.rank_idx, p.num_ranks, p.signals));
     }
 };
 
@@ -65,15 +61,12 @@ inline MegaMoECombineRuntime::Args make_mega_moe_combine_args(
     uint8_t* base, const layout::RoutedMoEBuffer& buffer, const DispatchConfig& config,
     const layout::SymBuffer<>& sym_buffer, const torch::Tensor& y, int rank_idx, int num_tokens) {
     const int hidden = y.size(1), threads = combine_num_threads(num_tokens, hidden);
-    const int count_words = 2 * config.num_experts + config.num_experts_per_rank;
     return {
         {config.num_topk, false, false}, {dim3(std::max(num_tokens, 1), 1), dim3(threads), 0},
         {base + buffer.combine, nullptr, math::advance_ptr<float>(base, buffer.topk_weights),
          math::advance_ptr<int64_t>(base, buffer.topk_idx), y.data_ptr<at::BFloat16>(),
          num_tokens, hidden, config.nmtpr, config.num_experts, 0, 0, 0,
-         sym_buffer, math::advance_ptr<int32_t>(base, buffer.barrier_flag), rank_idx, config.num_ranks,
-         math::advance_ptr<int32_t>(base, buffer.barrier_done),
-         math::advance_ptr<uint64_t>(base, layout::Workspace::kNumBarrierSignalBytes), count_words}};
+         sym_buffer, rank_idx, config.num_ranks, reinterpret_cast<layout::RoutedMoESignals*>(base)}};
 }
 
 inline void combine_mega_moe(
@@ -81,7 +74,7 @@ inline void combine_mega_moe(
     const layout::SymBuffer<>& sym_buffer, const torch::Tensor& y, int rank_idx, int num_tokens) {
     auto args = make_mega_moe_combine_args(base, buffer, config, sym_buffer, y, rank_idx, num_tokens);
     const auto runtime = compiler->build("ppu_mega_moe_barrier_reduce", MegaMoECombineRuntime::generate(args));
-    reset_done(math::advance_ptr<int32_t>(base, buffer.barrier_done));
+    reset_done(&args.kernel_params.signals->combine_done);
     MegaMoECombineRuntime::launch(runtime, args);
 }
 

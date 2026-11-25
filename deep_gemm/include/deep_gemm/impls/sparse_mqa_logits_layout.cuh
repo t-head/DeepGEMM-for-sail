@@ -6,7 +6,7 @@
 // DeepGEMM 26/09 `layout/sparse_mqa_logits.cuh`. Pure POD + constexpr so that both the host
 // translation unit (via csrc includes) and the hggc JIT device code can include it.
 //
-// MXFP4 only.
+// Shared by MXFP4 and non-paged INT8.
 namespace deep_gemm {
 namespace sparse_mqa_logits {
 
@@ -18,16 +18,18 @@ inline constexpr uint32_t kNumSparseSlotBits = 16;
 inline constexpr uint32_t kInvalidSparseSlot = (1u << kNumSparseSlotBits) - 1;
 // One KV split is one 128-token KV tile of the sparse main kernel (BLOCK_KV = 128).
 inline constexpr uint32_t kSplitKV = 128;
-// Eight-warp CTAs leave room for seven resident blocks per CU, including
-// the shared-memory footprint of the three-stage KV pipeline.
-inline constexpr uint32_t kNumWarpsPerCTA = 8;
-inline constexpr uint32_t kNumTbPerCu = 7;
+// Main-kernel grid slots per CU budget. These are scheduling targets, not
+// guarantees of simultaneous residency; INT8 and FP4 have different resource costs.
+inline constexpr uint32_t kNumTbPerCuPPU0010 = 4;
+inline constexpr uint32_t kNumTbPerCuPPU0015 = 7;
+// The PPU0015 FP4 tile uses eight warps per CTA.
+inline constexpr uint32_t kNumWarpsPerCTAPPU0015 = 8;
 inline constexpr uint32_t kContiguousFlag = 0x80000000u;
 
 // Metadata buffer layout (all little-endian u32 words), produced by the metadata kernel:
 //   [0, 16)                       MetadataHeader
 //   [16, 16 + S * sizeof(KVSplit))  one KVSplit per split: KVSplitHeader + KVBlockInfo[blocks_per_split]
-//   [schedule offset)             one ScheduleEntry per (wave, sm): [wave * kNumSMs + sm]
+//   [schedule offset)             one ScheduleEntry per (wave, slot): [wave * kNumSlots + slot]
 struct alignas(16) MetadataHeader {
     uint32_t num_kv_splits;
     uint32_t num_waves;

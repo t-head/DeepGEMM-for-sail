@@ -11,9 +11,9 @@ template <uint32_t Ranks, uint32_t CTAs, uint32_t Threads, uint32_t Experts, uin
           uint32_t BlockM, uint32_t PullSlots, uint32_t TokenBytes, uint32_t PullCTAs, uint32_t PullGroupSize>
 CUTLASS_DEVICE void dispatch_tokens(void* workspace_base, const layout::SymBuffer<>& buffer,
                                     int64_t* input_ids, const uint8_t* input_tokens, uint8_t* dispatched_tokens,
-                                    void* metadata, uint32_t tokens, uint32_t capacity) {
+                                    void* metadata, uint32_t tokens, uint32_t capacity, uint64_t routing_bytes) {
     const uint32_t cta = blockIdx.x, thread = threadIdx.x, warp = thread / 32, lane = thread % 32;
-    const layout::Workspace ws(workspace_base, Ranks, Experts, capacity, TopK);
+    const layout::Workspace ws(workspace_base, Ranks, Experts, capacity, TopK, routing_bytes);
     const layout::Gemm2Metadata meta(metadata, ExpertsPerRank);
     const auto block_sync = []() { __syncthreads(); };
     extern __shared__ __align__(16) unsigned char smem_buf[];
@@ -82,7 +82,7 @@ template <uint32_t kNumRanks, uint32_t kNumCTAs, uint32_t kNumThreads, uint32_t 
           uint32_t kNumExpertsPerRank, uint32_t kNumTopk, uint32_t kDispatchBlockM,
           uint32_t kPullSlots, uint32_t kNumMaxTokensPerRank, uint32_t kShapeN, uint32_t kShapeK,
           int kW4BlockM, int kW4BlockN, int kW4BlockK, int kW4WarpM, int kW4WarpN,
-          int kW4WarpK, int kW4Stages, uint32_t kNumPullCTAs, uint32_t kPullGroupSize>
+          int kW4WarpK, int kW4Stages, uint32_t kNumPullCTAs, uint32_t kPullGroupSize, GatedActivation Activation>
 CUTLASS_DEVICE void dispatch_gemm1_device(
     void* workspace_base, const layout::SymBuffer<>& sym_buffer, int64_t* __restrict__ input_topk_idx,
     const uint8_t* __restrict__ input_token, uint8_t* __restrict__ dispatched_token_pool,
@@ -90,7 +90,7 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
     const uint8_t* __restrict__ gemm1_weight_scale, const uint8_t* __restrict__ gemm1_weight_replicas,
     const uint8_t* __restrict__ gemm1_weight_scale_replicas, const uint32_t num_master_experts,
     __ppu_bfloat16* __restrict__ activated, const float situ_beta, const float situ_linear_beta,
-    const uint32_t num_pool, const int rank) {
+    const uint32_t num_pool, const int rank, uint64_t routing_bytes) {
     extern __shared__ __align__(16) unsigned char smem_buf[];
 
     static_assert(kNumExpertsPerRank < 128, "fused W4A16 dispatch currently uses the direct no-pad scheduler");
@@ -101,7 +101,7 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
     dispatch_tokens<kNumRanks, kNumCTAs, kNumThreads, kNumExperts, kNumExpertsPerRank, kNumTopk, kDispatchBlockM,
                     kPullSlots, kShapeK * sizeof(__ppu_bfloat16), kNumPullCTAs, kPullGroupSize>(
         workspace_base, sym_buffer, input_topk_idx, input_token, dispatched_token_pool, gemm2_metadata,
-        num_tokens, kNumMaxTokensPerRank);
+        num_tokens, kNumMaxTokensPerRank, routing_bytes);
 
     const layout::Gemm2Metadata gemm2_meta(gemm2_metadata, kNumExpertsPerRank);
 
@@ -111,7 +111,7 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
                                                           /*N_EXPAND=*/1,
                                                           /*kMoeScatter=*/false,
                                                           /*kFusedSitu=*/true, /*kUseReplicaWeights=*/false,
-                                                          /*kDynamicWork=*/true>;
+                                                          /*kDynamicWork=*/true, 1, Activation>;
     static_assert(W4Kernel::MaxThreadsPerBlock == kNumThreads, "W4A16 GEMM phase requires the MMA CTA size");
 
     typename W4Kernel::Params params{reinterpret_cast<const cutlass::bfloat16_t*>(dispatched_token_pool),
@@ -125,7 +125,7 @@ CUTLASS_DEVICE void dispatch_gemm1_device(
     params.valid_m_rows = gemm2_meta.valid_rows;
     params.situ_beta = situ_beta;
     params.situ_linear_beta = situ_linear_beta;
-    const layout::Workspace ws(workspace_base, kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk);
+    const layout::Workspace ws(workspace_base, kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk, routing_bytes);
     params.queue_counter = ws.get_gemm1_work_count_ptr();
     params.arrival_counts = ws.get_l1_arrival_count_ptr(0);
     params.dispatch_block_m = kDispatchBlockM;
@@ -140,8 +140,10 @@ namespace deep_gemm {
 template <int N_, int K_, int BlockM_, int BlockN_, int BlockK_, int WarpM_, int WarpN_, int WarpK_, int Groups_,
           int Stages_, int Ranks_, int CTAs_, int Threads_, int DispatchBlockM_, int TopK_, int Capacity_,
           int PullCTAs_, int PullGroupSize_, int PullSlots_, uint64_t PoolTokens_, uint64_t InputTokens_,
-          uint64_t TopkIdx_, uint64_t DispatchedTokens_, uint64_t Gemm2Metadata_>
+          uint64_t TopkIdx_, uint64_t DispatchedTokens_, uint64_t Gemm2Metadata_, GatedActivation Activation_, uint64_t RoutingBytes_>
 struct MegaMoEBf16Fp4Gemm1Kernel {
+    static constexpr uint64_t routing_bytes = RoutingBytes_;
+    static constexpr GatedActivation Activation = Activation_;
     static constexpr int N = N_;
     static constexpr int K = K_;
     static constexpr int BlockM = BlockM_;
@@ -170,7 +172,7 @@ struct MegaMoEBf16Fp4Gemm1Kernel {
     static_assert(sizeof(layout::SymBuffer<>) == 528, "MegaMoE symmetric buffer ABI changed");
     using Kernel = cutlass::gemm::kernel::W4A16GEMM_MMA<
         N, K, BlockM, BlockN, BlockK, WarpM, WarpN, WarpK, Groups, Stages,
-        GemmType::MGroupedNoPad, 1, false, true, false, true>;
+        GemmType::MGroupedNoPad, 1, false, true, false, true, 1, Activation>;
     static constexpr uint32_t shared_memory_bytes() {
         uint32_t pull = PullSlots * K * sizeof(__ppu_bfloat16);
         uint32_t counts = Ranks * Groups * sizeof(uint32_t);
@@ -193,11 +195,11 @@ __global__ __launch_bounds__(Builder::kNumThreads, Builder::kMinBlocks) void sm8
         Builder::Ranks, Builder::CTAs, Builder::Threads, Builder::Ranks * Builder::Groups, Builder::Groups, Builder::TopK,
             Builder::DispatchBlockM, Builder::PullSlots, Builder::Capacity,
         Builder::N, Builder::K, Builder::BlockM, Builder::BlockN, Builder::BlockK, Builder::WarpM, Builder::WarpN,
-            Builder::WarpK, Builder::Stages, Builder::PullCTAs, Builder::PullGroupSize>(
+            Builder::WarpK, Builder::Stages, Builder::PullCTAs, Builder::PullGroupSize, Builder::Activation>(
         pointer(0), sb, reinterpret_cast<int64_t*>(pointer(Builder::TopkIdx)), pointer(Builder::InputTokens),
         pointer(Builder::DispatchedTokens), pointer(Builder::Gemm2Metadata), static_cast<uint32_t>(num_tokens), rhs, rhs_scales,
         rhs_replicas, rhs_replica_scales, static_cast<uint32_t>(num_master_experts), activated,
-        situ_beta, situ_linear_beta, static_cast<uint32_t>(Builder::PoolTokens), rank_idx);
+        situ_beta, situ_linear_beta, static_cast<uint32_t>(Builder::PoolTokens), rank_idx, Builder::routing_bytes);
 }
 
 template <int N, int K, int BlockM, int BlockN, int BlockK, int WarpM, int WarpN,

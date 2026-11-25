@@ -14,6 +14,14 @@ namespace deep_gemm {
 // Non-paged block scheduler helpers
 // ============================================================
 
+// Public bounds are INT32 even when a kernel's argument mirror uses uint32.
+// Clamp before converting to an unsigned byte/element offset.
+__forceinline__ __device__
+uint32_t load_mqa_bound(const uint32_t* bounds, uint32_t query, uint32_t num_keys) {
+    const int32_t value = __ldg(reinterpret_cast<const int32_t*>(bounds) + query);
+    return min(static_cast<uint32_t>(max(value, int32_t{0})), num_keys);
+}
+
 template <int BLOCK_Q, int kNumQStages, int BLOCK_KV, bool kIsCompressedLogits,
           typename SeqLenType, typename CuSeqLenPtrType>
 __forceinline__ __device__
@@ -233,6 +241,38 @@ void float_epilogue_reduce_weights(const AccTensor& accum, int m,
     }
 }
 
+// Distribute H8 outputs over all four lanes: parity owns the KV row half,
+// bit 1 owns the query. Preserve the adjacent-head pair sums, then gather
+// the other head half. The large tile scatters the row half first, needing
+// three shuffles. Small tiles retain the five-shuffle form: its shorter
+// register lifetime allows more resident CTAs on M890.
+template <bool kReduceScatter, typename AccTensor>
+__forceinline__ __device__
+float float_epilogue_reduce_weights_h8_output(const AccTensor& accum, int m,
+                                             const float* weights, uint32_t lane_idx, int n = 0) {
+    float partial[2];
+    #pragma unroll
+    for (int token = 0; token < 2; ++token) {
+        const int j = token * 4;
+        float lo = fmaxf(accum(j, m, n), 0) * weights[token * 2]
+                 + fmaxf(accum(j + 1, m, n), 0) * weights[token * 2 + 1];
+        float hi = fmaxf(accum(j + 2, m, n), 0) * weights[token * 2]
+                 + fmaxf(accum(j + 3, m, n), 0) * weights[token * 2 + 1];
+        if constexpr (kReduceScatter) {
+            const float own_half = lane_idx & 1 ? hi : lo;
+            const float other_half = lane_idx & 1 ? lo : hi;
+            partial[token] = own_half + __shfl_xor_sync(0xffffffffu, other_half, 1);
+        } else {
+            lo += __shfl_xor_sync(0xffffffffu, lo, 1);
+            hi += __shfl_xor_sync(0xffffffffu, hi, 1);
+            partial[token] = lane_idx & 1 ? hi : lo;
+        }
+    }
+    const float own = lane_idx & 2 ? partial[1] : partial[0];
+    const float other = lane_idx & 2 ? partial[0] : partial[1];
+    return own + __shfl_xor_sync(0xffffffffu, other, 2);
+}
+
 // Avg (unweighted) epilogue reduce: plain ReLU sum over heads, same j->v_0/v_1
 // grouping as `float_epilogue_reduce_weights` (only the weights multiply is dropped)
 template <typename AccTensor>
@@ -274,6 +314,35 @@ void float_epilogue_reduce_avg(const AccTensor& accum, int m,
 // WARP_Q == 4 never compile there. Avg-only (the host rejects weighted H = 4).
 // ============================================================
 
+// 810E INT8 accumulator j maps to row=lane/4+8*(j/4), column=lane%4+4*(j%4).
+// A 16-column warp tile contains four H4 queries or two H8 queries.
+// Reduce heads in FP32, then assign each (query, KV row) to one lane.
+template <uint32_t Heads, typename AccTensor>
+__forceinline__ __device__
+void int8_avg_head_sum(const AccTensor& accum, int m, const float (&scales)[4],
+                       uint32_t lane, float (&totals)[2]) {
+    static_assert(Heads == 4 || Heads == 8);
+    const uint32_t row = lane & 1;
+    float halves[16 / Heads];
+    #pragma unroll
+    for (int q = 0; q < 16 / Heads; ++q) {
+        float sums[2] = {0.0f, 0.0f};
+        #pragma unroll
+        for (int h = 0; h < Heads / 4; ++h) {
+            const int col = q * (Heads / 4) + h;
+            #pragma unroll
+            for (int r = 0; r < 2; ++r)
+                sums[r] += fmaxf(float(accum(col + 4 * r, m, 0)), 0.0f) * scales[col];
+        }
+        halves[q] = sums[row] + __shfl_xor_sync(0xffffffffu, sums[row ^ 1], 1);
+    }
+    #pragma unroll
+    for (int t = 0; t < (Heads == 4 ? 2 : 1); ++t) {
+        const uint32_t q = 2 * t + (lane % 4) / 2;
+        totals[t] = halves[q] + __shfl_xor_sync(0xffffffffu, halves[q ^ 1], 2);
+    }
+}
+
 // 4-head in-thread head sums (requires MmaIterN == 1, accum(j, m, 0)):
 // lane T holds heads {2*(T&1), 2*(T&1)+1} of q_{T/2} (j 0-3) and q_{2+T/2} (j 4-7).
 // sums[t][r] is the row-G/row-(G+8) half of warp-local q token 2*t + T/2.
@@ -300,6 +369,37 @@ void shfl_xor_reduce_wq4(float (&sums)[2][2]) {
         #pragma unroll
         for (int r = 0; r < 2; ++r)
             sums[t][r] += __shfl_xor_sync(0xffffffffu, sums[t][r], 1);
+}
+
+// H8 AVG keeps the 16-column MMA tile: each quad lane T contributes heads
+// {2*T, 2*T+1} to both queries, with j=4*q+2*r+h for row r in {G,G+8}.
+// Return one full head sum per lane: query T/2, row T&1. All four lanes
+// must participate before the caller applies query/KV bounds or stores.
+template <typename AccTensor>
+__forceinline__ __device__
+__ppu_bfloat16 bf16_epilogue_reduce_wq2(const AccTensor& accum, int m, uint32_t lane_idx) {
+    const uint32_t row = lane_idx & 1;
+    const uint32_t query = (lane_idx % 4) / 2;
+    // Keep packed rows in scalars to avoid local-memory array indexing.
+    // Round each ReLU result before the pair/xor1/xor2 BF16 addition tree.
+    uint32_t a0 = tix::cvt_rte_bf16x2_f32_relu(accum(4, m, 0), accum(0, m, 0));
+    uint32_t b0 = tix::cvt_rte_bf16x2_f32_relu(accum(5, m, 0), accum(1, m, 0));
+    const __ppu_bfloat162 pair0 = __hadd2(reinterpret_cast<__ppu_bfloat162&>(a0),
+                                       reinterpret_cast<__ppu_bfloat162&>(b0));
+    const uint32_t row0 = reinterpret_cast<const uint32_t&>(pair0);
+    uint32_t a1 = tix::cvt_rte_bf16x2_f32_relu(accum(6, m, 0), accum(2, m, 0));
+    uint32_t b1 = tix::cvt_rte_bf16x2_f32_relu(accum(7, m, 0), accum(3, m, 0));
+    const __ppu_bfloat162 pair1 = __hadd2(reinterpret_cast<__ppu_bfloat162&>(a1),
+                                       reinterpret_cast<__ppu_bfloat162&>(b1));
+    const uint32_t row1 = reinterpret_cast<const uint32_t&>(pair1);
+    const uint32_t mine = row ? row1 : row0;
+    const uint32_t peer = row ? row0 : row1;
+    const uint32_t other_row = __shfl_xor_sync(0xffffffffu, peer, 1);
+    const __ppu_bfloat162 halves = __hadd2(reinterpret_cast<const __ppu_bfloat162&>(mine),
+                                        reinterpret_cast<const __ppu_bfloat162&>(other_row));
+    const uint32_t other_half = __shfl_xor_sync(0xffffffffu, reinterpret_cast<const uint32_t&>(halves), 2);
+    const __ppu_bfloat162 totals = __hadd2(halves, reinterpret_cast<const __ppu_bfloat162&>(other_half));
+    return query ? __high2bfloat16(totals) : __low2bfloat16(totals);
 }
 
 // FP4 fma2 phase: weight access via tCrW tensor (no arch branching)

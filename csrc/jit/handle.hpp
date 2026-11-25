@@ -104,7 +104,7 @@ using KernelHandle = HGfunction;
 using LaunchConfigHandle = HGlaunchConfig;
 using LaunchAttrHandle = HGlaunchAttribute;
 
-#if HGGC_VERSION >= 12040
+#if 0 // Temporarily disable Library loading; use the Module path below.
     #define DG_JIT_USE_LIBRARY_ENUM_KERNELS
     DECL_LAZY_HGGC_DRIVER_FUNCTION(hgLibraryGetKernelCount);
     DECL_LAZY_HGGC_DRIVER_FUNCTION(hgLibraryEnumerateKernels);

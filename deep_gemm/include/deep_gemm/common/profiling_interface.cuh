@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -306,6 +307,32 @@ void set_mega_mhc_params(int m, int hidden, int sinkhorn_iters, hggcStream_t str
     device_id_ = -1;
 }
 
+void set_mega_gate_params(int num_tokens, int hidden, int num_routed_experts, int num_topk,
+                          bool use_shared_as_routed, int num_shared_experts,
+                          float routed_scaling_factor, int ep_rank, hggcStream_t stream = 0) {
+    op_name_ = "MegaGate";
+    add_params("data_type", "bf16");
+    add_params("num_tokens", num_tokens);
+    add_params("hidden", hidden);
+    add_params("num_routed_experts", num_routed_experts);
+    add_params("num_topk", num_topk);
+    add_params("use_shared_as_routed", use_shared_as_routed);
+    add_params("num_shared_experts", num_shared_experts);
+    // Preserve the FP32 value for replay; the generic float formatter rounds to four decimals.
+    std::ostringstream scale;
+    scale << std::setprecision(std::numeric_limits<float>::max_digits10) << routed_scaling_factor;
+    add_params("routed_scaling_factor", scale.str());
+    add_params("ep_rank", ep_rank);
+
+    stream_ = stream;
+    m_ = num_tokens;
+    group_ = 1;
+    grouped_layout_ = nullptr;
+    gemm_type_ = GemmType::Normal;
+    is_gemv_ = false;
+    device_id_ = -1; // Metadata only: no grouped-layout dump or device synchronization.
+}
+
 void set_fused_moe_params(const std::string& data_type, const std::string& quant_type,
                           int groups, int num_token, int topk,
                           int n, int k, int* grouped_layout, hggcStream_t stream = 0) {
@@ -455,8 +482,8 @@ void distribution() {
 }
 
 bool check_support_dump() {
-    // MegaMoE counts are produced inside the collective; do not read or synchronize here.
-    if (gemm_type_ == GemmType::MegaMoE)
+    // Keep device-generated group lengths on device.
+    if (gemm_type_ == GemmType::MegaMoE || gemm_type_ == GemmType::MGroupedContiguousWithPsumLayout)
         return false;
     if (gemm_type_ == GemmType::KGroupedContiguous) {
         return false;  // Host K lengths were supplied by set_k_grouped_params.

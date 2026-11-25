@@ -22,7 +22,7 @@ struct FP8ChannelwiseLinear1Params {
     const float* replica_scales;
     int master_experts;
     at::BFloat16* output;
-    float activation_clamp, activation_alpha;
+    float activation_clamp, activation_alpha, situ_beta, situ_linear_beta;
     uint4* block_info;
 };
 
@@ -34,7 +34,7 @@ struct FP8BlockwiseLinear1Params {
     const float* scales;
     uint8_t* output;
     float* output_scales;
-    float activation_clamp, activation_alpha;
+    float activation_clamp, activation_alpha, situ_beta, situ_linear_beta;
     const uint8_t* replicas;
     const float* replica_scales;
     uint4* block_info;
@@ -124,6 +124,7 @@ public:
         LaunchInfo launch_info;
         LaunchArgs launch_args;
         Params kernel_params{};
+        uint64_t routing_bytes = 0;
     };
 
     static std::string generate_impl(const Args& args) {
@@ -134,12 +135,12 @@ public:
             TORCH_CHECK(dispatch.num_ranks > 0 && dispatch.num_experts % dispatch.num_ranks == 0,
                         "invalid MegaMoE layout");
             const layout::RoutedMoEInputLayout inputs(dispatch.num_ranks, dispatch.num_experts, dispatch.nmtpr,
-                                                     dispatch.num_topk, dispatch.token_bytes, dispatch.sf_bytes);
+                                                     dispatch.num_topk, dispatch.token_bytes, dispatch.sf_bytes, args.routing_bytes);
             if constexpr (kIsBlockwise) {
                 return fmt::format(R"(
 #define DG_MOE_FAST_MATH {}
 #include <deep_gemm/impls/sm89_fp8_fp8_mega_moe_blockwise.cuh>
-using Builder = deep_gemm::MegaMoEFp8BlockwiseGemm1Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>;
+using Builder = deep_gemm::MegaMoEFp8BlockwiseGemm1Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, deep_gemm::GatedActivation({}), {}, {}, {}, {}, {}, {}, {}, {}>;
 static_assert(Builder::shared_memory_bytes() == {}, "MegaMoE shared storage size differs from host");
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&deep_gemm::sm89_fp8_blockwise_mega_moe_l1<Builder>);
@@ -148,24 +149,25 @@ static void __instantiate_kernel() {{
                     int(c.fast_math), c.n, tile.block_m, c.num_threads, inputs.input_tokens,
                     inputs.input_scales, inputs.topk_idx, inputs.dispatched_tokens, inputs.dispatched_scales,
                     inputs.gemm2_metadata, dispatch.pull_ctas, int(args.kernel_params.activation_clamp >= 0),
-                    c.master_experts, c.swiglu_oai, c.metadata.block_m, dispatch.nmtpr, c.num_ctas, dispatch.num_experts,
-                    dispatch.num_ranks, dispatch.num_topk, dispatch.token_bytes, args.launch_args.smem_size);
+                    c.master_experts, int(c.activation), c.metadata.block_m, dispatch.nmtpr, c.num_ctas, dispatch.num_experts,
+                    dispatch.num_ranks, dispatch.num_topk, dispatch.token_bytes,
+                    args.routing_bytes, args.launch_args.smem_size);
             } else {
                 return fmt::format(R"(
 #define DG_MOE_FAST_MATH {}
 #include <deep_gemm/impls/sm89_fp8_fp8_mega_moe.cuh>
-using Builder = deep_gemm::MegaMoEFp8ChannelwiseGemm1Kernel<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>;
+using Builder = deep_gemm::MegaMoEFp8ChannelwiseGemm1Kernel<{}, {}, {}, {}, {}, {}, {}, deep_gemm::GatedActivation({}), {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>;
 static_assert(Builder::shared_memory_bytes() == {}, "MegaMoE shared storage size differs from host");
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&deep_gemm::sm89_fp8_channelwise_mega_moe_l1<Builder>);
 }}
 )",
                     int(c.fast_math), c.num_threads, inputs.input_tokens, inputs.input_scales, inputs.topk_idx,
-                    inputs.dispatched_tokens, inputs.dispatched_scales, inputs.gemm2_metadata, c.swiglu_oai,
+                    inputs.dispatched_tokens, inputs.dispatched_scales, inputs.gemm2_metadata, int(c.activation),
                     dispatch.pull_group_size, c.metadata.block_m, c.metadata.valid_rows, dispatch.block_m, tile.block_k,
                     tile.block_n, c.n, tile.num_stages, tile.warp_m, tile.warp_n, dispatch.nmtpr,
                     c.num_ctas, dispatch.num_experts, dispatch.num_experts_per_rank, dispatch.num_ranks, dispatch.num_topk, dispatch.pull_ctas,
-                    dispatch.token_bytes, args.launch_args.smem_size);
+                    dispatch.token_bytes, args.routing_bytes, args.launch_args.smem_size);
             }
         } else {
             if constexpr (kIsBlockwise) {
@@ -228,11 +230,11 @@ static void __instantiate_kernel() {{
             if constexpr (kIsBlockwise) {
                 DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config,
                     p.sym_buffer, p.local_pool, p.rank_idx, p.num_tokens, p.weights, p.scales, p.output,
-                    p.output_scales, p.activation_clamp, p.activation_alpha, p.replicas, p.replica_scales, p.block_info));
+                    p.output_scales, p.activation_clamp, p.activation_alpha, p.situ_beta, p.situ_linear_beta, p.replicas, p.replica_scales, p.block_info));
             } else {
                 DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config,
                     p.sym_buffer, p.rank_idx, p.num_tokens, p.weights, p.scales, p.replicas, p.replica_scales,
-                    p.master_experts, p.output, p.activation_clamp, p.activation_alpha, p.block_info));
+                    p.master_experts, p.output, p.activation_clamp, p.activation_alpha, p.situ_beta, p.situ_linear_beta, p.block_info));
             }
         } else {
             auto params = args.kernel_params;
@@ -247,7 +249,7 @@ static auto make_fp8_fp8_linear1_args(
     const std::tuple<torch::Tensor, torch::Tensor>& weights,
     const std::tuple<torch::Tensor, torch::Tensor>& replicas,
     uint8_t* base, const layout::RoutedMoEBuffer& buffer, const layout::SymBuffer<>& sym_buffer,
-    int rank_idx, int num_tokens, float activation_clamp, float activation_alpha, const Gemm1Config& config) {
+    int rank_idx, int num_tokens, float activation_clamp, float activation_alpha, float situ_beta, float situ_linear_beta, const Gemm1Config& config) {
     using Runtime = FP8MegaMoEGemmRuntime<MegaMoEPhaseKind::Linear1, Quantization>;
     const auto& [weight, scale] = weights;
     const auto& [replica_weight, replica_scale] = replicas;
@@ -255,6 +257,7 @@ static auto make_fp8_fp8_linear1_args(
         .kernel_name = Runtime::kIsBlockwise ? "fp8_blockwise_mega_moe_dispatch_gemm1" : "fp8_channelwise_mega_moe_dispatch_gemm1",
         .launch_info = config,
         .launch_args = {dim3(config.num_ctas), dim3(config.num_threads), config.tile.smem_size}};
+    args.routing_bytes = buffer.dispatch.routing_bytes;
     auto& p = args.kernel_params;
     p.sym_buffer = sym_buffer;
     p.rank_idx = rank_idx;
@@ -265,6 +268,8 @@ static auto make_fp8_fp8_linear1_args(
     p.replica_scales = device_pointer<float>(replica_scale);
     p.activation_clamp = activation_clamp;
     p.activation_alpha = activation_alpha;
+    p.situ_beta = situ_beta;
+    p.situ_linear_beta = situ_linear_beta;
     p.block_info = math::advance_ptr<uint4>(base, buffer.block_info);
     if constexpr (Runtime::kIsBlockwise) {
         p.local_pool = base + buffer.dispatched_tokens;
@@ -335,11 +340,11 @@ inline void fp8_fp8_mega_moe_impl(
     const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_replicas,
     const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_replicas,
     uint8_t* base, const layout::RoutedMoEBuffer& buffer, const layout::SymBuffer<>& sym_buffer,
-    int rank_idx, int num_tokens, GatedActivation activation, float activation_clamp, bool fast_math, float activation_alpha,
+    int rank_idx, int num_tokens, GatedActivation activation, float activation_clamp, bool fast_math, float activation_alpha, float situ_beta, float situ_linear_beta,
     const MegaMoEPrecisionConfigs& configs, Precision precision,
     const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats) {
     auto config = configs.l1;
-    config.swiglu_oai = activation == GatedActivation::SwiGLUOAI;
+    config.activation = activation;
     config.fast_math = fast_math;
     auto launch = [&](auto quantization_tag) {
         constexpr auto kind = decltype(quantization_tag)::value;
@@ -347,7 +352,7 @@ inline void fp8_fp8_mega_moe_impl(
         using Linear2Runtime = FP8MegaMoEGemmRuntime<MegaMoEPhaseKind::Linear2, kind>;
         const auto l1_args = make_fp8_fp8_linear1_args<kind>(
             l1_weights, l1_weights_replicas, base, buffer, sym_buffer, rank_idx, num_tokens,
-            activation_clamp, activation_alpha, config);
+            activation_clamp, activation_alpha, situ_beta, situ_linear_beta, config);
         const auto l2_args = make_fp8_fp8_linear2_args<kind>(
             l2_weights, l2_weights_replicas, base, buffer, rank_idx, config.dispatch, configs.l2);
         const int rows = buffer.dispatch.num_max_pool_tokens;

@@ -11,6 +11,7 @@
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/epilogue/epilogue_traits.cuh>
 #include <deep_gemm/epilogue/gated_activation.cuh>
+#include <deep_gemm/epilogue/activation_quant_ops.cuh>
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -78,13 +79,6 @@ public:
   EpilogueSiluAndMulPostQuant(Params const& params_, SharedStorage const& shared_storage = SharedStorage())
       : DefaultEpilogueNoTsm<StrideC_, StrideD_, ThreadEpilogueOp_, EpilogueSchedule_, IsAlignedN>(params_, shared_storage), params(params_), epilogue_op(params_.thread) { }
 
-  static CUTLASS_DEVICE uint8_t pcnvt_f4x2_f32x2(float hi, float lo) {
-    uint8_t b;
-    asm ("ppu.cvt.rtte.satfinite.e2m1x2.f32 %0, %1, %2;\n"
-      : "=c"(b)
-      : "f"(hi), "f"(lo));
-    return b;
-  }
 
   // `smem_act_tensor_ptr` is already advanced to the row of the current step_m, so all the
   // tsm offsets here are compile-time constants and no per-step address math is emitted.
@@ -111,21 +105,9 @@ public:
       scale_bits_u32[step_n] = __reduce_max_sync(0xffffffff, val_u32);
     });
 
-    // 2. calculate scales
+    // Preserve the original E8M0 rounding and output layout.
     cute::for_each(make_int_sequence<WARP_ITER_NUM_N>{}, [&](auto step_n) {
-      // Clamp absmax to avoid division by zero in scale computation
-      // float group_max_fp32 = fmaxf(__uint_as_float(scale_bits_u32[step_n]), 1e-10f);
-      uint32_t group_max_fp32 = max(scale_bits_u32[step_n], 0x2EDBE6FF); // 0x2EDBE6FF is 1e-10f (u32);
-
-      // Scale Round Up as OCP decalared.
-      // scale_bits_u32[step_n] = __float_as_uint(group_max_fp32 * (1.f / 6.f));
-      // 0x1400000u means that 6.0 can be termed as 4 * 1.5 which can be represented by u32.
-      scale_bits_u32[step_n] = group_max_fp32 - 0x1400000u; // ceil to power of 2;
-    });
-
-    // 3. calculate scales-0: round up
-    cute::for_each(make_int_sequence<WARP_ITER_NUM_N>{}, [&](auto step_n) {
-      scale_bits_u32[step_n] = (scale_bits_u32[step_n] + 0x007FFFFFu);
+      scale_bits_u32[step_n] = deep_gemm::epilogue::quant::mxfp4_scale_bits(scale_bits_u32[step_n]);
     });
 
     // 4. calculate scales-1: remove mantissa and do quant
@@ -141,12 +123,12 @@ public:
       // exponent << 23 termed as 2 ^ (exponent - 127)
       // we want 2 ^ (127 - exponent) which means exponent^{'} is (127 - exponent) + 127
       // bits: exponent^{'} << 23 = (254 - exponent) << 23 = 254 << 23 - exponent << 23
-      float scale_inv = __uint_as_float((254u << 23) - scale_exp_bit);
+      float scale_inv = deep_gemm::epilogue::quant::mxfp4_inverse(scale_exp_bit);
 
       // do quant
       auto val_quanted_tXv0 = rC[step_n] * scale_inv;
       auto val_quanted_tXv0_adjecent = __shfl_xor_sync(0xffffffff, val_quanted_tXv0, 1);
-      val_2f4_packeds[step_n] = pcnvt_f4x2_f32x2(val_quanted_tXv0_adjecent, val_quanted_tXv0);
+      val_2f4_packeds[step_n] = deep_gemm::epilogue::quant::fp4_pair(val_quanted_tXv0_adjecent, val_quanted_tXv0);
     });
   }
 

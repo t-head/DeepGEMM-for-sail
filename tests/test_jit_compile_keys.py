@@ -355,6 +355,7 @@ int fp4_checks() {
     info.warp_m = 32; info.warp_n = 64; info.num_stages = 4;
     info.num_groups = 1; info.n = 512; info.k = 512; info.n_expand = 1;
     info.gemm_type = "Normal"; info.kernel_name = "test_fp4";
+    info.kernel_strategy = "Default";
     args.launch_args.smem_size = 32768;
     int count = tile_checks<Runtime>(args);
 #define CHECK_FP4(field, value) \
@@ -363,6 +364,7 @@ int fp4_checks() {
     CHECK_FP4(k, 1024);
     CHECK_FP4(num_groups, 2);
     CHECK_FP4(gemm_type, "MGroupedContiguous");
+    CHECK_FP4(kernel_strategy, "OverlapPrologue");
     CHECK_FP4(enable_sbo_overlap, true);
     CHECK_FP4(hasBias, true);
     CHECK_FP4(n_expand, 2);
@@ -390,6 +392,9 @@ int gemv_checks() {
         CHECK_GEMV(k_per_thread, 16);
         CHECK_GEMV(kernel_name, "another_entry");
         CHECK_GEMV(output_fp32, true);
+        CHECK_GEMV(staticK, true);
+        CHECK_GEMV(pairLoad, true);
+        CHECK_GEMV(persistent, true);
         if (m == 2) { CHECK_GEMV(npt, 2); }
 #undef CHECK_GEMV
         count += check_change<Runtime>(args, [m](auto& a) { a.launch_info.m = 3 - m; }, "M1/M2 entry");
@@ -401,6 +406,11 @@ int gemv_checks() {
             a.kernel_params.y_ptr = reinterpret_cast<void*>(uintptr_t(0x3000));
             a.launch_args.grid_dim = dim3(5, 1, 1);
         }, "GEMV runtime dimensions, strides and addresses", false);
+        args.launch_info.staticK = true;
+        args.kernel_params.K = 64;
+        count += check_change<Runtime>(args, [](auto& a) {
+            a.kernel_params.K = 96;
+        }, "GEMV static K and row stride");
     }
     return count;
 }

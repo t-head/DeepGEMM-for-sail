@@ -5,6 +5,7 @@
 #include <hggc_fp8.h>
 #include <deep_gemm/tix/sys_atomics.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
+#include <deep_gemm/layout/routed_moe.cuh>
 #include <deep_gemm/impls/mega_moe_io.cuh>
 
 namespace deep_gemm::mega_moe::detail {
@@ -16,14 +17,20 @@ constexpr uint64_t kBarrierTimeoutCycles = 600000000000ULL;
 // Only block (0, 0) publishes arrival and polls the peer counters. The local
 // done flag is cleared on the launch stream before each invocation, including
 // graph replay. Empty ranks must launch this kernel too.
-__device__ __forceinline__ void combine_barrier(const layout::SymBuffer<>& sym_buffer, int32_t* flag, int rank, int world, int32_t* done,
-                                               uint64_t* dispatch_counts, int num_dispatch_counts) {
+__device__ __forceinline__ void combine_barrier(const layout::SymBuffer<>& sym_buffer, int rank, int world,
+                                               layout::RoutedMoESignals* signals, int num_experts) {
+    auto* flag = &signals->combine_flag;
+    auto* done = &signals->combine_done;
     const int tid = threadIdx.x;
     if (blockIdx.x == 0 && blockIdx.y == 0) {
         // The preceding GEMM2/scatter has completed on this stream. Recycle
         // only per-call counts; generation and arrival counters are excluded.
-        for (int i = tid; i < num_dispatch_counts; i += blockDim.x)
-            dispatch_counts[i] = 0;
+        for (int i = tid; i < num_experts; i += blockDim.x) {
+            signals->expert_send_count[i] = 0;
+            signals->expert_recv_count[i] = 0;
+        }
+        for (int i = tid; i < num_experts / world; i += blockDim.x)
+            signals->expert_recv_count_sum[i] = 0;
         tix::fence_acq_rel_sys();
         __syncthreads();
         if (tid < 32) {
@@ -109,9 +116,8 @@ template <int kTopk, bool kFp8, bool kScaled, int kThreads>
 __device__ __forceinline__ void barrier_reduce_kernel(
     const void* buf, const uint64_t* scales, const float* weights, const int64_t* ids, __ppu_bfloat16* output,
     int tokens, int hidden, int capacity, int num_experts, int scale_tiles, int scale_block_n, int fp8_exp_shift,
-    const layout::SymBuffer<>& sym_buffer, int32_t* flag, int rank, int world, int32_t* done,
-    uint64_t* dispatch_counts, int num_dispatch_counts) {
-    combine_barrier(sym_buffer, flag, rank, world, done, dispatch_counts, num_dispatch_counts);
+    const layout::SymBuffer<>& sym_buffer, int rank, int world, layout::RoutedMoESignals* signals) {
+    combine_barrier(sym_buffer, rank, world, signals, num_experts);
     const int token = blockIdx.x;
     if (token >= tokens)
         return;
@@ -161,9 +167,9 @@ __global__ __launch_bounds__(Threads)
 void sm89_mega_moe_barrier_reduce(
         const void* b, const uint64_t* s, const float* w, const int64_t* ids, __ppu_bfloat16* y,
         int t, int h, int c, int e, int st, int sn, int shift, layout::SymBuffer<> sym,
-        int32_t* flag, int r, int ws, int32_t* d, uint64_t* counts, int nc) {
+        int r, int ws, layout::RoutedMoESignals* signals) {
     barrier_reduce_kernel<TopK, Fp8, Scaled, Threads>(
-        b, s, w, ids, y, t, h, c, e, st, sn, shift, sym, flag, r, ws, d, counts, nc);
+        b, s, w, ids, y, t, h, c, e, st, sn, shift, sym, r, ws, signals);
 }
 
 } // namespace deep_gemm::mega_moe::detail

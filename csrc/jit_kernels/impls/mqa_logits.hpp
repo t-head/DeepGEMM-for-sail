@@ -191,16 +191,9 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
     int blocks_per_cu = 0;
     hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, runtime->kernel, num_threads, smem_size);
     const uint64_t capacity = static_cast<uint64_t>(num_sms) * blocks_per_cu;
-    args.launch_args.grid_dim.x = static_cast<unsigned>(capacity);
-    if (is_fp4 and is_avg) {
-        const uint64_t seq_len_q = kernel_params.seq_len_q;
-        const uint64_t block_q = config.block_q;
-        const uint64_t num_q_blocks = seq_len_q / block_q + (seq_len_q % block_q != 0);
-        const uint64_t num_output_tasks = num_q_blocks * (config.balance_output_tiles ? 2 : 1);
-        // Preserve a valid launch for the existing empty-Q AVG path.
-        args.launch_args.grid_dim.x = static_cast<unsigned>(
-            std::min(capacity, std::max(uint64_t{1}, num_output_tasks)));
-    }
+    const auto [grid_x, grid_y] = deep_gemm_mqa_common::get_mqa_logits_grid(
+        config, kernel_params.seq_len_q, kernel_params.seq_len_k, capacity);
+    args.launch_args.grid_dim = dim3(grid_x, grid_y, 1);
 
     // Report the configuration before launch so it remains visible even
     // when the launch itself fails
@@ -231,7 +224,9 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
             printf("ThreadblockShape[%d, %d], WarpShape[%d, %d], kNumQStages:%d, kNumKVStages:%d\n", config.block_qh,
                    config.block_kv, config.warp_qh, config.warp_kv, config.num_q_stages, config.num_kv_stages);
             printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d, num_threads:%d\n", num_sms, blocks_per_cu,
-                   static_cast<int>(args.launch_args.grid_dim.x), num_threads);
+                   static_cast<int>(args.launch_args.grid_dim.x * args.launch_args.grid_dim.y), num_threads);
+            printf("grid:[%u, %u, 1], task_kv_partitions:%d\n",
+                   args.launch_args.grid_dim.x, args.launch_args.grid_dim.y, config.kv_partitions);
         }
         printf("smem_size:%d, vreg:%d, stack:%d\n", smem_size, num_regs, local_size);
         printf("compressed_logits:%s, ", is_compressed ? "true" : "false");
@@ -243,6 +238,8 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
         dg_prof_params.set_mqa_logits_params(dtype_tag, static_cast<int>(kernel_params.seq_len_q),
                                              static_cast<int>(kernel_params.seq_len_k), num_heads,
                                              is_fp4 ? head_dim * 2 : head_dim, current_stream(), is_avg);
+        if (is_compressed)
+            dg_prof_params.add_params("compressed_logits", 1);
         if (element_logits == "__ppu_bfloat16")
             dg_prof_params.add_params("logits_dtype", std::string("bf16"));
         if (element_weights == "__ppu_bfloat16")
@@ -263,20 +260,21 @@ static void launch_mqa_logits(const std::string& include_header, const std::stri
 static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& k_scales,
                                 const torch::Tensor& weights, const torch::Tensor& cu_seq_len_k_start,
                                 const torch::Tensor& cu_seq_len_k_end, int seq_len_q, int seq_len_k, int num_heads,
-                                int head_dim, bool clean_logits, int max_seqlen_k, torch::ScalarType logits_dtype,
+                                int head_dim, bool clean_logits, int max_seqlen_k, torch::ScalarType logits_dtype, bool is_avg,
                                 const std::optional<torch::Tensor>& q_sf,
                                 const std::optional<torch::Tensor>& k_sf,
                                 const std::optional<torch::Tensor>& q_scale = std::nullopt) {
     const bool is_fp4 = q_sf.has_value();
     const auto& qk_dtype = q.scalar_type();
     const bool is_compressed = max_seqlen_k > 0;
-    // Avg variant: an empty weights tensor selects it, and the `weights` kernel slot then
-    // carries `q_scale` (nullptr for the unity mode -- the kernel never dereferences it)
-    const bool is_avg = weights.numel() == 0;
+    // INT8 AVG supplies per-Q/head scales through weights; FP8/FP4 AVG may
+    // replace that kernel slot with an optional scalar or per-row multiplier.
     QScaleMode scale_mode = kScaleModeWeights;
     const void* weights_ptr = weights.data_ptr();
     if (is_avg) {
-        if (not q_scale.has_value()) {
+        if (qk_dtype == torch::kInt8 and not is_fp4) {
+            scale_mode = kScaleModeQHead;
+        } else if (not q_scale.has_value()) {
             scale_mode = kScaleModeUnity;
             weights_ptr = nullptr;
         } else if (q_scale->numel() == 1) {
@@ -290,7 +288,7 @@ static torch::Tensor mqa_logits(const torch::Tensor& q, const torch::Tensor& k, 
 
     const auto config = deep_gemm_mqa_common::get_best_configs(
         q.scalar_type(), seq_len_q, seq_len_k, num_heads, logits_dtype,
-        is_fp4, get_num_sms(), is_compressed, scale_mode);
+        is_fp4, get_num_sms(), is_compressed, scale_mode, max_seqlen_k);
 
     const int aligned_seq_len = align(seq_len_q, config.block_q);
     const int logits_stride_alignment = deep_gemm_mqa_common::get_logits_stride_alignment(logits_dtype);

@@ -4,6 +4,7 @@
 #include <utility>
 #include <vector>
 #include <torch/torch.h>
+#include <ATen/cuda/CUDAContext.h>
 #include "../../utils/math.hpp"
 #include "common_nvfp4_w4a8_preprocess.hpp"
 #include "../../utils/utils.hpp"
@@ -33,6 +34,18 @@ struct PreprocessedWeights {
     // Only used in W4A8_MXFP4_MMA: Fold into the activation row scale
     float inv_scale = 1.0f;
 };
+
+// Gate/up adjacency is shared by activation-fused kernels, independently of
+// weight dtype and scale representation. Format-specific packing follows it.
+inline torch::Tensor interleave_gate_up_rows(const torch::Tensor& tensor, int group_size = 1) {
+    const auto half = tensor.size(1) / 2;
+    auto shape = tensor.sizes().vec();
+    shape[1] = half / group_size;
+    shape.insert(shape.begin() + 2, group_size);
+    return at::stack({tensor.slice(1, 0, half).reshape(shape),
+                      tensor.slice(1, half, half * 2).reshape(shape)}, 2)
+        .view(tensor.sizes());
+}
 
 inline const char* preprocess_mode_name(const PreprocessMode& mode) {
     switch (mode) {
@@ -75,6 +88,29 @@ inline PreprocessedWeights preprocess_weights_and_scales(
     TORCH_CHECK(weight.defined() || scale_only,
                 "preprocess mode '", preprocess_mode_name(mode), "' with fuse_activation=", fuse_activation,
                 " requires weights");
+    if (mode == PreprocessMode::INT8) {
+        TORCH_CHECK(weight.dim() == 3 && weight.scalar_type() == torch::kInt8 && weight.is_contiguous(),
+                    "INT8 preprocessing requires contiguous [E,N,K] signed INT8 weights");
+        TORCH_CHECK(weight_scale.has_value(), "INT8 preprocessing requires FP32 channel scales");
+        const auto& scale = *weight_scale;
+        TORCH_CHECK((scale.dim() == 2 || (scale.dim() == 3 && scale.size(2) == 1)) &&
+                    scale.scalar_type() == torch::kFloat32 && scale.is_contiguous() &&
+                    scale.device() == weight.device() && scale.size(0) == weight.size(0) &&
+                    scale.size(1) == weight.size(1),
+                    "INT8 channel scales must be contiguous FP32 [E,N] or [E,N,1]");
+        int gate_up_group_size = 1;
+        if (fuse_activation) {
+            TORCH_CHECK(weight.is_cuda(), "INT8 fused weights require a PPU device");
+            const auto* prop = at::cuda::getDeviceProperties(weight.get_device());
+            TORCH_CHECK(prop->major == 8 && (prop->minor == 0 || prop->minor == 9),
+                        "INT8 fused weights require PPU SM80 or SM89");
+            gate_up_group_size = prop->minor == 0 ? 4 : 1;
+        }
+        return fuse_activation
+            ? PreprocessedWeights{interleave_gate_up_rows(weight, gate_up_group_size),
+                                  interleave_gate_up_rows(scale, gate_up_group_size)}
+            : PreprocessedWeights{weight, scale};
+    }
     if ((mode == PreprocessMode::W4A16_INT4 || mode == PreprocessMode::W4A16_MXFP4)
             && !fuse_activation) {
         const bool int4 = mode == PreprocessMode::W4A16_INT4;
@@ -196,18 +232,12 @@ inline PreprocessedWeights preprocess_weights_and_scales(
             // do interleaving to make up and gate be adjacent.
             const int64_t num_groups = weight.size(0), n = weight.size(1), k = weight.size(2);
             DG_HOST_ASSERT(n % 2 == 0);  // silu_and_mul splits N in half
-            const int64_t half_n = n / 2;
-            const auto gate = weight.slice(1, 0, half_n);
-            const auto up = weight.slice(1, half_n, n);
-            // `at::stack` writes a fresh contiguous tensor, so the following `view` is always legal.
-            weight_out = at::stack({gate, up}, 2).view({num_groups, n, k});
+            weight_out = interleave_gate_up_rows(weight);
 
             const int64_t sfn = weight_scale->size(1), sfk = weight_scale->size(2);
             // `weight` is uint8, so one byte holds two fp4 values: sfk == ceil_div(2 * k, 32).
             DG_HOST_ASSERT(weight_scale->size(0) == num_groups && sfn == n && sfk == ceil_div<int64_t>(k, 16));
-            const auto gate_scale = weight_scale->slice(1, 0, half_n);
-            const auto up_scale = weight_scale->slice(1, half_n, n);
-            scale_out = at::stack({gate_scale, up_scale}, 2).view({num_groups, sfn, sfk});
+            scale_out = interleave_gate_up_rows(*weight_scale);
         }
         // Keep the packed weight unchanged unless gate/up interleaving was requested.
         // The legacy scale-only API uses an undefined weight and returns only the scale.

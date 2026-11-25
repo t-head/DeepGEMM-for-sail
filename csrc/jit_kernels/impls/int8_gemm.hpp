@@ -354,14 +354,14 @@ public:
         cute::Stride<int64_t, cute::Int<1>, int64_t> stride_D{};
     };
 
-    template <typename EpilogueParamsT>
+    template <typename EpilogueParamsT, typename SchedulerParamsT = TileSchedulerArguments>
     struct GemmKernelParamsT {
         GemmUniversalMode mode;
         GemmProblemSize problem_shape;
         CollectiveMainloopParams collective_mainloop_params;
         EpilogueParamsT collective_epilogue_params;
         cutlass::KernelHardwareInfo hw_info;
-        TileSchedulerArguments scheduler;
+        SchedulerParamsT scheduler;
         void* workspace{nullptr}; // workspace,
         int32_t* signal{nullptr};
     };

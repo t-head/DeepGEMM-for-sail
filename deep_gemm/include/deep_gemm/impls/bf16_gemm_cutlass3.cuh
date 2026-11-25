@@ -749,12 +749,14 @@ struct CollectiveMma<
   /// Perform a collective-scoped matrix multiply-accumulate
   template <
     bool PeelFirstK = false,
-    bool StaticK256 = false,
+    int StaticKTiles = 0,
+    bool DenseS2Opt = false,
     class... Ts,
     class FrgTensorD,
     class FrgTensorC,
     class KTileIterator,
-    class ResidueMNK
+    class ResidueMNK,
+    class PrefetchC = decltype(nullptr)
   >
   CUTLASS_DEVICE void
   operator() (
@@ -765,7 +767,8 @@ struct CollectiveMma<
       ResidueMNK residue_mnk,
       int thread_idx,
       int warp_idx,
-      char *smem_buf) {
+      char *smem_buf,
+      PrefetchC prefetch_c = nullptr) {
     using namespace cute;
 
     static_assert(is_rmem<FrgTensorD>::value, "D tensor must be rmem resident.");
@@ -800,14 +803,19 @@ struct CollectiveMma<
     Tensor tBgB = gmem_thr_copy_B.partition_S(gB);                             // (BCPY,BCPY_N,BCPY_K,k)
     Tensor tBsB = gmem_thr_copy_B.partition_D(sB);                             // (BCPY,BCPY_N,BCPY_K,PIPE)
 
-    // Start async loads for all pipes but the last
+    constexpr bool stage_c = !std::is_same_v<PrefetchC, decltype(nullptr)>;
+    // Commit one group per ring position, including slots unused by short K.
     CUTLASS_PRAGMA_UNROLL
     for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages; ++k_pipe) {
-      copy_aiu(
-        gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,k_pipe),
-        gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,k_pipe),
-        warp_idx
-      );
+      if (!stage_c || k_tile_count > 0) {
+        copy_aiu(
+          gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,k_pipe),
+          gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,k_pipe),
+          warp_idx
+        );
+      } else if constexpr (stage_c) {
+        prefetch_c(k_pipe);
+      }
       cp_async_fence();
       --k_tile_count;
       ++k_tile_iter;
@@ -877,17 +885,36 @@ struct CollectiveMma<
       copy(smem_tiled_copy_B, tCsB_p(_,_,Int<0>{}), tCrB_copy_view(_,_,Int<0>{}));
     }
 
+    // Dense PPU 1.0 can issue the next DMA before waiting for the older
+    // group. Other architectures and callers retain their original schedule.
+    constexpr bool DelayS2Wait = DenseS2Opt && DispatchPolicy::Stages == 2 &&
+        std::is_same_v<ArchTag, cutlass::arch::PPU0010>;
+    static_assert(!DelayS2Wait || decltype(K_BLOCK_MAX)::value > 1);
+
+    enum class KTilePhase { Regular, SteadyAB, FinalC };
+
     // Keep one BK iteration implementation for normal, peeled and static-K
     // schedules. Peeling exposes the zero accumulator to the first MMA.
-    auto process_k_tile = [&]() {
+    auto process_k_tile = [&](auto phase_tag) {
+      constexpr auto phase = decltype(phase_tag)::value;
+      const int live_stage = smem_pipe_read;
       // Pipeline the outer products with a static for loop.
       //
       // Note, the for_each() function is required here to ensure `k_block` is of type Int<x>.
       for_each(make_int_sequence<K_BLOCK_MAX>{}, [&] (auto k_block) {
         if (k_block == K_BLOCK_MAX - 1) {
-          // Slice the smem_pipe_read smem
-          tCsA_p = tCsA(_,_,_,smem_pipe_read);
-          tCsB_p = tCsB(_,_,_,smem_pipe_read);
+          if constexpr (DelayS2Wait) {
+            // Wait at the cross-stage S2R read: the older group must be
+            // complete, while the newly issued group can remain in flight.
+            cp_async_wait<1>();
+            __syncthreads();
+          }
+          // On the last tile the next-stage register preload is unused. Keep
+          // that read on the live A/B stage while the retired slots receive C.
+          int next_stage = smem_pipe_read;
+          if constexpr (phase == KTilePhase::FinalC) next_stage = live_stage;
+          tCsA_p = tCsA(_,_,_,next_stage);
+          tCsB_p = tCsB(_,_,_,next_stage);
         }
 
         // Load A, B shmem->regs for k_block+1
@@ -914,18 +941,25 @@ struct CollectiveMma<
         // Copy gmem to smem after computing gemm on each k-pipe
         if (k_block == K_BLOCK_MAX - 2) {
 
-          // Commit the smem for smem_pipe_read
-          cp_async_wait<DispatchPolicy::Stages-2>();
+          // The final C tile already has its A/B operands. A wait here would
+          // stall its remaining MMA on C, which is only consumed by the epilogue.
+          if constexpr (phase != KTilePhase::FinalC) {
+            if constexpr (!DelayS2Wait) cp_async_wait<DispatchPolicy::Stages-2>();
+            __syncthreads();
+          }
 
-          __syncthreads();
-
-          if (k_tile_count > 0) {
+          if (phase == KTilePhase::SteadyAB || k_tile_count > 0) {
             copy_aiu(
               gmem_tiled_copy_A, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,smem_pipe_write),
               gmem_tiled_copy_B, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write),
               warp_idx
             );
+          } else if constexpr (stage_c) {
+            // All warps have read this slot for the last time. Use its empty
+            // refill group for C; the next A/B slot is already ready to read.
+            if constexpr (phase != KTilePhase::FinalC) prefetch_c(smem_pipe_write);
           }
+          // Empty groups during drain preserve FIFO wait<1> semantics.
           cp_async_fence();
 
           --k_tile_count;
@@ -938,18 +972,27 @@ struct CollectiveMma<
       }); // for_each
 
     };
-    if constexpr (StaticK256) {
+    if constexpr (StaticKTiles > 0) {
       static_assert(PeelFirstK && std::is_same_v<ArchTag, cutlass::arch::PPU0010>);
-      CUTE_STATIC_ASSERT_V(size<2>(TileShape{}) == Int<64>{});
-      static_assert(DispatchPolicy::Stages == 2 || DispatchPolicy::Stages == 3);
-      for_each(make_int_sequence<4>{}, [&](auto) { process_k_tile(); });
+      static_assert(StaticKTiles >= DispatchPolicy::Stages && StaticKTiles <= 16);
+      static_assert(!stage_c);  // C staging uses the PPU0015 collective.
+      for_each(make_int_sequence<StaticKTiles>{}, [&](auto) { process_k_tile(cute::C<KTilePhase::Regular>{}); });
     } else {
+      constexpr int normal_end = int(stage_c) - DispatchPolicy::Stages;
       if constexpr (PeelFirstK) {
         CUTE_STATIC_ASSERT_V(K_BLOCK_MAX > Int<1>{});
-        if (k_tile_count > -(DispatchPolicy::Stages)) process_k_tile();
+        if (k_tile_count > normal_end) process_k_tile(cute::C<KTilePhase::Regular>{});
+      }
+      if constexpr (stage_c && DispatchPolicy::Stages > 2) {
+        // Keep C addresses and the drain decisions out of the steady-state refill.
+        CUTLASS_PRAGMA_NO_UNROLL
+        while (k_tile_count > 0) process_k_tile(cute::C<KTilePhase::SteadyAB>{});
       }
       CUTLASS_PRAGMA_NO_UNROLL
-      while (k_tile_count > -(DispatchPolicy::Stages)) process_k_tile();
+      while (k_tile_count > normal_end) process_k_tile(cute::C<KTilePhase::Regular>{});
+      if constexpr (stage_c) {
+        if (k_tile_count > -DispatchPolicy::Stages) process_k_tile(cute::C<KTilePhase::FinalC>{});
+      }
     }
 
     // TODO: original cutlass3 miss this sync
@@ -966,6 +1009,20 @@ struct CollectiveMma<
 
 
 namespace cutlass::gemm::kernel {
+// The grouped C epilogues expose CStage: void for a direct read, or a
+// policy that prefetches C as A/B slots retire.
+template <class Epilogue, class = void>
+struct GroupedCPolicy {
+  static constexpr bool with_c = false;
+  using Stage = void;
+};
+
+template <class Epilogue>
+struct GroupedCPolicy<Epilogue, std::void_t<typename Epilogue::CStage>> {
+  static constexpr bool with_c = true;
+  using Stage = typename Epilogue::CStage;
+};
+
 
 using deep_gemm::GemmType;
 
@@ -1039,6 +1096,9 @@ public:
       EpilogueSharedStorage epilogue;
     } tensors;
   };
+  using CPolicy = GroupedCPolicy<CollectiveEpilogue>;
+  using CStage = typename CPolicy::Stage;
+  static constexpr bool kStageC = !std::is_void_v<CStage>;
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
   // Device side arguments
@@ -1186,21 +1246,57 @@ public:
     int thread_idx = int(threadIdx.x);
     auto blk_shape = TileShape{}; // (BLK_M,BLK_N,BLK_K)
     TileScheduler deep_scheduler(params.scheduler);
+    if constexpr (TileScheduler::GEMM_TYPE == GemmType::MGroupedContiguous) {
+      // Contiguous C and D have physical row coordinates and no batch offset.
+      deep_scheduler.curr_group_idx = 0;
+    }
 
     uint32_t m_coord, n_coord;
     uint32_t l_coord = 0;
     constexpr uint32_t L = 1;
 
-    while (deep_scheduler.fetch_next_work(m_coord, n_coord)) {
-
+    // Padded expert IDs can change at 128-row boundaries inside a wider CTA.
+    constexpr uint32_t padded_alignment = 128;
+    constexpr bool wide_padded = CPolicy::with_c && TileScheduler::GEMM_TYPE == GemmType::MGroupedContiguous &&
+                                 TileScheduler::BLOCK_M > padded_alignment;
+    uint32_t next_span_row = 0;
+    while ((wide_padded && next_span_row != 0) || deep_scheduler.fetch_next_work(m_coord, n_coord)) {
       uint32_t M = deep_scheduler.curr_problem_m();
-
-      auto problem_shape_MNKL = ProblemShape{M, N, K, L};
+      uint32_t tile_m = m_coord;
 
       auto offset_m = deep_scheduler.curr_offset_m();
       auto expert_id = deep_scheduler.problem_index();
       auto offset_a = deep_scheduler.curr_offset_a();
-      auto offset_b = deep_scheduler.curr_offset_b(m_coord);
+      auto offset_cd = deep_scheduler.curr_offset_c();
+      int64_t offset_b;
+      if constexpr (wide_padded) {
+        const uint32_t first = m_coord * TileScheduler::BLOCK_M;
+        const uint32_t row = next_span_row ? next_span_row : first;
+        const uint32_t tile_end = first + cute::min(TileScheduler::BLOCK_M, M - first);
+        const auto* ids = params.scheduler.grouped_layout;
+        const int expert = __ldg(ids + row);
+        uint32_t end = tile_end;
+        for (uint32_t i = padded_alignment - row % padded_alignment; i < tile_end - row; i += padded_alignment) {
+          if (__ldg(ids + row + i) != expert) {
+            end = row + i;
+            break;
+          }
+        }
+        next_span_row = end < tile_end ? end : 0;
+        if (uint32_t(expert) >= TileScheduler::kNumGroups) continue;
+        offset_b = int64_t(expert) * N * K;
+        // Rebase every span so the AIU load, C prefetch and D store use the same local M bound.
+        tile_m = 0;
+        M = end - row;
+        offset_a = int64_t(row) * K;
+        offset_cd = int64_t(row) * N;
+      } else {
+        offset_b = deep_scheduler.curr_offset_b(m_coord);
+        if constexpr (TileScheduler::GEMM_TYPE == GemmType::MGroupedContiguous) {
+          if (uint64_t(offset_b) >= uint64_t(TileScheduler::kNumGroups) * N * K) continue;
+        }
+      }
+      auto problem_shape_MNKL = ProblemShape{M, N, K, L};
       const ElementA* ptr_A = reinterpret_cast<const ElementA*>(params.mainloop.ptr_A) + offset_a;
       const ElementB* ptr_B = reinterpret_cast<const ElementB*>(params.mainloop.ptr_B) + offset_b;
 
@@ -1209,7 +1305,7 @@ public:
       //       M, N, K, offset_m, expert_id, offset_a, offset_b, m_coord, n_coord, ptr_A, ptr_B);
       // }
 
-      auto blk_coord_mnkl = make_coord(m_coord, n_coord, _, l_coord);
+      auto blk_coord_mnkl = make_coord(tile_m, n_coord, _, l_coord);
       CollectiveMainloop collective_mma(params.mainloop, take<0, 3>(problem_shape_MNKL));
 
       auto load_inputs = collective_mma.load_init(problem_shape_MNKL, blk_coord_mnkl, params.mainloop,
@@ -1232,22 +1328,23 @@ public:
       auto k_tile_iter  = cute::make_coord_iterator(shape<2>(gA));
       int  k_tile_count = size<2>(gA);
 
-      // Perform the collective scoped MMA
-      collective_mma(
-        accumulators,
-        load_inputs,
-        accumulators,
-        k_tile_iter, k_tile_count,
-        residue_mnk,
-        thread_idx,
-        warp_idx,
-        smem_buf
-      );
+      if constexpr (kStageC) {
+        const auto* group_c = params.epilogue.ptr_C + offset_cd;
+        collective_mma(accumulators, load_inputs, accumulators, k_tile_iter, k_tile_count,
+                       residue_mnk, thread_idx, warp_idx, smem_buf, [&](int slot) {
+                         CStage::prefetch(smem_buf, group_c,
+                                          tile_m * TileScheduler::BLOCK_M,
+                                          n_coord * TileScheduler::BLOCK_N, M, N, slot);
+                       });
+      } else {
+        collective_mma(accumulators, load_inputs, accumulators, k_tile_iter, k_tile_count,
+                       residue_mnk, thread_idx, warp_idx, smem_buf);
+      }
 
       // update params.epilogue for ptrC and ptrD
       auto params_epilogue_local = params.epilogue;
-      params_epilogue_local.ptr_C += deep_scheduler.curr_offset_c();
-      params_epilogue_local.ptr_D += deep_scheduler.curr_offset_c();
+      params_epilogue_local.ptr_C += offset_cd;
+      params_epilogue_local.ptr_D += offset_cd;
       // Epilogue and write to gD
       CollectiveEpilogue epilogue{params_epilogue_local, shared_storage.tensors.epilogue};
       epilogue(
@@ -1260,6 +1357,10 @@ public:
         thread_idx,
         (char*)&shared_storage.tensors.epilogue
       );
+      if constexpr (kStageC) {
+        // No warp may overwrite C with the next output tile's A/B before its peers finish reading.
+        __syncthreads();
+      }
       // if (thread0()) {
       //   printf("accumulators[0] = %.4f\n", accumulators[0]);
       // }
@@ -1286,27 +1387,73 @@ public:
 
 namespace deep_gemm {
 
-struct Model810eReduceParams {
+struct BF16GemmEpilogueParams {
+    const float* product;
+    const void* c;
+    void* d;
+    int64_t count, n, cStride;
+};
+
+// A bounded grid covers the full output without exceeding the SIMT CU budget.
+// C may have padded/broadcast rows or alias D; each element is read before its store.
+template <typename Output, bool HasProduct, bool HasC>
+__device__ void bf16_gemm_epilogue_impl(const BF16GemmEpilogueParams p) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < p.count;
+         i += int64_t(gridDim.x) * blockDim.x) {
+        Output cValue = Output(0.0f);
+        if constexpr (HasC)
+            cValue = static_cast<const Output*>(p.c)[(i / p.n) * p.cStride + i % p.n];
+        if constexpr (HasProduct) {
+            float value = p.product[i];
+            if constexpr (HasC) value += float(cValue);
+            // Convert only after FP32 addition, including cancellation cases.
+            static_cast<Output*>(p.d)[i] = Output(value);
+        } else {
+            // K=0 copy preserves the input value directly, without adding zero.
+            static_cast<Output*>(p.d)[i] = cValue;
+        }
+    }
+}
+
+struct BF16GemmSplitKReduceParams810E {
     const float* partial;
     void* d;
     int64_t count;
 };
 
+// K is a nonnegative int, BK>=32 and split<=Splits<=64. Consequently
+// (K/BK)*split < 2^32 even when it exceeds INT_MAX. Unsigned arithmetic
+// preserves the tile partition without adding 64-bit operations to short GEMMs;
+// the final offset is bounded by K before conversion back to int.
+template <int BK, int Splits>
+CUTLASS_HOST_DEVICE constexpr int bf16_gemm_split_k_offset_810e(int k, int split) {
+    static_assert(BK >= 32 && Splits >= 1 && Splits <= 64);
+    return int((uint32_t(k / BK) * uint32_t(split) / Splits) * BK);
+}
+
+// Compile-time regressions exercise the actual partition helper without a
+// multi-gigabyte allocation. Include an uneven partition and its final tile.
+static_assert(bf16_gemm_split_k_offset_810e<32, 64>(1073741856, 0) == 0);
+static_assert(bf16_gemm_split_k_offset_810e<32, 64>(1073741856, 63) == 1056964608);
+static_assert(bf16_gemm_split_k_offset_810e<32, 64>(1073741856, 64) == 1073741856);
+static_assert(bf16_gemm_split_k_offset_810e<64, 3>(448, 2) == 256);
+
 template <typename Output, int Splits>
-__device__ void model_810e_reduce(const Model810eReduceParams p) {
-    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= p.count) return;
-    float value = 0.0f;
-    #pragma unroll
-    for (int s = 0; s < Splits; ++s)
-        value += p.partial[int64_t(s) * p.count + i];
-    // BF16 conversion occurs only after all FP32 split partials are summed.
-    static_cast<Output*>(p.d)[i] = Output(value);
+__device__ void bf16_gemm_split_k_reduce_impl_810e(const BF16GemmSplitKReduceParams810E p) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < p.count;
+         i += int64_t(gridDim.x) * blockDim.x) {
+        float value = 0.0f;
+        #pragma unroll
+        for (int s = 0; s < Splits; ++s)
+            value += p.partial[int64_t(s) * p.count + i];
+        // BF16 conversion occurs only after all FP32 split partials are summed.
+        static_cast<Output*>(p.d)[i] = Output(value);
+    }
 }
 
 
-template <class Mainloop, typename Output, int Splits>
-struct Model810eDenseKernel {
+template <class Mainloop, typename Output, int Splits, bool Persistent = false>
+struct BF16GemmDirectKernel810E {
     template <class Params>
     CUTLASS_DEVICE void operator()(Params const& p, char* smem) {
         using namespace cute;
@@ -1315,135 +1462,173 @@ struct Model810eDenseKernel {
         constexpr int BM = size<0>(Tile{}), BN = size<1>(Tile{}), BK = size<2>(Tile{});
         const int m = get<0>(p.problem_shape), n = get<1>(p.problem_shape);
         const int k = get<2>(p.problem_shape);
-        const int mi = int(blockIdx.y), ni = int(blockIdx.x), split = int(blockIdx.z);
-        // Partition complete BK tiles. The API enforces K%BK=0 and at least one
-        // tile per split, so AIU never reads across a logical row's K boundary.
-        const int begin = ((k / BK) * split / Splits) * BK;
-        const int length = ((k / BK) * (split + 1) / Splits) * BK - begin;
-        auto problem = make_shape(m, n, length, 1);
-        auto coord = make_coord(mi, ni, _, 0);
-        Mainloop loop(p.mainloop, take<0, 3>(problem));
-        auto inputs = loop.load_init(problem, coord, p.mainloop, 0, 0,
-                                     p.mainloop.ptr_A + begin, p.mainloop.ptr_B + begin);
-        auto gA = get<0>(inputs);
-        auto residue = make_tuple(m - mi * BM, n - ni * BN,
-                                  length - size<1>(gA) * size<2>(gA));
-        Mma mma;
-        auto accum = make_fragment_like<float>(partition_fragment_C(mma, take<0, 2>(Tile{})));
-        clear(accum);
-        auto iter = make_coord_iterator(shape<2>(gA));
-        loop(accum, inputs, accum, iter, size<2>(gA), residue,
-             int(threadIdx.x), cutlass::canonical_warp_idx_sync(), smem);
-        auto coords = mma.get_slice(int(threadIdx.x)).partition_C(
-            make_identity_tensor(make_shape(Int<BM>{}, Int<BN>{})));
-        CUTE_UNROLL
-        for (int i = 0; i < size(accum); ++i) {
-            const int row = mi * BM + get<0>(coords(i));
-            const int col = ni * BN + get<1>(coords(i));
-            if (row < m && col < n) {
-                const int64_t offset = int64_t(row) * n + col;
-                if constexpr (Splits == 1)
-                    p.epilogue.ptr_D[offset] = Output(accum(i));
-                else
-                    static_cast<float*>(p.workspace)[int64_t(split) * m * n + offset] = accum(i);
+        const int64_t tilesM = (int64_t(m) + BM - 1) / BM;
+        const int64_t tilesN = (int64_t(n) + BN - 1) / BN;
+        const int64_t work = Persistent ? tilesM * tilesN * Splits : 1;
+        for (int64_t linear = Persistent ? blockIdx.x : 0; linear < work;
+             linear += Persistent ? gridDim.x : 1) {
+            const int split = Persistent ? int(linear / (tilesM * tilesN)) : int(blockIdx.z);
+            const int mi = Persistent ? int((linear / tilesN) % tilesM) : int(blockIdx.y);
+            const int ni = Persistent ? int(linear % tilesN) : int(blockIdx.x);
+            // Partition complete BK tiles. The API enforces K%BK=0 and at least one
+            // tile per split, so AIU never reads across a logical row's K boundary.
+            const int begin = bf16_gemm_split_k_offset_810e<BK, Splits>(k, split);
+            const int length = bf16_gemm_split_k_offset_810e<BK, Splits>(k, split + 1) - begin;
+            auto problem = make_shape(m, n, length, 1);
+            auto coord = make_coord(mi, ni, _, 0);
+            Mainloop loop(p.mainloop, take<0, 3>(problem));
+            auto inputs = loop.load_init(problem, coord, p.mainloop, 0, 0,
+                                         p.mainloop.ptr_A + begin, p.mainloop.ptr_B + begin);
+            auto gA = get<0>(inputs);
+            auto residue = make_tuple(m - mi * BM, n - ni * BN,
+                                      length - size<1>(gA) * size<2>(gA));
+            Mma mma;
+            auto accum = make_fragment_like<float>(partition_fragment_C(mma, take<0, 2>(Tile{})));
+            clear(accum);
+            auto iter = make_coord_iterator(shape<2>(gA));
+            loop(accum, inputs, accum, iter, size<2>(gA), residue,
+                 int(threadIdx.x), cutlass::canonical_warp_idx_sync(), smem);
+            auto coords = mma.get_slice(int(threadIdx.x)).partition_C(
+                make_identity_tensor(make_shape(Int<BM>{}, Int<BN>{})));
+            CUTE_UNROLL
+            for (int i = 0; i < size(accum); ++i) {
+                const int row = mi * BM + get<0>(coords(i));
+                const int col = ni * BN + get<1>(coords(i));
+                if (row < m && col < n) {
+                    const int64_t offset = int64_t(row) * n + col;
+                    if constexpr (Splits == 1)
+                        p.epilogue.ptr_D[offset] = Output(accum(i));
+                    else
+                        static_cast<float*>(p.workspace)[int64_t(split) * m * n + offset] = accum(i);
+                }
             }
+            if constexpr (Persistent) __syncthreads();
         }
     }
 };
 
-template <class Mainloop>
-struct Model810eBatchedKernel {
-    template <class Params>
-    CUTLASS_DEVICE void operator()(Params const& p, char* smem) {
-        using namespace cute;
-        using Tile = typename Mainloop::TileShape;
-        using Mma = typename Mainloop::TiledMma;
-        constexpr int BM = size<0>(Tile{}), BN = size<1>(Tile{});
-        const int m = get<0>(p.problem_shape), n = get<1>(p.problem_shape);
-        const int k = get<2>(p.problem_shape);
-        const int batch = int(blockIdx.z), mi = int(blockIdx.y), ni = int(blockIdx.x);
-        auto problem = make_shape(m, n, k, 1);
-        auto coord = make_coord(mi, ni, _, 0);
-        Mainloop loop(p.mainloop, take<0, 3>(problem));
-        auto inputs = loop.load_init(problem, coord, p.mainloop, 0, 0,
-            p.mainloop.ptr_A + int64_t(batch) * get<2>(p.mainloop.dA),
-            p.mainloop.ptr_B + int64_t(batch) * get<2>(p.mainloop.dB));
-        auto gA = get<0>(inputs);
-        auto residue = make_tuple(m - mi * BM, n - ni * BN,
-                                  k - size<1>(gA) * size<2>(gA));
-        Mma mma;
-        auto accum = make_fragment_like<float>(partition_fragment_C(mma, take<0, 2>(Tile{})));
-        clear(accum);
-        auto iter = make_coord_iterator(shape<2>(gA));
-        loop(accum, inputs, accum, iter, size<2>(gA), residue,
-             int(threadIdx.x), cutlass::canonical_warp_idx_sync(), smem);
-        // TiledMma supplies the 810E lane mapping; CUDA/890P formulas differ.
-        auto coords = mma.get_slice(int(threadIdx.x)).partition_C(
-            make_identity_tensor(make_shape(Int<BM>{}, Int<BN>{})));
-        CUTE_UNROLL
-        for (int i = 0; i < size(accum); ++i) {
-            const int row = mi * BM + get<0>(coords(i));
-            const int col = ni * BN + get<1>(coords(i));
-            if (row < m && col < n) {
-                const int64_t offset = int64_t(batch) * get<2>(p.epilogue.dD) +
-                                       int64_t(row) * get<0>(p.epilogue.dD) + col;
-                p.epilogue.ptr_D[offset] = cutlass::bfloat16_t(accum(i));
-            }
-        }
-    }
-};
 
-template <class Base, bool StaticK256 = false>
-struct Model810eFirstKPeel : Base {
+template <class Base, bool PeelFirstK = false, int StaticKTiles = 0>
+struct BF16GemmMainloop810E : Base {
     using Base::Base;
     template <class... Args>
     CUTLASS_DEVICE void operator()(Args&&... args) {
-        Base::template operator()<true, StaticK256>(static_cast<Args&&>(args)...);
+        Base::template operator()<PeelFirstK, StaticKTiles, true>(static_cast<Args&&>(args)...);
     }
 };
 
-// Input descriptors retain the caller's row strides. Batch and split-K both
-// use grid.z, but only batch changes input bases; split-K changes the K interval.
-template <class Mainloop, class Epilogue, bool SplitK, int Splits, bool GridMFirst, bool StaticM36 = false>
-struct Model810eTsmKernel {
+// A narrow final N tile can use fewer MMA instructions without another
+// launch. The host restricts this wrapper to one complete dense K product,
+// BM128/BN128, 256 threads and non-persistent grid orders 0/1.
+template <class Primary, class TailMainloop, int TileOrder>
+struct BF16GemmNarrowNTailKernel810E {
     template <class Params>
     CUTLASS_DEVICE void operator()(Params const& p, char* smem) {
         using namespace cute;
-        using Tile = typename Mainloop::TileShape;
-        using Mma = typename Mainloop::TiledMma;
-        constexpr int BM = size<0>(Tile{}), BN = size<1>(Tile{}), BK = size<2>(Tile{});
-        const int m = StaticM36 ? 36 : get<0>(p.problem_shape), n = StaticM36 ? 512 : get<1>(p.problem_shape);
-        const int k = StaticM36 ? 256 : get<2>(p.problem_shape), groups = get<3>(p.problem_shape);
-        const int mi = GridMFirst ? int(blockIdx.x) : int(blockIdx.y);
-        const int ni = GridMFirst ? int(blockIdx.y) : int(blockIdx.x);
-        const int zi = int(blockIdx.z);
-        const int begin = SplitK ? ((k / BK) * zi / Splits) * BK : 0;
-        const int length = SplitK ? ((k / BK) * (zi + 1) / Splits) * BK - begin : k;
-        const auto* ptr_a = p.mainloop.ptr_A + (SplitK ? int64_t(begin) : int64_t(zi) * get<2>(p.mainloop.dA));
-        const auto* ptr_b = p.mainloop.ptr_B + (SplitK ? int64_t(begin) : int64_t(zi) * get<2>(p.mainloop.dB));
-        const auto input_problem = make_shape(m, n, length, 1);
-        const auto input_coord = make_coord(mi, ni, _, 0);
-        Mainloop loop(p.mainloop, take<0, 3>(input_problem));
-        auto inputs = loop.load_init(input_problem, input_coord, p.mainloop, 0, 0, ptr_a, ptr_b);
+        static_assert(TileOrder == 0 || TileOrder == 1);
+        const int m = get<0>(p.problem_shape), n = get<1>(p.problem_shape);
+        const int k = get<2>(p.problem_shape), tail = n % 128;
+        const int ni = TileOrder == 1 ? int(blockIdx.y) : int(blockIdx.x);
+        if (tail == 0 || tail > 16 || ni != n / 128) {
+            Primary{}(p, smem);
+            return;
+        }
+        using Tile = typename TailMainloop::TileShape;
+        using Mma = typename TailMainloop::TiledMma;
+        static_assert(size<0>(Tile{}) == 128 && size<1>(Tile{}) == 16);
+        const int mi = TileOrder == 1 ? int(blockIdx.x) : int(blockIdx.y);
+        const int firstN = n - tail;
+        typename TailMainloop::Params mp{
+            p.mainloop.ptr_A, p.mainloop.dA,
+            p.mainloop.ptr_B + int64_t(firstN) * get<0>(p.mainloop.dB), p.mainloop.dB};
+        const auto problem = make_shape(m, tail, k, 1);
+        TailMainloop loop(mp, take<0, 3>(problem));
+        auto inputs = loop.load_init(problem, make_coord(mi, 0, _, 0), mp, 0, 0, mp.ptr_A, mp.ptr_B);
         auto gA = get<0>(inputs);
-        auto residue = make_tuple(m - mi * BM, n - ni * BN,
-                                  length - size<1>(gA) * size<2>(gA));
+        auto residue = make_tuple(m - mi * 128, tail, k - size<1>(gA) * size<2>(gA));
         Mma mma;
         auto accum = make_fragment_like<float>(partition_fragment_C(mma, take<0, 2>(Tile{})));
         clear(accum);
         auto iter = make_coord_iterator(shape<2>(gA));
         loop(accum, inputs, accum, iter, size<2>(gA), residue,
              int(threadIdx.x), cutlass::canonical_warp_idx_sync(), smem);
+        auto coords = mma.get_slice(int(threadIdx.x)).partition_C(make_identity_tensor(take<0, 2>(Tile{})));
+        CUTE_UNROLL
+        for (int i = 0; i < size(accum); ++i) {
+            const int row = mi * 128 + get<0>(coords(i)), col = get<1>(coords(i));
+            if (row < m && col < tail)
+                p.epilogue.ptr_D[int64_t(row) * get<0>(p.epilogue.dD) + firstN + col] =
+                    static_cast<std::remove_pointer_t<decltype(p.epilogue.ptr_D)>>(accum(i));
+        }
+    }
+};
 
-        // The AIU mainloop ends with cp_async_wait<0>() and __syncthreads().
-        // Reuse its storage for the software-swizzled epilogue only after that
-        // barrier. These are fresh register writes, not reads of AIU data.
-        auto& epi_storage = *reinterpret_cast<typename Epilogue::SharedStorage*>(smem);
-        Epilogue epilogue{p.epilogue, epi_storage};
-        // Output strides and z coordinate are real. For split-K the host builds
-        // a FLOAT epilogue and D[splits,M,N], so no partial BF16 rounding occurs.
-        epilogue(make_shape(m, n, length, groups), Tile{}, make_coord(mi, ni, _, zi),
-                 accum, mma, residue, int(threadIdx.x), smem);
+// Dense inputs share one matrix pair. grid.z selects a split-K interval and
+// its FP32 output plane; a complete product uses a single plane.
+template <class Mainloop, class Epilogue, bool SplitK, int Splits, int TileOrder, int StaticK = 0, bool Persistent = false>
+struct BF16GemmTsmKernel810E {
+    template <class Params>
+    CUTLASS_DEVICE void operator()(Params const& p, char* smem) {
+        using namespace cute;
+        using Tile = typename Mainloop::TileShape;
+        using Mma = typename Mainloop::TiledMma;
+        constexpr int BM = size<0>(Tile{}), BN = size<1>(Tile{}), BK = size<2>(Tile{});
+        const int m = get<0>(p.problem_shape), n = get<1>(p.problem_shape);
+        const int k = StaticK > 0 ? StaticK : get<2>(p.problem_shape), groups = get<3>(p.problem_shape);
+        const int64_t tilesM = (int64_t(m) + BM - 1) / BM;
+        const int64_t tilesN = (int64_t(n) + BN - 1) / BN;
+        const int64_t work = Persistent ? tilesM * tilesN * groups : 1;
+        for (int64_t linear = Persistent ? blockIdx.x : 0; linear < work;
+             linear += Persistent ? gridDim.x : 1) {
+            const int zi = Persistent ? int(linear / (tilesM * tilesN)) : int(blockIdx.z);
+            int mi, ni;
+            if constexpr (TileOrder >= 2) {
+                // Traverse a bounded A row panel across N before advancing M.
+                // The final group may contain fewer rows; divide by its actual
+                // height so every output tile is visited exactly once.
+                const int64_t local = Persistent ? linear % (tilesM * tilesN) :
+                    int64_t(blockIdx.y) * gridDim.x + blockIdx.x;
+                const int64_t span = TileOrder * tilesN;
+                const int64_t firstM = (local / span) * TileOrder;
+                const int64_t activeM = tilesM - firstM < TileOrder ? tilesM - firstM : TileOrder;
+                const int64_t within = local % span;
+                mi = int(firstM + within % activeM);
+                ni = int(within / activeM);
+            } else {
+                mi = Persistent ? int(TileOrder == 1 ? linear % tilesM : (linear / tilesN) % tilesM) :
+                     (TileOrder == 1 ? int(blockIdx.x) : int(blockIdx.y));
+                ni = Persistent ? int(TileOrder == 1 ? (linear / tilesM) % tilesN : linear % tilesN) :
+                     (TileOrder == 1 ? int(blockIdx.y) : int(blockIdx.x));
+            }
+            const int begin = SplitK ? bf16_gemm_split_k_offset_810e<BK, Splits>(k, zi) : 0;
+            const int length = SplitK ? bf16_gemm_split_k_offset_810e<BK, Splits>(k, zi + 1) - begin : k;
+            const auto* ptrA = p.mainloop.ptr_A + begin;
+            const auto* ptrB = p.mainloop.ptr_B + begin;
+            const auto inputProblem = make_shape(m, n, length, 1);
+            const auto inputCoord = make_coord(mi, ni, _, 0);
+            Mainloop loop(p.mainloop, take<0, 3>(inputProblem));
+            auto inputs = loop.load_init(inputProblem, inputCoord, p.mainloop, 0, 0, ptrA, ptrB);
+            auto gA = get<0>(inputs);
+            auto residue = make_tuple(m - mi * BM, n - ni * BN,
+                                      length - size<1>(gA) * size<2>(gA));
+            Mma mma;
+            auto accum = make_fragment_like<float>(partition_fragment_C(mma, take<0, 2>(Tile{})));
+            clear(accum);
+            auto iter = make_coord_iterator(shape<2>(gA));
+            loop(accum, inputs, accum, iter, size<2>(gA), residue,
+                 int(threadIdx.x), cutlass::canonical_warp_idx_sync(), smem);
+
+            // The AIU mainloop ends with cp_async_wait<0>() and __syncthreads().
+            // Reuse its storage for the software-swizzled epilogue only after that
+            // barrier. These are fresh register writes, not reads of AIU data.
+            auto& epiStorage = *reinterpret_cast<typename Epilogue::SharedStorage*>(smem);
+            Epilogue epilogue{p.epilogue, epiStorage};
+            // Output strides and z coordinate are real. For split-K the host builds
+            // a FLOAT epilogue and D[splits,M,N], so no partial BF16 rounding occurs.
+            epilogue(make_shape(m, n, length, groups), Tile{}, make_coord(mi, ni, _, zi),
+                     accum, mma, residue, int(threadIdx.x), smem);
+            if constexpr (Persistent) __syncthreads();
+        }
     }
 };
 

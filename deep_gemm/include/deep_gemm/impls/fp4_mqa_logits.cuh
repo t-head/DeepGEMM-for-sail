@@ -73,12 +73,14 @@ public:
     static constexpr bool WarpInterleaving = NumThreadsPerCTA == 512;
     // Output ownership and task distribution are independent of M-block grouping.
     static constexpr bool kIsAvg = kScaleMode != deep_gemm::kScaleModeWeights;
+    static_assert(!(kIsAvg && kNumHeads == 8) || (WARP_Q == 2 && MmaIterN == 1),
+                  "H8 AVG requires WARP_QH=16");
     static_assert(!kQOwnerEpilogue ||
                   (kIsAvg && kNumHeads == 4 && WARP_Q == 4 && MmaIterN == 1),
                   "Q-owner requires H4 AVG with WARP_Q=4");
     static_assert(!kBalanceOutputTiles ||
-                  (kIsAvg && kNumHeads == 4 && kNumQStages == 1),
-                  "balanced output tiles require H4 AVG with one Q stage");
+                  (kIsAvg && (kNumHeads == 4 || kNumHeads == 8) && kNumQStages == 1),
+                  "balanced output tiles require H4/H8 AVG with one Q stage");
 
 
     // ── AIU operands for Q/K ────────────────────────────────────────────
@@ -336,8 +338,7 @@ public:
         Tensor tCsW = smem_thr_copy_weights.partition_S(sW_copy);
         Tensor tCrW_copy_view = make_tensor_like(tCsW(_, _, _, 0));
         using WeightRegLayout = Layout<Shape<Shape<_2, _2, _2>, Int<MmaIterN>>, Stride<Stride<_1, _0, _2>, _4>>;
-        // For bf16 weights: tCrW points directly to tCrW_copy_view's data (no separate weights array)
-        // For float weights: tCrW points to weights array (populated by cvt in load_q_s2r)
+        // The S2R helper copies or converts weights into the epilogue tensor.
         ElementLogits weights[elem_weights];
         // Avg variants
         // FP32 Q-owner combines the two output factors once per Q load.
@@ -351,6 +352,10 @@ public:
         // Only kScaleModeQRow reads scale_q_row
         float scale_q_row[WARP_Q];
 
+        constexpr bool kLoadWeightsInEpilogue = kNumHeads == 32 && kIsCompressedLogits &&
+            kScaleMode == deep_gemm::kScaleModeWeights &&
+            cute::is_same_v<ElementWeights, __ppu_bfloat16> &&
+            cute::is_same_v<ElementLogits, __ppu_bfloat16>;
         Tensor tCrW = make_tensor(static_cast<ElementLogits*>(weights), WeightRegLayout{});
 
         // ── Block scheduler (non-paged) ───────────────────────────────────
@@ -390,6 +395,10 @@ public:
         }
         // Per-token KV range arrays for compressed logits mode (dead code when kIsCompressedLogits=false)
         uint32_t seq_k_start[BLOCK_Q], seq_k_end[BLOCK_Q];
+        uint32_t full_kv_start = 0, full_kv_end = 0;
+        uint32_t row_k_start = 0, row_k_len = 0;
+        // Only initialized for a nonempty interior; includes this warp's KV offset.
+        StrideKType full_output_offset = 0;
 
         // ── Variables ─────────────────────────────────────────────────────
         clear(accum);
@@ -432,13 +441,18 @@ public:
             tSFAgSFA.data() = tSFAgSFA.data() + BLOCK_KV;
         };
 
+        auto load_weights_s2r = [&](uint32_t q_stage_idx) {
+            copy(smem_tiled_copy_weights, tCsW(_, _, _, q_stage_idx), tCrW_copy_view);
+            deep_gemm::load_weights_from_copy_view<ElementWeights, ElementLogits>(
+                tCrW_copy_view, weights, elem_weights);
+        };
+
         auto load_q_s2r = [&](uint32_t q_stage_idx) {
             copy(smem_tiled_copy_B, tCsB(_, _, _, q_stage_idx), tCrB_copy_view);
             copy(smem_tiled_copy_SFB, tCsSFB(_, _, _, q_stage_idx), tCrSFB_copy_view);
             if constexpr (kScaleMode == deep_gemm::kScaleModeWeights) {
-                copy(smem_tiled_copy_weights, tCsW(_, _, _, q_stage_idx), tCrW_copy_view);
-                deep_gemm::load_weights_from_copy_view<ElementWeights, ElementLogits>(
-                    tCrW_copy_view, weights, elem_weights);
+                if constexpr (!kLoadWeightsInEpilogue)
+                    load_weights_s2r(q_stage_idx);
             } else if constexpr (kScaleMode == deep_gemm::kScaleModeQRow) {
                 // The weights slot carries the per-Q-row float scale; clamped for partial tail blocks
                 #pragma unroll
@@ -464,7 +478,7 @@ public:
             copy(smem_tiled_copy_SFA, tCsSFA(_, scale_group, k_block, kv_stage_idx), tCrSFA_copy_view(_, scale_group, k_block));
         };
 
-        auto epilogue_mblock = [&](uint32_t kv_start, uint32_t kv_block_idx, int m_block) {
+        auto epilogue_mblock = [&](uint32_t kv_start, uint32_t kv_block_idx, int m_block, auto full_kv_tag) {
             // Reduce over heads and store logits
             static constexpr int kNumAccumPerMma = size<0>(accum);
             CUTE_STATIC_ASSERT(kNumHeads % 4 == 0);
@@ -475,7 +489,32 @@ public:
                 auto logits_q_offset = (block_q_idx * BLOCK_Q + warp_q_idx) * params.stride_k;
                 auto logits_kv_offset = kv_offset + mma_offset;
 
-                if constexpr (cute::is_same_v<ElementLogits, float>) {
+                if constexpr (kIsAvg && kNumHeads == 8) {
+                    // Each quad owns two queries and two KV row halves, one output per lane.
+                    const uint32_t local_q = warp_q_idx * WARP_Q + (lane_idx % 4) / 2;
+                    const uint32_t q_idx = block_q_idx * BLOCK_Q + local_q;
+                    const uint32_t kv_idx = kv_offset + mma_offset + v_offset_mine;
+                    float q_scale = 1.0f;
+                    if constexpr (kScaleMode == deep_gemm::kScaleModeQRow)
+                        q_scale = scale_q_row[(lane_idx % 4) / 2];
+                    else if constexpr (kScaleMode == deep_gemm::kScaleModeQScalar)
+                        q_scale = scale_q;
+
+                    static_assert(cute::is_same_v<ElementLogits, __ppu_bfloat16>, "H8 AVG requires BF16 output");
+                    const __ppu_bfloat16 total = deep_gemm::bf16_epilogue_reduce_wq2(accum, m, lane_idx);
+                    const float scale = kInvSqrtHeadDim * q_scale;
+                    const uint32_t scale2 = deep_gemm::tix::cvt_rte_bf16x2_f32(scale, scale);
+                    const ElementLogits value = __hmul(total, __low2bfloat16(reinterpret_cast<const __ppu_bfloat162&>(scale2)));
+                    if (q_idx < static_cast<uint32_t>(params.seq_len_q)) {
+                        if constexpr (kIsCompressedLogits) {
+                            const uint32_t column = kv_idx - seq_k_start[local_q];
+                            if (column < seq_k_end[local_q] - seq_k_start[local_q])
+                                params.logits[q_idx * params.stride_k + column] = value;
+                        } else if (kv_idx < static_cast<uint32_t>(params.seq_len_k)) {
+                            params.logits[q_idx * params.stride_k + kv_idx] = value;
+                        }
+                    }
+                } else if constexpr (cute::is_same_v<ElementLogits, float>) {
                     float v_0, v_1;
                     if constexpr (kScaleMode == deep_gemm::kScaleModeWeights) {
                         deep_gemm::float_epilogue_reduce_tCrW(accum, m, tCrW, v_0, v_1);
@@ -568,6 +607,10 @@ public:
                     }
                 } else {
                     if constexpr (kScaleMode == deep_gemm::kScaleModeWeights) {
+                        // Keep H32 weights out of the MMA live range, allowing
+                        // four resident CTAs without a register cap or spills.
+                        if constexpr (kLoadWeightsInEpilogue)
+                            load_weights_s2r(q_iter_idx % kNumQStages);
                         // bf16 output: separate cvt and fma2 phases with __ppu_sched_bound()
                         constexpr int kTotalTransforms = 4 * size<2>(accum);
                         __ppu_bfloat162 sum_0 = {0, 0};
@@ -583,14 +626,22 @@ public:
                         __ppu_bfloat16 v_1_bf = __hadd(__low2bfloat16(sum_1), __high2bfloat16(sum_1));
                         __ppu_bfloat162 packed = deep_gemm::shfl_xor_reduce_bf16x2({v_0_bf, v_1_bf});
                         if constexpr (kIsCompressedLogits) {
-                            // Finish each uint32 relative column before adding the row base.
-                            const uint32_t rel_lo = static_cast<uint32_t>(logits_kv_offset) + v_0_offset - seq_k_start[warp_q_idx];
-                            const uint32_t rel_hi = static_cast<uint32_t>(logits_kv_offset) + v_1_offset - seq_k_start[warp_q_idx];
-                            const uint32_t len = seq_k_end[warp_q_idx] - seq_k_start[warp_q_idx];
-                            if (rel_lo < len)
-                                params.logits[logits_q_offset + rel_lo] = __low2bfloat16(packed);
-                            if (rel_hi < len)
-                                params.logits[logits_q_offset + rel_hi] = __high2bfloat16(packed);
+                            if constexpr (decltype(full_kv_tag)::value) {
+                                params.logits[full_output_offset + mma_offset + v_0_offset] = __low2bfloat16(packed);
+                                params.logits[full_output_offset + mma_offset + v_1_offset] = __high2bfloat16(packed);
+                            } else {
+                                // Widen before subtracting an unaligned request start.
+                                const StrideKType store_base = logits_q_offset
+                                    + static_cast<StrideKType>(logits_kv_offset)
+                                    - static_cast<StrideKType>(row_k_start);
+                                const uint32_t rel_lo = static_cast<uint32_t>(logits_kv_offset) + v_0_offset - row_k_start;
+                                const uint32_t rel_hi = static_cast<uint32_t>(logits_kv_offset) + v_1_offset - row_k_start;
+                                const uint32_t len = row_k_len;
+                                if (rel_lo < len)
+                                    params.logits[store_base + v_0_offset] = __low2bfloat16(packed);
+                                if (rel_hi < len)
+                                    params.logits[store_base + v_1_offset] = __high2bfloat16(packed);
+                            }
                         } else {
                             params.logits[logits_q_offset + logits_kv_offset + v_0_offset] = __low2bfloat16(packed);
                             params.logits[logits_q_offset + logits_kv_offset + v_1_offset] = __high2bfloat16(packed);
@@ -737,6 +788,23 @@ public:
             }
 
 
+            if constexpr (kIsCompressedLogits &&
+                          kScaleMode == deep_gemm::kScaleModeWeights &&
+                          cute::is_same_v<ElementLogits, __ppu_bfloat16>) {
+                full_kv_start = 0;
+                full_kv_end = params.seq_len_k;
+                // Only the intersection is valid for every output row of this CTA.
+                #pragma unroll
+                for (int q = 0; q < BLOCK_Q; ++q) {
+                    full_kv_start = max(full_kv_start, seq_k_start[q]);
+                    full_kv_end = min(full_kv_end, seq_k_end[q]);
+                    if (q == warp_q_idx) {
+                        row_k_start = seq_k_start[q];
+                        row_k_len = seq_k_end[q] - seq_k_start[q];
+                    }
+                }
+            }
+
             // ── Offset Q / K / scale data pointers ──────────────────────────
             tAgA.data() = tKgK.data() + kv_start * BLOCK_K;
             tSFAgSFA.data() = tSFKgSFK.data() + kv_start;
@@ -768,10 +836,9 @@ public:
 
             deep_gemm::warp_interleave_start<WarpInterleaving>(warp_group_id, NumThreadsPerCTA);
 
-            // ── Inner loop: KV blocks ──────────────────────────────────────
-            for (uint32_t kv_block_idx = 0; kv_block_idx < num_kv_blocks; ++ kv_block_idx) {
+            // Shared block body: segment dispatch only selects the store masks.
+            auto process_kv_block = [&](uint32_t kv_block_idx, auto full_kv_tag) {
                 uint32_t kv_stage_idx = kv_block_idx % kNumKVStages;
-
                 deep_gemm::warp_interleave_sync<WarpInterleaving>(warp_group_id, NumThreadsPerCTA);
 
                 // Issue next K block
@@ -796,7 +863,7 @@ public:
                     deep_gemm::warp_interleave_arrive<WarpInterleaving>(warp_group_id, NumThreadsPerCTA);
                     #pragma unroll
                     for (int m_block = 0; m_block < size<1>(accum); m_block++) {
-                        epilogue_mblock(kv_start, kv_block_idx, m_block);
+                        epilogue_mblock(kv_start, kv_block_idx, m_block, full_kv_tag);
                     }
                 } else { // Grouped S2R/MMA and epilogue, independent of output precision
                     static_assert(kMBlockGroup > 0 && M_BLOCK % kMBlockGroup == 0, "invalid M-block group");
@@ -828,7 +895,7 @@ public:
                                 });
                             });
                             deep_gemm::warp_interleave_arrive<WarpInterleaving>(warp_group_id, NumThreadsPerCTA);
-                            epilogue_mblock(kv_start, kv_block_idx, m_block);
+                            epilogue_mblock(kv_start, kv_block_idx, m_block, full_kv_tag);
                         });
                     } else {
                         for_each(make_int_sequence<M_BLOCK / kMBlockGroup>{}, [&](auto group_block) {
@@ -858,7 +925,7 @@ public:
                             deep_gemm::warp_interleave_arrive<WarpInterleaving>(warp_group_id, NumThreadsPerCTA);
                             for_each(make_int_sequence<kMBlockGroup>{}, [&](auto group_offset) {
                                 constexpr int m_block = decltype(group_block)::value * kMBlockGroup + decltype(group_offset)::value;
-                                epilogue_mblock(kv_start, kv_block_idx, m_block);
+                                epilogue_mblock(kv_start, kv_block_idx, m_block, full_kv_tag);
                             });
                         });
                     }
@@ -870,6 +937,35 @@ public:
                     __syncthreads();
                 }
                 clear(accum);
+            };
+            if constexpr (kIsCompressedLogits &&
+                          kScaleMode == deep_gemm::kScaleModeWeights &&
+                          cute::is_same_v<ElementLogits, __ppu_bfloat16>) {
+                const uint32_t first_full = min(num_kv_blocks,
+                    deep_gemm::math::ceil_div(max(full_kv_start, kv_start) - kv_start,
+                                              static_cast<uint32_t>(BLOCK_KV)));
+                const uint32_t last_full = max(first_full, min(num_kv_blocks,
+                    (max(full_kv_end, kv_start) - kv_start) / BLOCK_KV));
+                // Keep the pipeline live across prefix, interior and suffix.
+                // An empty intersection has no unmasked segment.
+                uint32_t kv_block_idx = 0;
+                for (; kv_block_idx < first_full; ++kv_block_idx)
+                    process_kv_block(kv_block_idx, cute::false_type{});
+                if (first_full < last_full) {
+                    const StrideKType row_base = (block_q_idx * BLOCK_Q + warp_q_idx) * params.stride_k;
+                    // The full-tile intersection guarantees a nonnegative column.
+                    const uint32_t first_column = kv_start + first_full * BLOCK_KV - row_k_start;
+                    full_output_offset = row_base + first_column + warp_offset;
+                    for (; kv_block_idx < last_full; ++kv_block_idx) {
+                        process_kv_block(kv_block_idx, cute::true_type{});
+                        full_output_offset += BLOCK_KV;
+                    }
+                }
+                for (; kv_block_idx < num_kv_blocks; ++kv_block_idx)
+                    process_kv_block(kv_block_idx, cute::false_type{});
+            } else {
+                for (uint32_t kv_block_idx = 0; kv_block_idx < num_kv_blocks; ++kv_block_idx)
+                    process_kv_block(kv_block_idx, cute::false_type{});
             } // end KV loop
 
             deep_gemm::warp_interleave_end<WarpInterleaving>(warp_group_id, NumThreadsPerCTA);

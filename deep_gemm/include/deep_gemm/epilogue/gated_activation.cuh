@@ -1,31 +1,23 @@
 #pragma once
 
-#include <cmath>
 #include <cutlass/cutlass.h>
 #include <cutlass/functional.h>
-#if defined(__HGGC__) || defined(__HGGCCC__) || defined(__HGGCCC_RTC__)
-#include <cutlass/epilogue/thread/activation.h>
-#else
-// The host launcher only instantiates the activation parameter types.
-namespace cutlass::epilogue::thread {
-template <typename T> struct Sigmoid;
-}
-#endif
+#include <hggc_bf16.h>
+#include <deep_gemm/common/math.cuh>
 
 namespace deep_gemm {
 
 enum class GatedActivation { SwiGLU, SiTU, SwiGLUStep, SwiGLUOAI };
 
-template <bool FastMath, typename T>
-CUTLASS_DEVICE T gated_sigmoid(T value) {
-    if constexpr (FastMath)
-        return cutlass::epilogue::thread::Sigmoid<T>{}(value);
-    return T(1) / (T(1) + expf(-value));
+template <class Op, typename T>
+CUTLASS_DEVICE T compose_gated_activation(T gate, T up, const typename Op::Params& params) {
+    gate = Op::prepare_gate(gate, params);
+    const T sigmoid = Op::sigmoid(gate, params);
+    return Op::multiply_up(Op::gate_times_sigmoid(gate, sigmoid, params), up, params);
 }
 
 // Non-SiTU epilogues run sigmoid, gate_times_sigmoid and multiply_up in separate fragment-wide passes.
-template <GatedActivation Kind, bool ApplyClamp = false, bool kHasLinearBeta = true,
-          bool FastMath = true>
+template <GatedActivation Kind, bool ApplyClamp = false, bool kHasLinearBeta = true, bool FastMath = false>
 struct GatedActivationOp;
 
 template <bool ApplyClamp, bool FastMath>
@@ -35,6 +27,11 @@ struct GatedActivationOp<GatedActivation::SwiGLU, ApplyClamp, true, FastMath> {
     using Params = float;
 
     template <typename T>
+    CUTLASS_DEVICE static T apply(T gate, T up, Params params) {
+        return compose_gated_activation<GatedActivationOp>(gate, up, params);
+    }
+
+    template <typename T>
     CUTLASS_DEVICE static T prepare_gate(T gate, Params limit) {
         if constexpr (ApplyClamp) return min(gate, limit);
         return gate;
@@ -42,7 +39,7 @@ struct GatedActivationOp<GatedActivation::SwiGLU, ApplyClamp, true, FastMath> {
 
     template <typename T>
     CUTLASS_DEVICE static T sigmoid(T gate, Params) {
-        return gated_sigmoid<FastMath>(gate);
+        return __ppu_sgmdf(gate);
     }
 
     template <typename T>
@@ -62,6 +59,11 @@ template <bool ApplyClamp, bool FastMath>
 struct GatedActivationOp<GatedActivation::SwiGLUStep, ApplyClamp, true, FastMath>
     : GatedActivationOp<GatedActivation::SwiGLU, ApplyClamp, true, FastMath> {
     static constexpr auto kKind = GatedActivation::SwiGLUStep;
+
+    template <typename T>
+    CUTLASS_DEVICE static T apply(T gate, T up, float params) {
+        return compose_gated_activation<GatedActivationOp>(gate, up, params);
+    }
 
     template <typename T>
     CUTLASS_DEVICE static T prepare_gate(T gate, float) {
@@ -88,19 +90,27 @@ struct GatedActivationOp<GatedActivation::SiTU, ApplyClamp, kHasLinearBeta, Fast
 
     template <typename T>
     CUTLASS_DEVICE static T softcap(T value, float beta) {
-        if constexpr (!FastMath)
-            return beta * tanhf(value / beta);
-#if DG_MEGAMOE_SITU_USE_RCP
-        const T scaled = value * __ppu_rcpf(beta);
-#else
-        const T scaled = value / beta;
-#endif
-        return beta * __ppu_tanhf(scaled);
+        return beta * __ppu_tanhf(math::fp32_divide<FastMath>(value, T(beta)));
     }
 
     template <typename T>
     CUTLASS_DEVICE static T apply(T gate, T up, const Params& p) {
-        const T gated = gated_sigmoid<FastMath>(gate) * softcap(gate, p.beta);
+        return compose_gated_activation<GatedActivationOp>(gate, up, p);
+    }
+
+    template <typename T>
+    CUTLASS_DEVICE static T prepare_gate(T gate, const Params&) { return gate; }
+
+    template <typename T>
+    CUTLASS_DEVICE static T sigmoid(T gate, const Params&) { return __ppu_sgmdf(gate); }
+
+    template <typename T>
+    CUTLASS_DEVICE static T gate_times_sigmoid(T gate, T sigmoid, const Params& p) {
+        return sigmoid * softcap(gate, p.beta);
+    }
+
+    template <typename T>
+    CUTLASS_DEVICE static T multiply_up(T gated, T up, const Params& p) {
         if constexpr (kHasLinearBeta)
             up = softcap(up, p.linear_beta);
         return gated * up;
@@ -116,6 +126,11 @@ struct GatedActivationOp<GatedActivation::SwiGLUOAI, ApplyClamp, true, FastMath>
     };
 
     template <typename T>
+    CUTLASS_DEVICE static T apply(T gate, T up, const Params& p) {
+        return compose_gated_activation<GatedActivationOp>(gate, up, p);
+    }
+
+    template <typename T>
     CUTLASS_DEVICE static T prepare_gate(T gate, const Params& p) {
         if constexpr (ApplyClamp) return min(gate, p.limit);
         return gate;
@@ -123,7 +138,7 @@ struct GatedActivationOp<GatedActivation::SwiGLUOAI, ApplyClamp, true, FastMath>
 
     template <typename T>
     CUTLASS_DEVICE static T sigmoid(T gate, const Params& p) {
-        return gated_sigmoid<FastMath>(gate * p.alpha);
+        return __ppu_sgmdf(gate * p.alpha);
     }
 
     template <typename T>
@@ -137,5 +152,26 @@ struct GatedActivationOp<GatedActivation::SwiGLUOAI, ApplyClamp, true, FastMath>
         return value * (up + T(1));
     }
 };
+
+// Routed backends share formulas but retain their BF16 clamp-boundary contract.
+// FP4's fragment-wide epilogue uses GatedActivationOp directly with FP32 limits.
+template <GatedActivation Kind, bool FastMath>
+CUTLASS_DEVICE float routed_gated_activation(float gate, float up, float limit, float alpha,
+                                            float beta, float linear_beta) {
+    if constexpr (Kind == GatedActivation::SiTU) {
+        if (linear_beta > 0)
+            return GatedActivationOp<Kind, false, true, FastMath>::apply(gate, up, {beta, linear_beta});
+        return GatedActivationOp<Kind, false, false, FastMath>::apply(gate, up, {beta, linear_beta});
+    } else {
+        const float bound = __bfloat162float(__float2bfloat16(limit));
+        if constexpr (Kind == GatedActivation::SwiGLUOAI) {
+            if (limit >= 0) return GatedActivationOp<Kind, true, true, FastMath>::apply(gate, up, {bound, alpha});
+            return GatedActivationOp<Kind, false, true, FastMath>::apply(gate, up, {bound, alpha});
+        } else {
+            if (limit >= 0) return GatedActivationOp<Kind, true, true, FastMath>::apply(gate, up, bound);
+            return GatedActivationOp<Kind, false, true, FastMath>::apply(gate, up, bound);
+        }
+    }
+}
 
 }  // namespace deep_gemm
