@@ -76,7 +76,7 @@ public:
     struct Args {
         const int32_t* ends;
         int64_t groups;
-        int64_t rows;
+        int64_t row_capacity;
         LaunchArgs launch_args;
     };
 
@@ -85,37 +85,39 @@ public:
     static std::string generate_impl(const Args&) {
         return R"(
 #include <deep_gemm/common/exception.cuh>
-extern "C" __global__ void validate_compact_group_ends(const int32_t* ends, int64_t groups, int64_t rows) {
+extern "C" __global__ void validate_compact_group_ends(const int32_t* ends, int64_t groups, int64_t row_capacity) {
     const int64_t group = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (group >= groups) return;
     const int32_t end = ends[group];
     const int32_t begin = group == 0 ? 0 : ends[group - 1];
-    DG_DEVICE_ASSERT(end >= begin && (group + 1 != groups || end == rows) &&
-                     "cu_seqlens must be nonnegative, nondecreasing and end at M_sum");
+    DG_DEVICE_ASSERT(end >= begin && end <= row_capacity &&
+                     "cu_seqlens must be nonnegative, nondecreasing and fit in A and D");
 }
 )";
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.ends, args.groups, args.rows));
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.ends, args.groups, args.row_capacity));
     }
 };
 
-static void validate_compact_group_ends(const torch::Tensor& ends, int64_t rows) {
+static void validate_compact_group_ends(const torch::Tensor& ends, int64_t row_capacity) {
     constexpr int threads = 128;
     const auto groups = ends.numel();
-    ValidateCompactGroupEndsRuntime::Args args{ends.data_ptr<int32_t>(), groups, rows,
+    ValidateCompactGroupEndsRuntime::Args args{ends.data_ptr<int32_t>(), groups, row_capacity,
         {dim3(ceil_div<int64_t>(groups, threads)), dim3(threads), 0}};
     const auto runtime = compiler->build_cached<ValidateCompactGroupEndsRuntime>("validate_compact_group_ends", args);
     ValidateCompactGroupEndsRuntime::launch(runtime, args);
 }
 
+template <bool BIsMNMajor, bool ScalarNoC>
 static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor& lhs, const torch::Tensor& rhs,
                                                              const torch::Tensor& out, const torch::Tensor& m_indices,
                                                              const int& m, const int& n, const int& k,
                                                              const int& num_groups, std::optional<ConfigTuple> configs,
                                                              const std::optional<torch::Tensor>& c = std::nullopt,
                                                              bool use_psum_layout = false) {
+    using Runtime = BF16GemmCutlass3RuntimeT<cutlass::bfloat16_t, BIsMNMajor, ScalarNoC>;
     int num_sms = get_num_sms();
     Config cfg;
     if (configs.has_value()) {
@@ -132,14 +134,14 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
     }
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
-    int expected_m = ceil_div(m, num_groups);
+    const int expected_m = ceil_div<int64_t>(m, num_groups);
     auto SMSIZE = std::get<0>(smem_config);
 
     int kNumGroups = num_groups;
     const GemmType gemm_type = use_psum_layout ? GemmType::MGroupedContiguousWithPsumLayout
                                               : GemmType::MGroupedContiguous;
     using StrideA = cute::Stride<int64_t, cute::Int<1>, int64_t>;
-    using StrideB = cute::Stride<int64_t, cute::Int<1>, int64_t>;
+    using StrideB = typename Runtime::InputStrideB;
 
     auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
     auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
@@ -161,6 +163,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
                          SMSIZE <= device_runtime->get_prop()->sharedMemPerBlockOptin;
     const char* kernel_name = stage_c ? "bf16_grouped_deep_gemm_contiguous_stage_c" :
                               with_c  ? "bf16_grouped_deep_gemm_contiguous_add_c" :
+                              ScalarNoC ? "bf16_grouped_deep_gemm_contiguous_scalar" :
                                         "bf16_grouped_deep_gemm_contiguous";
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
@@ -168,7 +171,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
     dim3 const block = (block_m / warp_m) * (block_n / warp_n) * 32;
     dim3 grid = get_grid_shape(hw_info.cu_count);
     bool enable_sbo_overlap = false;
-    const auto gemm_args = BF16GemmCutlass3Runtime::GemmArguments{
+    const auto gemm_args = typename Runtime::GemmArguments{
         .mode = cutlass::gemm::GemmUniversalMode::kGemm,
         .problem_shape = {m, n, k, 1},
         .mainloopargs = {input_a, stride_A, input_b, stride_B},
@@ -184,15 +187,14 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
         .scheduler = {(uint32_t)m, grouped_layout},
         .signal = nullptr};
 
-    BF16GemmCutlass3Runtime::GemmKernelParams params =
-        BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr, with_c);
-    auto args = BF16GemmCutlass3Runtime::Args{
+    auto params = Runtime::to_underlying_arguments_rtc(gemm_args, nullptr, with_c);
+    auto args = typename Runtime::Args{
         .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
                         use_psum_layout ? "MGroupedContiguousWithPsumLayout" : "MGroupedContiguous",
                         "Default", kernel_name, enable_sbo_overlap, with_c, stage_c},
         .launch_args = {grid, block, SMSIZE},
         .kernel_params = params};
-    const auto& code = BF16GemmCutlass3Runtime::generate(args);
+    const auto& code = Runtime::generate(args);
     const auto& runtime = compiler->build(kernel_name, code);
     const auto& kernel = runtime->kernel;
     int blocks_per_cu = 0;
@@ -207,7 +209,11 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
     if (deep_gemm::profiling_enabled()) {
         dg_prof_params.set_params(gemm_type, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
                                   grouped_layout, current_stream());
-        if (use_psum_layout) dg_prof_params.add_params("use_psum_layout", 1);
+        dg_prof_params.add_params("b_layout", BIsMNMajor ? "mn_major" : "k_major");
+        if (use_psum_layout) {
+            dg_prof_params.add_params("use_psum_layout", 1);
+            dg_prof_params.add_params("replayable", 0);
+        }
         if (with_c) {
             dg_prof_params.add_params("accumulate", source == output ? "alias" : "separate");
             dg_prof_params.add_params("stage_c", int(stage_c));
@@ -215,7 +221,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
     }
     {
         auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);
-        BF16GemmCutlass3Runtime::launch(runtime, args);
+        Runtime::launch(runtime, args);
     }
 
     char* pEnv_params = std::getenv("show_log");

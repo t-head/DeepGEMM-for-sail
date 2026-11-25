@@ -29,15 +29,18 @@
 using namespace deep_gemm_bf16_common;
 namespace deep_gemm {
 
-// Output type is part of the generated source (and therefore the JIT cache key).
-// Grouped GEMMs retain the BF16 specialization through the alias below.
-template <typename ElementOutput>
-class BF16GemmCutlass3RuntimeT final : public LaunchRuntime<BF16GemmCutlass3RuntimeT<ElementOutput>> {
+// Output type and B layout are part of the generated source (and JIT cache key).
+// Keep the host stride type in sync with the generated device LayoutB.
+// Existing callers retain packed K-major B through the default specialization.
+template <typename ElementOutput, bool BIsMNMajor = false, bool ScalarNoC = false>
+class BF16GemmCutlass3RuntimeT final : public LaunchRuntime<BF16GemmCutlass3RuntimeT<ElementOutput, BIsMNMajor, ScalarNoC>> {
 public:
     using GemmUniversalMode = cutlass::gemm::GemmUniversalMode;
     using GemmProblemSize = cute::tuple<int32_t, int32_t, int32_t, int32_t>;
 
-    using InputStrideB = cute::Stride<int64_t, cute::Int<1>, int64_t>;
+    using InputStrideB = std::conditional_t<BIsMNMajor,
+        cute::Stride<cute::Int<1>, int64_t, int64_t>,
+        cute::Stride<int64_t, cute::Int<1>, int64_t>>;
     struct MainLoopArguments {
         cutlass::bfloat16_t const* ptr_A;
         cute::Stride<int64_t, cute::Int<1>, int64_t> stride_A;
@@ -183,7 +186,7 @@ public:
 #include <deep_gemm/common/gemm_occ_model.cuh>
 #include <deep_gemm/epilogue/bf16_add_c.cuh>
 #include <deep_gemm/epilogue/grouped_bf16_stage_c.cuh>
-namespace deep_gemm {{
+{23}namespace deep_gemm {{
 using namespace cute;
 using cutlass::KernelHardwareInfo;
 
@@ -341,10 +344,12 @@ __global__ void {12}(
             hw.tsm_per_cu, hw.max_threads_per_cta, hw.max_warps_per_cu, hw.total_vreg_per_cu,
             with_tsm_epilogue, host_params_size,
             std::is_same_v<ElementOutput, float> ? "float" : "cutlass::bfloat16_t",
-            "cutlass::layout::ColumnMajor",
+            BIsMNMajor ? "cutlass::layout::RowMajor" : "cutlass::layout::ColumnMajor",
             args.launch_info.denseS2Opt ? "BF16GemmMainloop810E<CollectiveMainloop>" : "CollectiveMainloop",
             stage_c ? "Bf16StagedCEpilogueNoTsm<CollectiveEpilogue_noTsm, BLOCK_M, BLOCK_N, BLOCK_K, STAGES, SHAPE_K>" :
-            with_c  ? "Bf16AddCEpilogueNoTsm<CollectiveEpilogue_noTsm>" : "CollectiveEpilogue_noTsm");
+            with_c  ? "Bf16AddCEpilogueNoTsm<CollectiveEpilogue_noTsm>" :
+            ScalarNoC ? "Bf16ScalarEpilogueNoTsm<CollectiveEpilogue_noTsm>" : "CollectiveEpilogue_noTsm",
+            ScalarNoC ? "#include <deep_gemm/epilogue/bf16_scalar.cuh>\n" : "");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {

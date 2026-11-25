@@ -17,7 +17,9 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 - **M890 M-grouped BF16 NT GEMM**: supports optional BF16 C accumulation,
   including in-place `c=d`, and compact expert end offsets through
-  `use_psum_layout=True`, including empty experts.
+  `use_psum_layout=True`, including empty experts. Accepts packed MN-major B
+  so dgrad can reuse transposed forward weights. Both grouping layouts accept
+  different A and D row capacities and leave the ungrouped output tail untouched.
 
 - **DeepSeek V4 normal Mega-mHC**: `mega_mhc` supports hidden sizes 4096 and
   7168 on Zhenwu M890 when both `shifted_prev_mix` and `new_prev_mix` are `None`.
