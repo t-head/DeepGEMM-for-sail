@@ -191,34 +191,46 @@ enum Pipeline : unsigned {
     OverlapPrologue = 1 << 6, ValidEpilogue = 1 << 7, StaticStages = 1 << 8
 };
 
+struct ExactKey {
+    int m, n, k;
+    at::ScalarType output_dtype;
+    acArch_t soc;
+
+    constexpr bool operator==(const ExactKey& other) const {
+        return m == other.m && n == other.n && k == other.k
+            && output_dtype == other.output_dtype && soc == other.soc;
+    }
+};
+
 struct ExactConfig {
-    int m, bm, bn, bk, wm, wn, wk, stages, grid;
+    ExactKey key;
+    int bm, bn, bk, wm, wn, wk, stages, grid;
     unsigned pipeline;
     int decode_split_k, k_order;
 
     bool has(Pipeline flag) const { return (pipeline & flag) != 0; }
 };
 
-static const ExactConfig* exact_config(int m, int n, int k, int sms, double scale,
-                                       bool fp32_output, bool explicit_config) {
-    if (fp32_output || explicit_config || n != 384 || k != 7168 || sms != 39
+static const ExactConfig* exact_config(const ExactKey& key, int sms, double scale,
+                                       bool explicit_config) {
+    if (explicit_config || sms != 39
         || scale != 1.0 / 256.0 || get_env<int>("DG_JIT_USE_HGRTC", 0)
         || !dual_b_no_experimental_overrides())
         return nullptr;
     static constexpr ExactConfig lut[] = {
-        {8,     16,  16, 128, 16, 16, 128, 4, 48, PackedStore | StaticShape | PackedN, 2, 0},
-        {16,    16,  16, 128, 16, 16, 128, 4, 48, PackedStore | StaticShape | PackedN, 2, 0},
-        {128,   48,  32, 128, 16, 16, 128, 5, 36, PackedStore | StaticShape | OneTile, 1, 0},
-        {256,   96,  32, 128, 48, 16,  64, 6, 36, PackedStore | StaticShape | OneTile | CtaK, 1, 0},
-        {512,   96,  64,  64, 48, 16,  64, 5, 36, PackedStore | StaticShape | OneTile | MmaS2ROverlap, 1, 0},
-        {1024, 192,  64,  64, 48, 32,  64, 4, 36, PackedStore | StaticShape | OneTile | MmaS2ROverlap, 1, 0},
-        {2048, 256,  96,  64, 32, 48,  64, 4, 32, PackedStore | StaticShape | OverlapPrologue, 1, 0},
-        {4096, 320, 128,  64, 80, 32,  64, 3, 39, PackedStore, 1, 0},
-        {8192, 320, 128,  64, 80, 32,  64, 3, 39, PackedStore | StaticShape | OverlapPrologue | ValidEpilogue, 1, 1},
-        {16384,256, 128,  64, 64, 32,  64, 4, 39, PackedStore | StaticShape | OverlapPrologue | ValidEpilogue | StaticStages, 1, 6},
+        {{8,     384, 7168, at::kBFloat16, AC_PPU0015},  16,  16, 128, 16, 16, 128, 4, 48, PackedStore | StaticShape | PackedN, 2, 0},
+        {{16,    384, 7168, at::kBFloat16, AC_PPU0015},  16,  16, 128, 16, 16, 128, 4, 48, PackedStore | StaticShape | PackedN, 2, 0},
+        {{128,   384, 7168, at::kBFloat16, AC_PPU0015},  48,  32, 128, 16, 16, 128, 5, 36, PackedStore | StaticShape | OneTile, 1, 0},
+        {{256,   384, 7168, at::kBFloat16, AC_PPU0015},  96,  32, 128, 48, 16,  64, 6, 36, PackedStore | StaticShape | OneTile | CtaK, 1, 0},
+        {{512,   384, 7168, at::kBFloat16, AC_PPU0015},  96,  64,  64, 48, 16,  64, 5, 36, PackedStore | StaticShape | OneTile | MmaS2ROverlap, 1, 0},
+        {{1024,  384, 7168, at::kBFloat16, AC_PPU0015}, 192,  64,  64, 48, 32,  64, 4, 36, PackedStore | StaticShape | OneTile | MmaS2ROverlap, 1, 0},
+        {{2048,  384, 7168, at::kBFloat16, AC_PPU0015}, 256,  96,  64, 32, 48,  64, 4, 32, PackedStore | StaticShape | OverlapPrologue, 1, 0},
+        {{4096,  384, 7168, at::kBFloat16, AC_PPU0015}, 320, 128,  64, 80, 32,  64, 3, 39, PackedStore, 1, 0},
+        {{8192,  384, 7168, at::kBFloat16, AC_PPU0015}, 320, 128,  64, 80, 32,  64, 3, 39, PackedStore | StaticShape | OverlapPrologue | ValidEpilogue, 1, 1},
+        {{16384, 384, 7168, at::kBFloat16, AC_PPU0015}, 256, 128,  64, 64, 32,  64, 4, 39, PackedStore | StaticShape | OverlapPrologue | ValidEpilogue | StaticStages, 1, 6},
     };
     for (const auto& entry : lut)
-        if (entry.m == m) return &entry;
+        if (entry.key == key) return &entry;
     return nullptr;
 }
 } // namespace dual_b
@@ -385,8 +397,8 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
                                           const double& scale, const int& m, const int& n, const int& k,
                                           std::optional<ConfigTuple> configs = std::nullopt) {
     int num_sms = get_num_sms();
-    const auto* exact = dual_b::exact_config(m, n, k, num_sms, scale,
-        std::is_same_v<ElementOutput, float>, configs.has_value());
+    const dual_b::ExactKey key{m, n, k, out.scalar_type(), get_ppu_arch()};
+    const auto* exact = dual_b::exact_config(key, num_sms, scale, configs.has_value());
     const bool cta_k = exact && exact->has(dual_b::CtaK);
     static constexpr GemmType kGemmType = GemmType::Normal;
     const char* packed_env = std::getenv("DG_BF16XFP32_PACKED_DUAL_N");

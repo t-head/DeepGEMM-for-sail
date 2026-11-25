@@ -177,20 +177,33 @@ int dual_b_lut_checks() {
     const int shapes[] = {8,16,128,256,512,1024,2048,4096,8192,16384};
     const int smem[] = {65536,65536,143360,245760,143360,163840,229376,221184,221184,262144};
     for (int index = 0; index < 10; ++index) {
-        const auto* cfg = dual_b::exact_config(shapes[index],384,7168,39,1.0/256,false,false);
-        if (!cfg || dual_b::shared_storage_bytes(cfg->bm,cfg->bn,cfg->bk,cfg->wm,cfg->wn,cfg->wk,
+        const dual_b::ExactKey key{shapes[index],384,7168,at::kBFloat16,AC_PPU0015};
+        const auto* cfg = dual_b::exact_config(key,39,1.0/256,false);
+        if (!cfg || !(cfg->key == key)
+            || dual_b::shared_storage_bytes(cfg->bm,cfg->bn,cfg->bk,cfg->wm,cfg->wn,cfg->wk,
                 cfg->stages,cfg->has(dual_b::PackedN),cfg->decode_split_k,cfg->has(dual_b::CtaK)) != smem[index])
-            throw std::runtime_error("exact LUT resource mismatch");
+            throw std::runtime_error("exact LUT key or resource mismatch");
+        ++count;
+        const dual_b::ExactKey misses[] = {
+            {key.m+1,key.n,key.k,key.output_dtype,key.soc},
+            {key.m,key.n+2,key.k,key.output_dtype,key.soc},
+            {key.m,key.n,key.k+64,key.output_dtype,key.soc},
+            {key.m,key.n,key.k,at::kFloat,key.soc},
+            {key.m,key.n,key.k,at::kHalf,key.soc},
+            {key.m,key.n,key.k,key.output_dtype,AC_PPU0010},
+            {key.m,key.n,key.k,key.output_dtype,AC_PPU_MAX_ARCH},
+        };
+        for (const auto& other : misses) {
+            if (key == other || other == key || dual_b::exact_config(other,39,1.0/256,false))
+                throw std::runtime_error("non-exact LUT key hit");
+            ++count;
+        }
+        if (dual_b::exact_config(key,20,1.0/256,false)
+            || dual_b::exact_config(key,39,std::nextafter(1.0/256,1.0),false)
+            || dual_b::exact_config(key,39,1.0/256,true))
+            throw std::runtime_error("LUT eligibility guard bypassed");
         ++count;
     }
-    if (dual_b::exact_config(9,384,7168,39,1.0/256,false,false)
-        || dual_b::exact_config(8,386,7168,39,1.0/256,false,false)
-        || dual_b::exact_config(8,384,7232,39,1.0/256,false,false)
-        || dual_b::exact_config(8,384,7168,20,1.0/256,false,false)
-        || dual_b::exact_config(8,384,7168,39,std::nextafter(1.0/256,1.0),false,false)
-        || dual_b::exact_config(8,384,7168,39,1.0/256,true,false)
-        || dual_b::exact_config(8,384,7168,39,1.0/256,false,true))
-        throw std::runtime_error("non-exact LUT hit");
     return count;
 }
 
