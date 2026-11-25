@@ -13,27 +13,29 @@ struct MixGemmNumericArrayConverter<int8_t, int4b_t, 8> {
   using result_type = Array<int8_t, 8>;
   using source_type = Array<int4b_t, 8>;
 
+  template <bool LeftAligned>
   CUTLASS_DEVICE static uint32_t convert_four(uint32_t packed) {
-    // Preprocessing transposes {a,b,c,d,e,f,g,h} to {a,e,b,f,c,g,d,h} and changes
-    // signed two's-complement nibbles into unsigned values biased by 8. One LOP3 therefore
-    // extracts four nibbles into independent byte lanes while setting each lane's high bit.
-    static constexpr uint32_t kNibbleMask = 0x0f0f0f0f;
+    // The stored nibbles are biased by 8. In bits 7:4, flipping bit 7 gives
+    // signed INT8 values equal to 16 times the weights in a single LOP3.
+    static constexpr uint32_t kNibbleMask = LeftAligned ? 0xf0f0f0f0u : 0x0f0f0f0fu;
     static constexpr uint32_t kByteMsb = 0x80808080;
     static constexpr uint32_t kZeroPoint = 0x08080808;
-    static constexpr uint32_t kAndOrLut = (0xf0 & 0xcc) | 0xaa;
+    static constexpr uint32_t kLut = LeftAligned ? ((0xf0 & 0xcc) ^ 0xaa) : ((0xf0 & 0xcc) | 0xaa);
     uint32_t expanded;
     asm volatile("ppu.lop3.b32 %0, %1, %2, %3, %4;\n"
                  : "=r"(expanded)
-                 : "r"(packed), "n"(kNibbleMask), "n"(kByteMsb), "n"(kAndOrLut));
+                 : "r"(packed), "n"(kNibbleMask), "n"(kByteMsb), "n"(kLut));
+    if constexpr (LeftAligned) return expanded;
     return (expanded - kZeroPoint) ^ kByteMsb;
   }
 
+  template <bool LeftAligned = false>
   CUTLASS_DEVICE static result_type convert(source_type const& source) {
     result_type result;
     const uint32_t packed = reinterpret_cast<uint32_t const&>(source);
     auto* dst = reinterpret_cast<uint32_t*>(&result);
-    dst[0] = convert_four(packed);
-    dst[1] = convert_four(packed >> 4);
+    dst[0] = convert_four<LeftAligned>(LeftAligned ? packed << 4 : packed);
+    dst[1] = convert_four<LeftAligned>(LeftAligned ? packed : packed >> 4);
     return result;
   }
 
@@ -47,17 +49,18 @@ struct MixGemmNumericArrayConverter<int8_t, int4b_t, 32> {
   using result_type = Array<int8_t, 32>;
   using source_type = Array<int4b_t, 32>;
 
+  template <bool LeftAligned = false>
   CUTLASS_DEVICE static result_type convert(source_type const& source) {
     result_type result;
     using VecResult = Array<int8_t, 8>;
     using VecSource = Array<int4b_t, 8>;
     auto* result_ptr = reinterpret_cast<VecResult*>(&result);
     auto const* source_ptr = reinterpret_cast<VecSource const*>(&source);
-    MixGemmNumericArrayConverter<int8_t, int4b_t, 8> converter;
+    using Converter = MixGemmNumericArrayConverter<int8_t, int4b_t, 8>;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < 4; ++i) {
       const int dst = (i % 2) * 2 + i / 2;
-      result_ptr[dst] = converter(source_ptr[i]);
+      result_ptr[dst] = Converter::convert<LeftAligned>(source_ptr[i]);
     }
     return result;
   }
@@ -102,7 +105,8 @@ struct A8W4PackedOperandB {
 
 namespace cutlass::gemm {
 
-template <int Stages_, typename Schedule_ = KernelAiuMultistage, int CopyKTilesPerFlag_ = 0>
+template <int Stages_, typename Schedule_ = KernelAiuMultistage, int CopyKTilesPerFlag_ = 0,
+          bool LeftAligned = false>
 struct MainloopPPUAiuA8W4 {
   static constexpr int Stages = Stages_;
   static constexpr int CopyKTilesPerFlag = CopyKTilesPerFlag_;
@@ -116,18 +120,18 @@ struct MainloopPPUAiuA8W4 {
 namespace cutlass::gemm::collective {
 
 template <
-    int Stages, typename KernelSchedule, int CopyKTilesPerFlag,
+    int Stages, typename KernelSchedule, int CopyKTilesPerFlag, bool LeftAligned,
     typename TileShape_, typename StrideA_, typename StrideB_,
     typename TiledMma_, typename GmemTiledCopyA_, typename SmemLayoutAtomA_, typename SmemCopyAtomA_,
     typename TransformA_, typename GmemTiledCopyB_, typename SmemLayoutAtomB_, typename SmemCopyAtomB_,
     typename TransformB_>
 struct CollectiveMma<
-    cutlass::arch::PPU0010, MainloopPPUAiuA8W4<Stages, KernelSchedule, CopyKTilesPerFlag>, TileShape_,
+    cutlass::arch::PPU0010, MainloopPPUAiuA8W4<Stages, KernelSchedule, CopyKTilesPerFlag, LeftAligned>, TileShape_,
     int8_t, StrideA_, cutlass::int4b_t, StrideB_, TiledMma_,
     GmemTiledCopyA_, SmemLayoutAtomA_, SmemCopyAtomA_, TransformA_,
     GmemTiledCopyB_, SmemLayoutAtomB_, SmemCopyAtomB_, TransformB_> {
 public:
-  using DispatchPolicy = MainloopPPUAiuA8W4<Stages, KernelSchedule, CopyKTilesPerFlag>;
+  using DispatchPolicy = MainloopPPUAiuA8W4<Stages, KernelSchedule, CopyKTilesPerFlag, LeftAligned>;
   using TileShape = TileShape_;
   using ElementA = int8_t;
   using StrideA = StrideA_;
@@ -434,7 +438,7 @@ private:
         for (int i = 0; i < size(decltype(cvt_in.layout()){}) / 32; ++i) {
           auto const* src = reinterpret_cast<typename Converter::source_type const*>(raw_pointer_cast(cvt_in(_, i).data()));
           auto* dst = reinterpret_cast<typename Converter::result_type*>(raw_pointer_cast(cvt_out(_, i).data()));
-          *dst = Converter::convert(*src);
+          *dst = Converter::convert<LeftAligned>(*src);
         }
 
         CUTLASS_PRAGMA_UNROLL
@@ -448,6 +452,11 @@ private:
 
     cp_async_wait<0>();
     __syncthreads();
+    if constexpr (LeftAligned) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size(accum); ++i)
+        accum(i) >>= 4;
+    }
   }
 
 public:

@@ -38,8 +38,11 @@ struct MegaMoEInt8Kernel {
             cute::Int<BN>, cute::Int<BK>, true, BN * BK>>;
     using Schedule = cutlass::gemm::KernelAiuMultistage;
     static constexpr int kCopyKTiles = kIsLinear1 ? KTilesPerFlag : 0;
+    // Left-aligned INT4 values multiply the integer dot product by 16. Bound
+    // every partial sum before recovering the exact dot product for the epilogue.
+    static constexpr bool kLeftAligned = kIsLinear1 && K <= INT32_MAX / (128 * 128);
     using Policy = cute::conditional_t<PackedInt4,
-        cutlass::gemm::MainloopPPUAiuA8W4<Stages, Schedule, kCopyKTiles>,
+        cutlass::gemm::MainloopPPUAiuA8W4<Stages, Schedule, kCopyKTiles, kLeftAligned>,
         cutlass::gemm::MainloopPPUAiuA8W8<Stages, Schedule, kCopyKTiles>>;
     using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<Arch, Element, Element, int32_t>::type;
     using Mma = cute::TiledMMA<cute::MMA_Atom<MmaInst>,
