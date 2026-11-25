@@ -266,7 +266,9 @@ def test_gemm_bf16xfp32_ppu10_disabled(api, use_fp32_output, shape):
 
 
 @pytest.mark.usefixtures("router_ppu1v5")
-@pytest.mark.parametrize("shape", [(5, 14, 13), (9, 130, 65), (8, 384, 7168), (128, 384, 7168)])
+@pytest.mark.parametrize("shape", [(5, 14, 13), (9, 130, 65), (8, 384, 7168), (128, 384, 7168),
+                                 (17, 194, 129), (63, 258, 257), (129, 386, 513),
+                                 (1023, 384, 65), (1025, 384, 65), (2049, 386, 129)])
 @pytest.mark.parametrize("use_fp32_output", [True, False])
 @pytest.mark.parametrize("api", ["default", "explicit", "wrapper"])
 def test_gemm_bf16xfp32_exact_and_guard(shape, use_fp32_output, api):
@@ -292,6 +294,51 @@ def test_gemm_bf16xfp32_exact_and_guard(shape, use_fp32_output, api):
     torch.cuda.synchronize()
     guard.check(actual)
     _assert_exact(actual, expected)
+
+
+@pytest.mark.usefixtures("router_ppu1v5")
+@pytest.mark.parametrize("m, expected", [(1024, "ThreadblockShape[192, 64, 64]"),
+                                       (2048, "ThreadblockShape[128, 192, 64]")])
+def test_gemm_bf16xfp32_measured_lut_and_explicit_priority(m, expected, monkeypatch, capfd):
+    import ctypes
+    libc = ctypes.CDLL(None)
+    previous_sms = deep_gemm.get_num_sms()
+    monkeypatch.setenv("show_log", "1")
+    try:
+        deep_gemm.set_num_sms(39)
+        x, high, low, scale, gt = _make_case(m, 384, 7168)
+        actual = _call_api("default", x, high, low, scale, True)
+        torch.cuda.synchronize()
+        _assert_accuracy(actual, *gt)
+        libc.fflush(None)
+        assert expected in capfd.readouterr().out
+        actual = _call_api("explicit", x, high, low, scale, True)
+        torch.cuda.synchronize()
+        _assert_accuracy(actual, *gt)
+        libc.fflush(None)
+        assert "ThreadblockShape[64, 64, 64]" in capfd.readouterr().out
+    finally:
+        deep_gemm.set_num_sms(previous_sms)
+
+
+@pytest.mark.usefixtures("router_ppu1v5")
+def test_gemm_bf16xfp32_tile_cache_is_not_tensor_cache():
+    previous_sms = deep_gemm.get_num_sms()
+    try:
+        # Alternate every selection-key component, then return to the first key
+        # with new tensors. Shape/dtype/SM caching must not retain tensor data.
+        cases = [(17, 194, 65, 39, True), (9, 130, 129, 20, False),
+                 (63, 258, 257, 39, False), (17, 194, 65, 20, True),
+                 (17, 194, 65, 39, False), (17, 194, 65, 39, True)]
+        for index, (m, n, k, sms, fp32) in enumerate(cases):
+            deep_gemm.set_num_sms(sms)
+            x, high, low, scale, gt = _make_case(m, n, k)
+            x = x * (2 ** index)
+            gt = tuple(reference * (2 ** index) for reference in gt)
+            actual = _call_api("default", x, high, low, scale, fp32)
+            _assert_accuracy(actual, *gt)
+    finally:
+        deep_gemm.set_num_sms(previous_sms)
 
 
 def test_gemm_bf16xfp32_accuracy_standard_selfcheck():
