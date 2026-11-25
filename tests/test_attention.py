@@ -293,7 +293,6 @@ def _check_paged_metadata_scan():
 
 
 def test_paged_mqa_metadata_scan():
-    import json
     import os
     from pathlib import Path
     import shlex
