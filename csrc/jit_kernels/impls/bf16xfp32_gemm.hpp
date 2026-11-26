@@ -500,6 +500,14 @@ static void bf16xfp32_gemm_cute_free_impl(const torch::Tensor& lhs, const torch:
     DgProfParam dg_prof_params;
     if (deep_gemm::profiling_enabled()) {
         dg_prof_params.set_params(kGemmType, false, std::string("bf16xfp32"), 1, m, n, k, 0, nullptr, stream);
+        dg_prof_params.add_params("scale", fmt::format("{:.17g}", scale));
+        dg_prof_params.add_params("use_fp32_output", std::is_same_v<ElementOutput, float>);
+        dg_prof_params.add_params("num_sms", num_sms);
+        if (configs.has_value()) {
+            const auto& [ns, bm, bn, bk, wm, wn, stages, sc] = *configs;
+            dg_prof_params.add_params("configs", fmt::format("[{},{},{},{},{},{},{}]",
+                ns, bm, bn, bk, wm, wn, stages));
+        }
     }
     {
         auto profiling_guard = deep_gemm::show_gemm_ut(dg_prof_params);

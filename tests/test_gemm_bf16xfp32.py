@@ -20,7 +20,12 @@ Documented contract (see csrc/apis/gemm.hpp):
     output     : FP32 (use_fp32_output=True) or BF16, row-major [m, n]
 """
 import inspect
+import math
 import os
+from pathlib import Path
+import re
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -135,6 +140,84 @@ def _call_api(api, x, high, low, scale, use_fp32_output):
         return deep_gemm.bf16xfp32_gemm_nt(x, high, low, scale, use_fp32_output, configs)
     assert api == "default"
     return deep_gemm.bf16xfp32_gemm_nt(x, high, low, scale, use_fp32_output)
+
+
+def run_bf16xfp32_case(args, check_accuracy=True, ref_backend="device"):
+    """Replay operator parameters with fresh dual-B inputs, not saved tensor data."""
+    m, n, k = (args[name] for name in ("m", "n", "k"))
+    scale = float(args["scale"])
+    fp32 = args["use_fp32_output"]
+    if min(m, n, k) < 0 or n % 2 or not math.isfinite(scale) or scale <= 0 or fp32 not in (0, 1):
+        raise ValueError("Invalid BF16xFP32 replay dimensions, scale or output type")
+    if args.get("with_bias") or args.get("accumulate", "none") != "none":
+        raise ValueError("BF16xFP32 replay does not support bias or C accumulation")
+    config = args.get("configs")
+    if config is not None:
+        if not isinstance(config, (list, tuple)) or len(config) != 7 or any(type(v) is not int for v in config):
+            raise ValueError("BF16xFP32 configs require SMS/BM/BN/BK/WM/WN/stages")
+        config = tuple(config) + ((0, 0, 0),)
+    compiling = bool(os.environ.get("HGGC_WARM_UP")) or deep_gemm.get_compile_mode() == 1
+    check = check_accuracy and not compiling
+    expected_error = args.get("expect_error")
+    x = torch.empty((m, k), dtype=torch.bfloat16, device="cuda")
+    high = torch.empty((n, k), dtype=torch.bfloat16, device="cuda")
+    low = torch.empty_like(high)
+    references = None
+    if not compiling and not expected_error:
+        x.normal_()
+        weight = torch.randn((n, k), dtype=torch.float32, device=x.device)
+        high.copy_(weight)
+        low.copy_((weight - high.float()) / scale)
+        if check:
+            lhs, hi, lo, original = x.float(), high.float(), low.float(), weight
+            if ref_backend == "host":
+                lhs, hi, lo, original = (t.cpu() for t in (lhs, hi, lo, original))
+            elif ref_backend != "device":
+                raise ValueError("Unknown reference backend")
+            backends = (torch.backends.cuda.matmul, torch.backends.cudnn)
+            previous = tuple(b.allow_tf32 for b in backends)
+            try:
+                for backend in backends:
+                    backend.allow_tf32 = False
+                references = (lhs @ hi.t() + scale * (lhs @ lo.t()), lhs @ original.t())
+                references = tuple(t.to(x.device) for t in references)
+            finally:
+                for backend, setting in zip(backends, previous):
+                    backend.allow_tf32 = setting
+    previous_sms = deep_gemm.get_num_sms()
+    dtype = torch.float32 if fp32 else torch.bfloat16
+    guard = _GuardedOutput((m, n), dtype, x.device)
+    try:
+        if "num_sms" in args:
+            deep_gemm.set_num_sms(args["num_sms"])
+        try:
+            with guard:
+                actual = deep_gemm.bf16xfp32_gemm_nt(x, high, low, scale, bool(fp32), config)
+        except RuntimeError as error:
+            if not expected_error or expected_error not in str(error):
+                raise
+            assert not guard.captured, "rejected call allocated an output"
+            print("Passed expected BF16xFP32 API rejection")
+            return
+        if expected_error:
+            raise AssertionError("BF16xFP32 accepted unsupported arguments")
+        torch.cuda.synchronize()
+        if m and n and k:
+            guard.check(actual)
+            if compiling:
+                _assert_exact(actual, torch.full_like(actual, -123))
+        if check:
+            if m and n:
+                _assert_accuracy(actual, *references)
+            else:
+                for reference in references:
+                    _assert_exact(actual, reference.to(dtype))
+        assert actual.shape == (m, n) and actual.dtype == dtype
+        print("Passed BF16xFP32 replay with acc_check" if check else "Passed BF16xFP32 replay without acc_check")
+        return actual
+    finally:
+        if "num_sms" in args:
+            deep_gemm.set_num_sms(previous_sms)
 
 
 def _make_case(m, n, k, device="cuda"):
@@ -396,7 +479,7 @@ def test_gemm_bf16xfp32_exact_lut_boundaries(change, monkeypatch, capfd):
     try:
         requested_sms = 20 if change == "sms" else 64 if change == "sms64" else 39
         if requested_sms > torch.cuda.get_device_properties(0).multi_processor_count:
-            # 超出物理 SM 数时应由公共接口拒绝，不进入 LUT 选参。
+            # Reject budgets above the physical SM count before LUT selection.
             with pytest.raises(RuntimeError, match="new_num_sms"):
                 deep_gemm.set_num_sms(requested_sms)
             return
@@ -460,6 +543,133 @@ def test_gemm_bf16xfp32_removed_overrides_are_ignored(mode, use_fp32_output, mon
             assert config_log() == baseline_log
     finally:
         deep_gemm.set_num_sms(previous_sms)
+
+
+@pytest.mark.parametrize("api", ["default", "explicit", "wrapper", "native"])
+@pytest.mark.parametrize("fp32", [False, True])
+@pytest.mark.parametrize("operand", [0, 1, 2])
+@pytest.mark.parametrize("empty", [False, True])
+def test_gemm_bf16xfp32_rejects_cpu_operand(api, fp32, operand, empty):
+    if not torch.cuda.is_available():
+        pytest.skip("no PPU device available")
+    x = torch.empty((0 if empty else 5, 13), dtype=torch.bfloat16, device="cuda")
+    high = torch.empty((14, 13), dtype=torch.bfloat16, device="cuda")
+    inputs = [x, high, high.clone()]
+    inputs[operand] = inputs[operand].cpu()
+    with pytest.raises(RuntimeError, match="BF16xFP32 inputs must be CUDA tensors"):
+        _call_api(api, *inputs, 1 / 256, fp32)
+
+
+@pytest.mark.parametrize("api", ["default", "explicit", "wrapper", "native"])
+@pytest.mark.parametrize("fp32", [False, True])
+@pytest.mark.parametrize("operand", [0, 1, 2])
+def test_gemm_bf16xfp32_rejects_mixed_devices(api, fp32, operand):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two visible PPU devices")
+    current = torch.cuda.current_device()
+    other = (current + 1) % torch.cuda.device_count()
+    x = torch.empty((5, 13), dtype=torch.bfloat16, device=current)
+    high = torch.empty((14, 13), dtype=torch.bfloat16, device=current)
+    inputs = [x, high, high.clone()]
+    inputs[operand] = inputs[operand].to(other)
+    with pytest.raises(RuntimeError, match="BF16xFP32 inputs must be on the same device"):
+        _call_api(api, *inputs, 1 / 256, fp32)
+    assert torch.cuda.current_device() == current
+
+
+@pytest.mark.parametrize("api", ["default", "explicit", "wrapper", "native"])
+@pytest.mark.parametrize("fp32", [False, True])
+def test_gemm_bf16xfp32_rejects_noncurrent_device(api, fp32):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two visible PPU devices")
+    current = torch.cuda.current_device()
+    other = (current + 1) % torch.cuda.device_count()
+    x = torch.empty((0, 13), dtype=torch.bfloat16, device=other)
+    high = torch.empty((14, 13), dtype=torch.bfloat16, device=other)
+    with pytest.raises(RuntimeError, match="BF16xFP32 inputs must be on the current device"):
+        _call_api(api, x, high, high, 1 / 256, fp32)
+    assert torch.cuda.current_device() == current
+
+
+@pytest.mark.parametrize("scale", [1 / 256, 1 / 128, math.nextafter(1 / 256, 1)])
+@pytest.mark.parametrize("fp32", [False, True])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_gemm_bf16xfp32_replay_parser(scale, fp32, explicit):
+    from utils import parse_deepgemm_string_re
+    spec = f"Normal,data_type:bf16xfp32,m:8,n:384,k:7168,scale:{scale:.17g},use_fp32_output:{int(fp32)}"
+    if explicit:
+        spec += ",configs:[20,64,64,64,16,16,2]"
+    parsed = parse_deepgemm_string_re(spec)
+    assert parsed["scale"] == scale and parsed["use_fp32_output"] == fp32
+    assert parsed["data_type"] == "bf16xfp32" and parsed["quant_type"] == "non_quantized"
+    if explicit:
+        assert parsed["configs"] == [20, 64, 64, 64, 16, 16, 2]
+    assert parse_deepgemm_string_re("DenseGemm,data_type:bf16_bf16_fp32,m:16,n:64,k:128")["data_type"] == "bf16_bf16_fp32"
+
+
+@pytest.mark.parametrize("suffix", ["", ",scale:0.00390625", ",use_fp32_output:1", ",scale:0,use_fp32_output:1",
+                                    ",scale:nan,use_fp32_output:1", ",scale:inf,use_fp32_output:1",
+                                    ",scale:0.00390625,use_fp32_output:2"])
+def test_gemm_bf16xfp32_replay_requires_metadata(suffix):
+    from utils import parse_deepgemm_string_re
+    with pytest.raises(ValueError, match="BF16xFP32 replay"):
+        parse_deepgemm_string_re("Normal,data_type:bf16xfp32,m:16,n:64,k:128" + suffix)
+
+
+@pytest.mark.usefixtures("ppu1v5")
+@pytest.mark.parametrize("shape", [(0, 14, 13), (5, 0, 13), (5, 14, 0), (5, 14, 13)])
+@pytest.mark.parametrize("fp32", [False, True])
+def test_gemm_bf16xfp32_replay_empty_and_tail(shape, fp32):
+    m, n, k = shape
+    actual = run_bf16xfp32_case(dict(m=m, n=n, k=k, scale=1 / 128, use_fp32_output=int(fp32)))
+    assert actual.shape == (m, n)
+    if not k:
+        _assert_exact(actual, torch.zeros_like(actual))
+
+
+@pytest.mark.usefixtures("ppu1v5")
+@pytest.mark.parametrize("scale", [1 / 256, 1 / 128, math.nextafter(1 / 256, 1)])
+@pytest.mark.parametrize("fp32", [False, True])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_gemm_bf16xfp32_dump_replay(scale, fp32, explicit, tmp_path):
+    from utils import parse_deepgemm_string_re
+    spec = f"Normal,data_type:bf16xfp32,m:8,n:384,k:7168,scale:{scale:.17g},use_fp32_output:{int(fp32)}"
+    if explicit:
+        spec += ",configs:[20,64,64,64,16,16,2]"
+    entry = Path(__file__).with_name("run_deep_gemm.py")
+    env = dict(os.environ, PPU_LIB_SHOW_PARAMS="1")
+    env.pop("HGGC_WARM_UP", None)
+    env["DG_JIT_COMPILE_ONLY"] = "0"
+    def run(command):
+        result = subprocess.run([sys.executable, str(entry), *command], cwd=tmp_path, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
+        assert result.returncode == 0, result.stdout.decode(errors="replace")
+        return result.stdout.decode(errors="replace")
+    output = run(["--format", spec, "--require_supported"])
+    records = re.findall(r"\[DeepGemm\] --format=((?:Normal|DenseGemm),data_type:bf16xfp32[^\n]+)", output)
+    assert len(records) == 1, output
+    parsed = parse_deepgemm_string_re(records[0])
+    assert parsed["scale"] == scale and parsed["use_fp32_output"] == fp32
+    if explicit:
+        assert parsed["configs"] == [20, 64, 64, 64, 16, 16, 2]
+    else:
+        assert "configs" not in parsed
+    assert "num_sms" in parsed
+    caselist = tmp_path / "replay.list"
+    caselist.write_text(records[0] + "\n")
+    assert "Passed BF16xFP32 replay with acc_check" in run(["--caselist", str(caselist), "--require_supported"])
+
+
+def test_gemm_bf16xfp32_automatic_registration():
+    from checkin.run_checkin import SCRIPT_SUITES, load_cases
+    from daily.run_daily import load_script_checks
+    root = Path(__file__).parent
+    for board, filename in (("ZW-M890P", "890p"), ("ZW-810E", "810e")):
+        assert any("test_gemm_bf16xfp32.py" in spec for spec in SCRIPT_SUITES[board])
+        assert any("test_gemm_bf16xfp32.py" in spec for spec in load_script_checks(board))
+        cases = [case for case in load_cases(root / "checkin" / f"checkin_{filename}.list") if "data_type:bf16xfp32," in case]
+        assert cases and any("use_fp32_output:0" in case for case in cases) and any("use_fp32_output:1" in case for case in cases)
+        assert all(("expect_error:BF16xFP32 GEMM is disabled on PPU1.0" in case) == (filename == "810e") for case in cases)
 
 
 def test_gemm_bf16xfp32_accuracy_standard_selfcheck():

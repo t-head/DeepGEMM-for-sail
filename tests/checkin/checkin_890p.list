@@ -9,6 +9,32 @@
 
 # ============ DenseGemm ============
 
+# --- DenseGemm / BF16xFP32 dual-B fusion ---
+DenseGemm,data_type:bf16xfp32,m:8,n:384,k:7168,scale:0.00390625,use_fp32_output:0
+DenseGemm,data_type:bf16xfp32,m:8,n:384,k:7168,scale:0.00390625,use_fp32_output:1
+DenseGemm,data_type:bf16xfp32,m:16,n:384,k:7168,scale:0.00390625,use_fp32_output:0
+DenseGemm,data_type:bf16xfp32,m:16,n:384,k:7168,scale:0.00390625,use_fp32_output:1
+DenseGemm,data_type:bf16xfp32,m:128,n:384,k:7168,scale:0.00390625,use_fp32_output:0
+DenseGemm,data_type:bf16xfp32,m:128,n:384,k:7168,scale:0.00390625,use_fp32_output:1
+DenseGemm,data_type:bf16xfp32,m:256,n:384,k:7168,scale:0.00390625,use_fp32_output:0
+DenseGemm,data_type:bf16xfp32,m:256,n:384,k:7168,scale:0.00390625,use_fp32_output:1
+DenseGemm,data_type:bf16xfp32,m:512,n:384,k:7168,scale:0.00390625,use_fp32_output:0
+DenseGemm,data_type:bf16xfp32,m:512,n:384,k:7168,scale:0.00390625,use_fp32_output:1
+DenseGemm,data_type:bf16xfp32,m:1024,n:384,k:7168,scale:0.00390625,use_fp32_output:0
+DenseGemm,data_type:bf16xfp32,m:1024,n:384,k:7168,scale:0.00390625,use_fp32_output:1
+DenseGemm,data_type:bf16xfp32,m:2048,n:384,k:7168,scale:0.00390625,use_fp32_output:0
+DenseGemm,data_type:bf16xfp32,m:2048,n:384,k:7168,scale:0.00390625,use_fp32_output:1
+DenseGemm,data_type:bf16xfp32,m:4096,n:384,k:7168,scale:0.00390625,use_fp32_output:0
+DenseGemm,data_type:bf16xfp32,m:4096,n:384,k:7168,scale:0.00390625,use_fp32_output:1
+DenseGemm,data_type:bf16xfp32,m:8192,n:384,k:7168,scale:0.00390625,use_fp32_output:0
+DenseGemm,data_type:bf16xfp32,m:8192,n:384,k:7168,scale:0.00390625,use_fp32_output:1
+DenseGemm,data_type:bf16xfp32,m:16384,n:384,k:7168,scale:0.00390625,use_fp32_output:0
+DenseGemm,data_type:bf16xfp32,m:16384,n:384,k:7168,scale:0.00390625,use_fp32_output:1
+DenseGemm,data_type:bf16xfp32,m:5,n:14,k:13,scale:0.0078125,use_fp32_output:0
+DenseGemm,data_type:bf16xfp32,m:5,n:14,k:13,scale:0.0078125,use_fp32_output:1
+DenseGemm,data_type:bf16xfp32,m:8,n:384,k:7168,scale:0.00390625,use_fp32_output:0,configs:[20,64,64,64,16,16,2]
+DenseGemm,data_type:bf16xfp32,m:8,n:384,k:7168,scale:0.00390625,use_fp32_output:1,configs:[20,64,64,64,16,16,2]
+
 # --- DenseGemm / bf16 ---
 # Small M with N/K tails, retained from the legacy shape sweep.
 DenseGemm,data_type:bf16,m:64,n:2112,k:576

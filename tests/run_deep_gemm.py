@@ -21,6 +21,13 @@ def device_version_supported(one_case):
     caselist can run on both PPU1.0 and PPU1.5.
     """
     data_type = one_case.get('data_type')
+    if data_type == 'bf16xfp32':
+        arch = get_arch_version()
+        if arch == 80:
+            if one_case.get('expect_error') == 'BF16xFP32 GEMM is disabled on PPU1.0':
+                return True, ''
+            return False, 'BF16xFP32 execution requires PPU1.5'
+        return (arch == 89, '' if arch == 89 else 'BF16xFP32 requires a supported PPU architecture')
     if (one_case.get('gemm_type') in ('MqaLogits', 'PagedMqaLogits', 'MqaAvgLogits', 'PagedMqaAvgLogits')
             and data_type == torch.int8 and get_arch_version() != 80):
         return False, 'INT8 indexer requires 810E'

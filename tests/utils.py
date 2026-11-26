@@ -1234,6 +1234,15 @@ def parse_deepgemm_string_re(s):
                 except ValueError:
                     result[key] = value
                     pass
+    if result.get('data_type') == 'bf16xfp32':
+        if result['gemm_type'] not in ('Normal', 'DenseGemm'):
+            raise ValueError('BF16xFP32 replay supports only NT dense GEMM')
+        if 'scale' not in result or result.get('use_fp32_output') not in (0, 1):
+            raise ValueError('BF16xFP32 replay requires scale and use_fp32_output:0 or 1')
+        import math
+        if not isinstance(result['scale'], (int, float)) or not math.isfinite(result['scale']) or result['scale'] <= 0:
+            raise ValueError('BF16xFP32 replay requires a finite positive scale')
+        result['scale'] = float(result['scale'])
     if result.get("replayable") == 0:
         raise ValueError("This profiling record cannot be replayed without the group distribution")
     if "quant_type" not in result:
@@ -1249,7 +1258,8 @@ def parse_deepgemm_string_re(s):
             'w4fa8_mma': 'group',
             'w4a8_nvfp4': 'block',
             'w4a8_int8': 'channel',
-            'bf16_bf16_fp32': 'non_quantized'
+            'bf16_bf16_fp32': 'non_quantized',
+            'bf16xfp32': 'non_quantized'
         }
         result["quant_type"] = quant_type_defaults.get(result["data_type"], 'block')
     return result
@@ -1307,8 +1317,8 @@ def convert_data_type_to_dtype(data_type):
         return torch.float8_e4m3fn
     elif data_type in ["w4a16", "w4fa16", "w4fa16_mma", "w4fa8_mma", "w4a8_int8", "w4a8_nvfp4"]:
         return data_type
-    elif data_type in ["bf16_bf16_fp32"]:
-        # DenseGemm only: BF16 inputs with an FP32 output (deep_gemm.gemm_bf16_bf16_fp32_nt).
+    elif data_type in ["bf16_bf16_fp32", "bf16xfp32"]:
+        # Keep single-B FP32 output and dual-B replay as distinct dense modes.
         return data_type
     else:
         print(f"ERROR: Unsupported dtype: {data_type}, please check!")
@@ -1548,6 +1558,11 @@ def test_gemm(args) -> None:
     """Run a dense GEMM case or its explicitly selected regression checks."""
     if args['data_type'] == 'w4a8_nvfp4':
         return run_nvfp4_case(args)
+    if args['data_type'] == 'bf16xfp32':
+        from test_gemm_bf16xfp32 import run_bf16xfp32_case
+        if get_benchmark():
+            raise ValueError('BF16xFP32 replay is a functional check, not a timing mode')
+        return run_bf16xfp32_case(args, check_accuracy=get_acc_check(), ref_backend=get_ref_backend())
     print('Testing GEMM:')
     m, n, k, d = args['m'], args['n'], args['k'], args["data_type"]
     quant_type = args['quant_type'] if 'quant_type' in args else 'block'

@@ -211,6 +211,14 @@ torch::Tensor bf16xfp32_gemm_nt(const torch::Tensor& x,
                                 const double& scale,
                                 const bool& use_fp32_output,
                                 std::optional<ConfigTuple> configs = std::nullopt) {
+    TORCH_CHECK(x.is_cuda() && w_high.is_cuda() && w_low.is_cuda(),
+                "BF16xFP32 inputs must be CUDA tensors");
+    TORCH_CHECK(x.device() == w_high.device() && x.device() == w_low.device(),
+                "BF16xFP32 inputs must be on the same device");
+    int current_device = -1;
+    CHECK_HGGC(hggcGetDevice(&current_device));
+    TORCH_CHECK(x.get_device() == current_device,
+                "BF16xFP32 inputs must be on the current device");
     TORCH_CHECK(scale > 0.0, "scale must be positive, got ", scale);
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be BF16");
     TORCH_CHECK(w_high.scalar_type() == torch::kBFloat16, "w_high must be BF16");

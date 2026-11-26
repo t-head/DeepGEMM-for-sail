@@ -1,6 +1,7 @@
 python ./tests/test_core.py
 python ./tests/test_attention.py
 python -m pytest ./tests/test_deep_gemm_tuner.py -v
+python -m pytest ./tests/test_gemm_bf16xfp32.py -q
 python ./tests/test_einsum.py
 python ./tests/test_hyperconnection.py
 python ./tests/test_w4a16.py
