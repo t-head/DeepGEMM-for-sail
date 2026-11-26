@@ -264,15 +264,6 @@ def test_gemm_bf16xfp32_k_sweep(k, use_fp32_output):
     _assert_accuracy(my, *gt)
 
 
-@pytest.fixture
-def router_ppu1v5(monkeypatch, ppu1v5):
-    if not torch.cuda.is_available():
-        pytest.skip("no PPU device available")
-    if torch.cuda.get_device_capability() != (8, 9):
-        pytest.skip("router fusion regression requires PPU1.5")
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
-
-
 def _check_bf16xfp32_router_case(m, use_fp32_output, api):
     n, k = 384, 7168
     x, w_high, w_low, scale, gt = _make_case(m, n, k)
@@ -294,7 +285,7 @@ def _check_bf16xfp32_router_case(m, use_fp32_output, api):
     _assert_accuracy(actual, *gt)
 
 
-@pytest.mark.usefixtures("router_ppu1v5")
+@pytest.mark.usefixtures("ppu1v5")
 @pytest.mark.parametrize("m", [8, 16], ids=lambda m: f"m{m}")
 @pytest.mark.parametrize("use_fp32_output", [True, False], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("api", ["default", "explicit", "wrapper"])
@@ -303,7 +294,7 @@ def test_gemm_bf16xfp32_router_decode(m, use_fp32_output, api):
     _check_bf16xfp32_router_case(m, use_fp32_output, api)
 
 
-@pytest.mark.usefixtures("router_ppu1v5")
+@pytest.mark.usefixtures("ppu1v5")
 @pytest.mark.parametrize("m", [128, 256, 512, 1024, 2048, 4096, 8192, 16384],
                          ids=lambda m: f"m{m}")
 @pytest.mark.parametrize("use_fp32_output", [True, False], ids=["fp32", "bf16"])
@@ -344,7 +335,7 @@ def test_gemm_bf16xfp32_ppu10_disabled(api, use_fp32_output, shape):
         _call_api(api, x, high, high, 1 / 256, use_fp32_output)
 
 
-@pytest.mark.usefixtures("router_ppu1v5")
+@pytest.mark.usefixtures("ppu1v5")
 @pytest.mark.parametrize("shape", [(5, 14, 13), (9, 130, 65), (8, 384, 7168), (128, 384, 7168),
                                  (17, 194, 129), (63, 258, 257), (129, 386, 513),
                                  (1023, 384, 65), (1025, 384, 65), (2049, 386, 129)]
@@ -376,7 +367,7 @@ def test_gemm_bf16xfp32_exact_and_guard(shape, use_fp32_output, api):
     _assert_exact(actual, expected)
 
 
-@pytest.mark.usefixtures("router_ppu1v5")
+@pytest.mark.usefixtures("ppu1v5")
 def test_gemm_bf16xfp32_tile_cache_is_not_tensor_cache():
     previous_sms = deep_gemm.get_num_sms()
     try:
@@ -396,7 +387,7 @@ def test_gemm_bf16xfp32_tile_cache_is_not_tensor_cache():
         deep_gemm.set_num_sms(previous_sms)
 
 
-@pytest.mark.usefixtures("router_ppu1v5")
+@pytest.mark.usefixtures("ppu1v5")
 @pytest.mark.parametrize(
     "m, n, k, use_fp32_output, tile, warp, stages, grid, smem, pipeline, static_router, static_stages, split_k, cta_k, k_order", [
     (8,384,7168,False,(16,16,128),(16,16,128),4,48,65536,"packed_dual_n",1,0,2,0,0),
@@ -463,7 +454,7 @@ def test_gemm_bf16xfp32_exact_lut_and_explicit_priority(
         deep_gemm.set_num_sms(previous_sms)
 
 
-@pytest.mark.usefixtures("router_ppu1v5")
+@pytest.mark.usefixtures("ppu1v5")
 @pytest.mark.parametrize("change", ["m", "n", "k", "sms", "sms64", "scale", "near_scale", "fp32", "configs"])
 def test_gemm_bf16xfp32_exact_lut_boundaries(change, monkeypatch, capfd):
     import ctypes
@@ -503,7 +494,7 @@ def test_gemm_bf16xfp32_exact_lut_boundaries(change, monkeypatch, capfd):
         deep_gemm.set_num_sms(previous_sms)
 
 
-@pytest.mark.usefixtures("router_ppu1v5")
+@pytest.mark.usefixtures("ppu1v5")
 @pytest.mark.parametrize("mode", ["lut", "whitebox", "explicit"])
 @pytest.mark.parametrize("use_fp32_output", [False, True])
 def test_gemm_bf16xfp32_removed_overrides_are_ignored(mode, use_fp32_output, monkeypatch, capfd):
@@ -673,6 +664,23 @@ def test_gemm_bf16xfp32_automatic_registration():
         cases = [case for case in load_cases(root / "checkin" / f"checkin_{filename}.list") if "data_type:bf16xfp32," in case]
         assert cases and any("use_fp32_output:0" in case for case in cases) and any("use_fp32_output:1" in case for case in cases)
         assert all(("expect_error:BF16xFP32 GEMM is disabled on PPU1.0" in case) == (filename == "810e") for case in cases)
+
+
+def test_gemm_bf16xfp32_tf32_fixture_restores_state():
+    backend = torch.backends.cuda.matmul
+    assert backend.allow_tf32 is False
+    try:
+        for previous in (True, False):
+            backend.allow_tf32 = previous
+            fixture = _disable_tf32_golden.__wrapped__()
+            try:
+                next(fixture)
+                assert backend.allow_tf32 is False
+            finally:
+                fixture.close()
+            assert backend.allow_tf32 is previous
+    finally:
+        backend.allow_tf32 = False
 
 
 def test_gemm_bf16xfp32_accuracy_standard_selfcheck():
