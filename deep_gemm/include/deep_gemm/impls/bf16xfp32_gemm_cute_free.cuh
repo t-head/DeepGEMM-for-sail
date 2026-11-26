@@ -6,7 +6,7 @@
 // Same layering as bf16_gemm_cute_free.cuh, but binds the atoms to the dual-B
 // orchestrator (cute_free/kernel/gemm_bf16xfp32.cuh). The FP32 weight is
 // passed as two BF16 matrices (high + low * scale); the interleaved dual-B
-// pipeline carries A + both B operands per stage on the BF16 tensor cores
+// pipeline carries A + both B operands per stage on the BF16 matrix units
 // with FP32 accumulation, and the epilogue writes a single combined result.
 //
 // IsAlignedN: host-computed (shape_n % block_n == 0), same convention as the

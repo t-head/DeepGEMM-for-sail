@@ -1,7 +1,7 @@
 """BF16 x FP32 dense GEMM correctness and API contract tests.
 
 The FP32 weight is decomposed into two BF16 matrices (high + low * scale,
-scale = 1/256), the GEMM runs on the BF16 tensor cores with FP32 accumulation
+scale = 1/256), the GEMM runs on the BF16 matrix units with FP32 accumulation
 and both FP32 references must satisfy the ordinary BF16 dense calc_diff < 0.001:
 computation uses X @ high.T + scale * (X @ low.T); approximation quality uses
 X @ original_weight.T. BF16 references round only after the final FP32 merge.

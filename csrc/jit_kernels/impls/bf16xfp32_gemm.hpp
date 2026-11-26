@@ -231,7 +231,7 @@ static const ExactConfig* exact_config(const ExactKey& key, bool explicit_config
 } // namespace dual_b
 
 // Composition fallback: out = x@w_high^T + scale * x@w_low^T via two plain BF16
-// GEMMs through an FP32 intermediate (BF16 tensor-core rate, FP32 accumulation;
+// GEMMs through an FP32 intermediate (BF16 matrix-unit rate, FP32 accumulation;
 // the low part recovers the residual bits). Only PPU1.0 uses the composed path.
 static void bf16xfp32_gemm_composed(const torch::Tensor& lhs, const torch::Tensor& w_high,
                                     const torch::Tensor& w_low, const torch::Tensor& out,
