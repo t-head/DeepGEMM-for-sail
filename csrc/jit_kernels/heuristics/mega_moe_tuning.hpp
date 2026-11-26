@@ -2,12 +2,14 @@
 
 #include <array>
 #include <initializer_list>
+#include <limits>
 #include <optional>
 #include <string>
+#include <tuple>
 
 namespace deep_gemm::mega {
 
-enum class Precision { W4A16, W4A8, FP8Channelwise, FP8Blockwise };
+enum class Precision { W4A16, W4A8, FP8Channelwise, FP8Blockwise, W4A8NVFP4 };
 using Tile = std::array<int, 6>; // BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, stages
 
 struct TuningWorkload {
@@ -62,9 +64,47 @@ struct TuningEntry {
     bool token_buckets = false;
 };
 
-inline TuningConfig select_tuning(const TuningWorkload& w) {
+inline std::optional<Tile> nvfp4_tuned_tile(int expected_m, int n, int k, bool linear1) {
+    if (k < 1024 || k % 128 != 0)
+        return std::nullopt;
+
+    // Inclusive expert-row bounds. Gate/up and scatter use different operand
+    // lifetimes, so retain their measured tiles and stage counts separately.
+    using Row = std::tuple<int, Tile, Tile>;
+    static const Tile gate16{16, 128, 128, 16, 64, 2};
+    static const Tile scatter16{16, 256, 128, 16, 64, 2};
+    static const Tile gate32{32, 128, 128, 32, 64, 2};
+    static const Tile scatter32{32, 128, 128, 32, 32, 3};
+    static const Tile gate64{64, 128, 128, 64, 32, 3};
+    static const Tile scatter64{64, 128, 128, 64, 32, 2};
+    static const Tile reuse128{128, 128, 128, 64, 32, 3};
+    // Gate/up pairs use a deeper operand ring than the scatter mainloop.
+    static const Tile gate128{128, 128, 128, 64, 32, 4};
+    static const Tile scatter256{256, 64, 128, 64, 32, 3};
+    constexpr int unbounded = std::numeric_limits<int>::max();
+    static const std::initializer_list<Row> general = {
+        {11, gate16, scatter16}, {31, gate32, scatter32}, {unbounded, gate64, scatter64},
+    };
+    static const std::initializer_list<Row> large = {
+        {11, gate16, scatter16}, {31, gate32, scatter32}, {64, gate64, scatter64},
+        {128, gate128, reuse128}, {256, gate128, scatter256},
+        {639, gate128, reuse128}, {unbounded, gate128, scatter256},
+    };
+    for (const auto& [upper_m, gate, scatter] : n >= 4096 && k >= 4096 ? large : general) {
+        if (expected_m <= upper_m)
+            return linear1 ? gate : scatter;
+    }
+    return std::nullopt;
+}
+
+inline TuningConfig select_tuning(const TuningWorkload& w, int expected_m) {
     TuningConfig result{w, {}, {}, {}, {}};
     using P = Precision;
+    if (w.precision == P::W4A8NVFP4) {
+        result.gemm1.tile = nvfp4_tuned_tile(expected_m, 2 * w.intermediate, w.hidden, true);
+        result.gemm2.tile = nvfp4_tuned_tile(expected_m, w.hidden, w.intermediate, false);
+        return result;
+    }
     static const Tile small16{16, 256, 128, 16, 64, 2};
     static const Tile small32{32, 256, 128, 32, 64, 2};
     static const Tile reuse128{128, 256, 128, 128, 32, 2};

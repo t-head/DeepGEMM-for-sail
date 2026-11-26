@@ -10,6 +10,7 @@
 #include "../jit_kernels/impls/sm89_fp8_fp8_mega_moe.hpp"
 #include "../jit_kernels/impls/sm89_bf16_fp4_mega_moe.hpp"
 #include "../jit_kernels/impls/sm89_fp8_fp4_mega_moe.hpp"
+#include "../jit_kernels/impls/sm89_fp8_nvfp4_mega_moe.hpp"
 #include "../jit_kernels/heuristics/mega_moe.hpp"
 
 namespace deep_gemm::mega {
@@ -754,6 +755,180 @@ void fp8_fp4_mega_moe(
         configs, cumulative_local_expert_recv_stats);
 }
 
+static std::pair<NVFP4Weights, NVFP4Weights> transform_weights_for_nvfp4_mega_moe(
+    const WeightPair& l1_weights, const WeightPair& l2_weights,
+    const OptTensor& l1_rhs_scales, const OptTensor& l2_rhs_scales,
+    const OptTensor& l1_weight_global_scale, const OptTensor& l2_weight_global_scale,
+    const std::string& execution) {
+    TORCH_CHECK_VALUE(execution == "fused" || execution == "dequantize",
+                      "execution must be 'fused' or 'dequantize'");
+    const auto check = [](const WeightPair& pair, const char* name) {
+        const auto& [w, s] = pair;
+        TORCH_CHECK_VALUE(w.dim() == 3 && s.dim() == 3, name, " must contain rank-3 weights and scales");
+        TORCH_CHECK_VALUE(w.is_cuda() && w.scalar_type() == torch::kUInt8 &&
+                          s.scalar_type() == torch::kFloat8_e4m3fn && w.device() == s.device() &&
+                          w.is_contiguous() && s.is_contiguous(), "invalid ", name, " dtype, device or layout");
+        const int64_t e = w.size(0), n = w.size(1), packed_k = w.size(2);
+        TORCH_CHECK_VALUE(e > 0 && n % 128 == 0 && packed_k % 64 == 0 &&
+                          s.sizes() == std::vector<int64_t>({e, n, packed_k / 8}),
+                          "invalid ", name, " NVFP4 shape or K16 scale shape");
+    };
+    check(l1_weights, "l1_weights");
+    check(l2_weights, "l2_weights");
+    const auto& w1 = std::get<0>(l1_weights);
+    const auto& w2 = std::get<0>(l2_weights);
+    const int64_t e = w1.size(0), h = 2 * w1.size(2), i = w1.size(1) / 2;
+    TORCH_CHECK_VALUE(h > 0 && h % 256 == 0 && i > 0 && i % 128 == 0 &&
+                      w2.sizes() == std::vector<int64_t>({e, h, i / 2}) && w1.device() == w2.device(),
+                      "weights must represent matching [E,2I,H] and [E,H,I] matrices");
+    const auto positive_finite = [](const Tensor& t) {
+        return at::logical_and(at::isfinite(t), t > 0).all().item<bool>();
+    };
+    const auto mode = execution == "fused" ? deep_gemm_preprocess_common::PreprocessMode::W4A8_NVFP4
+                                          : deep_gemm_preprocess_common::PreprocessMode::W4A8_NVFP4_FP8;
+    const auto prepare = [&](const WeightPair& pair, const OptTensor& scales,
+                             const OptTensor& global_scale, bool interleave) {
+        const auto& w = std::get<0>(pair);
+        const std::vector<int64_t> shape{e, w.size(1) / 128, w.size(2) / 64};
+        auto outer = scales ? *scales : at::ones(shape, w.options().dtype(torch::kFloat32));
+        TORCH_CHECK_VALUE(outer.scalar_type() == torch::kFloat32 && outer.device() == w.device() &&
+                          outer.sizes() == shape && outer.is_contiguous() && positive_finite(outer),
+                          "rhs_scales must be positive finite FP32 [E,N/128,K/128]");
+        if (global_scale) {
+            const auto& g = *global_scale;
+            TORCH_CHECK_VALUE(g.device() == w.device() && g.scalar_type() == torch::kFloat32 &&
+                              g.is_contiguous() && (g.dim() == 0 ||
+                                  (g.dim() == 1 && (g.size(0) == 1 || g.size(0) == e))) && positive_finite(g),
+                              "weight_global_scale must be a positive finite FP32 scalar or [E]");
+            outer = outer * g.reshape({-1, 1, 1});
+            TORCH_CHECK_VALUE(positive_finite(outer), "combined FP8 outer/global scales must remain positive and finite");
+        }
+        return prepare_nvfp4_mega_moe_weights(pair, outer, interleave, mode);
+    };
+    return {prepare(l1_weights, l1_rhs_scales, l1_weight_global_scale, true),
+            prepare(l2_weights, l2_rhs_scales, l2_weight_global_scale, false)};
+}
+
+// Both NVFP4 execution modes use the existing blockwise activation transport.
+void fp8_nvfp4_mega_moe(
+    const Tensor& y, const NVFP4Weights& l1_weights_tuple, const NVFP4Weights& l2_weights_tuple,
+    const OptTensor& cumulative_local_expert_recv_stats, const Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx, const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk,
+    const std::string& activation, const std::optional<float>& activation_clamp_opt, const bool& fast_math,
+    const std::optional<float>& situ_beta_opt, const std::optional<float>& situ_linear_beta_opt,
+    const std::optional<float>& activation_alpha_opt,
+    const std::optional<NVFP4Weights>& l1_weights_replicas, const std::optional<NVFP4Weights>& l2_weights_replicas,
+    const std::array<int, 3>& staging_config, const std::string& execution,
+    const std::optional<NVFP4Workspace>& fp8_workspace,
+    const std::optional<NVFP4Workspace>& fp8_workspace_replicas) {
+    check_device();
+    TORCH_CHECK(execution == "fused" || execution == "dequantize", "execution must be 'fused' or 'dequantize'");
+    const bool decode = execution == "dequantize";
+    TORCH_CHECK(decode == fp8_workspace.has_value(), "dequantize requires fp8_workspace; fused does not use it");
+    TORCH_CHECK(l1_weights_replicas.has_value() == l2_weights_replicas.has_value(),
+                "Both replica banks must be provided together");
+    TORCH_CHECK(fp8_workspace_replicas.has_value() == (decode && l1_weights_replicas.has_value()),
+                "dequantize with replica banks requires fp8_workspace_replicas");
+    check_tensor(y, torch::kBFloat16);
+    TORCH_CHECK(y.dim() == 2 && std::get<0>(l1_weights_tuple).dim() == 3, "Invalid NVFP4 output or weight rank");
+    const int64_t width = decode ? std::get<0>(l1_weights_tuple).size(1)
+                                 : std::get<0>(l1_weights_tuple).size(2) / 4;
+    TORCH_CHECK(width > 0 && width % 256 == 0 && width <= std::numeric_limits<int>::max(),
+                "NVFP4 GEMM1 requires complete gate/up blocks within INT32 dimensions");
+    const int hidden = y.size(1), intermediate = width / 2, tokens = y.size(0), ranks = sym_buffer_ptrs.size();
+    const auto layout = checked_routed_layout(ranks, num_experts, num_max_tokens_per_rank, num_topk,
+        hidden, intermediate, "fp8_blockwise", staging_config);
+    TORCH_CHECK(tokens <= num_max_tokens_per_rank && y.device() == sym_buffer.device(), "Invalid output capacity or device");
+    check_routed_buffer(sym_buffer, layout);
+    const auto transport = make_sym_buffer(sym_buffer, sym_buffer_ptrs, rank_idx);
+    const int groups = num_experts / ranks, masters = std::get<0>(l1_weights_tuple).size(0);
+    TORCH_CHECK(masters > 0 && masters <= groups && (l1_weights_replicas ? masters < groups : masters == groups),
+                "Invalid master/replica expert count");
+    if (cumulative_local_expert_recv_stats)
+        check_tensor(*cumulative_local_expert_recv_stats, torch::kInt32, y.device(), {groups}, "receive statistics");
+    std::vector<Tensor> inputs;
+    if (decode) inputs = {y, sym_buffer};
+    const auto check_bank = [&](const NVFP4Weights& bank, int n, int k, int e) {
+        const auto& [w, native, outer] = bank;
+        check_tensor(w, torch::kInt32); check_tensor(native, torch::kUInt8);
+        check_tensor(outer, torch::kFloat32, y.device(), {e, n / 128, k / 128}, "FP8 outer scales");
+        TORCH_CHECK(w.device() == y.device() && native.device() == y.device(), "Weights must share the workspace device");
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(w.data_ptr()) % 8 == 0,
+                    "NVFP4 packed weights must be 8-byte aligned");
+        TORCH_CHECK(decode || reinterpret_cast<uintptr_t>(native.data_ptr()) % 16 == 0,
+                    "Fused NVFP4 native scales must be 16-byte aligned");
+        check_shape(w, decode ? std::vector<int64_t>{e, n, k / 8} : std::vector<int64_t>{e, k / 32, 4 * n});
+        check_shape(native, decode ? std::vector<int64_t>{e, n, k / 16} : std::vector<int64_t>{e, k / 16, n});
+        TORCH_CHECK(!decode || int64_t(e) * n * (k / 16) <= std::numeric_limits<int32_t>::max(),
+                    "NVFP4 decode exceeds INT32_MAX K16 records");
+        if (decode) inputs.insert(inputs.end(), {w, native, outer});
+    };
+    check_bank(l1_weights_tuple, 2 * intermediate, hidden, masters);
+    check_bank(l2_weights_tuple, hidden, intermediate, masters);
+    if (l1_weights_replicas) {
+        check_bank(*l1_weights_replicas, 2 * intermediate, hidden, groups - masters);
+        check_bank(*l2_weights_replicas, hidden, intermediate, groups - masters);
+    }
+    const auto& r1 = l1_weights_replicas ? *l1_weights_replicas : l1_weights_tuple;
+    const auto& r2 = l2_weights_replicas ? *l2_weights_replicas : l2_weights_tuple;
+    const auto kind = parse_gated_activation(activation);
+    const auto params = check_mega_moe_activation(
+        kind, activation_clamp_opt, situ_beta_opt, situ_linear_beta_opt, activation_alpha_opt);
+    const float clamp = activation_clamp_opt && std::isfinite(*activation_clamp_opt) ? *activation_clamp_opt : -1.f;
+    if (get_env<int>("show_log", 0))
+        printf("[fp8_nvfp4_mega_moe] execution:%s\n", execution.c_str());
+    DgProfParam profile;
+    if (profiling_enabled()) {
+        profile.set_params(GemmType::MegaMoE, false, "w4a8_nvfp4", groups,
+            tokens, 2 * intermediate, hidden, 0, nullptr, current_stream());
+        profile.add_params("scope", "forward");
+        profile.add_params("execution", execution);
+        profile.add_params("ranks", ranks);
+        profile.add_params("capacity", num_max_tokens_per_rank);
+        profile.add_params("topk", num_topk);
+        profile.add_params("masters", masters);
+        profile.add_params("activation", activation);
+        profile.add_params("clamp", clamp);
+        profile.add_params("fast_math", fast_math);
+        profile.add_params("activation_alpha", params.alpha);
+        // Replay synthesizes routes and weights; retain the common activation
+        // contract without synchronizing to read device-generated row counts.
+        profile.add_params("replayable", kind != GatedActivation::SiTU ||
+            (params.beta == 4.f && params.linear_beta == 25.f));
+    }
+    auto profiling_guard = show_gemm_ut(profile);
+    if (decode) {
+        std::vector<Tensor> decoded;
+        const auto check_workspace = [&](const NVFP4Workspace& pair, int e) {
+            check_tensor(pair.first, torch::kFloat8_e4m3fn, y.device(), {e, 2 * intermediate, hidden}, "GEMM1 FP8 workspace");
+            check_tensor(pair.second, torch::kFloat8_e4m3fn, y.device(), {e, hidden, intermediate}, "GEMM2 FP8 workspace");
+            decoded.insert(decoded.end(), {pair.first, pair.second});
+        };
+        check_workspace(*fp8_workspace, masters);
+        if (fp8_workspace_replicas) check_workspace(*fp8_workspace_replicas, groups - masters);
+        if (cumulative_local_expert_recv_stats) inputs.push_back(*cumulative_local_expert_recv_stats);
+        const auto disjoint = [](const Tensor& a, const Tensor& b) {
+            if (!a.numel() || !b.numel()) return true;
+            const auto x = reinterpret_cast<uintptr_t>(a.data_ptr()), z = reinterpret_cast<uintptr_t>(b.data_ptr());
+            return x <= z ? z - x >= uint64_t(a.nbytes()) : x - z >= uint64_t(b.nbytes());
+        };
+        for (size_t i = 0; i < decoded.size(); ++i) {
+            TORCH_CHECK(reinterpret_cast<uintptr_t>(decoded[i].data_ptr()) % 16 == 0, "FP8 workspace must be 16-byte aligned");
+            for (const auto& input : inputs) TORCH_CHECK(disjoint(decoded[i], input), "FP8 workspace must not overlap inputs or output");
+            for (size_t j = 0; j < i; ++j) TORCH_CHECK(disjoint(decoded[i], decoded[j]), "FP8 workspaces must not overlap");
+        }
+    }
+    const auto& configs = get_mega_moe_precision_configs(
+        decode ? Precision::FP8Blockwise : Precision::W4A8NVFP4,
+        ranks, num_experts, num_topk, hidden, intermediate,
+        num_max_tokens_per_rank, tokens, masters, activation, y.device().index());
+    fp8_nvfp4_mega_moe_impl(
+        y, l1_weights_tuple, l2_weights_tuple, r1, r2, sym_buffer.data_ptr<uint8_t>(), layout, transport,
+        rank_idx, tokens, kind, clamp, fast_math, params.alpha, params.beta, params.linear_beta,
+        configs, cumulative_local_expert_recv_stats, fp8_workspace, fp8_workspace_replicas);
+}
+
 static void int8_int8_mega_moe(
     const Tensor& y, const WeightPair& l1_weights_tuple, const WeightPair& l2_weights_tuple,
     const OptTensor& cumulative_local_expert_recv_stats,
@@ -805,7 +980,9 @@ static void int8_int8_mega_moe(
 }
 
 static void register_apis(pybind11::module_& m) {
+    m.def("transform_weights_for_nvfp4_mega_moe", &transform_weights_for_nvfp4_mega_moe);
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
+    m.def("fp8_nvfp4_mega_moe", &fp8_nvfp4_mega_moe);
     m.def("bf16_fp4_mega_moe", &bf16_fp4_mega_moe);
     m.def("fp8_fp8_mega_moe", &fp8_fp8_mega_moe);
     m.def("fp4_fp4_mega_moe", &fp4_fp4_mega_moe);

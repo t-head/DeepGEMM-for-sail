@@ -9,7 +9,7 @@ from utils import test_gemm, test_m_grouped_gemm_contiguous, test_m_grouped_gemm
 from utils import test_k_grouped_gemm_contiguous
 from utils import test_hc_prenorm_gemm, test_mqa_logits, test_paged_mqa_logits, test_sparse_mqa_logits, test_mega_mhc, test_mega_gate
 from utils import test_batch_gemm
-from utils import get_acc_check, set_acc_check, set_benchmark
+from utils import get_acc_check, set_acc_check, get_benchmark, set_benchmark
 from utils import judge_device_type, set_ref_backend
 import atexit
 
@@ -85,6 +85,14 @@ def run_moe_align(args):
     return main(check_accuracy=get_acc_check())
 
 
+def run_mega_moe(args):
+    if os.environ.get("HGGC_WARM_UP") or not get_acc_check() or get_benchmark():
+        raise ValueError("MegaMoE format replay runs complete correctness checks; "
+                         "use tests/bench_mega_moe.py for timing")
+    from test_mega_moe_precisions import replay_nvfp4_mega_moe
+    return replay_nvfp4_mega_moe(args)
+
+
 def call_test_func(gemm_type, func_args):
     supported_call_funcs = {
         "KGroupedContiguous": test_k_grouped_gemm_contiguous,
@@ -110,6 +118,7 @@ def call_test_func(gemm_type, func_args):
         "Activation": run_activation_regression,
         "MoeAlign": run_moe_align,
         "MegaGate": test_mega_gate,
+        "MegaMoE": run_mega_moe,
     }
 
     if gemm_type in supported_call_funcs.keys():

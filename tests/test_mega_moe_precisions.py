@@ -1,4 +1,4 @@
-"""Complete FP8, FP8 x FP4 and BF16 x FP4 MegaMoE through public entry points.
+"""Complete FP8, MXFP4 and NVFP4 MegaMoE through public entry points.
 
 python -m pytest -q -s tests/test_mega_moe_precisions.py -k smoke
 torchrun --standalone --nproc-per-node=2 -m pytest -q -s tests/test_mega_moe_precisions.py -k smoke
@@ -20,6 +20,7 @@ if __name__ == "__main__":
 import deep_gemm as dg
 from deep_gemm.testing import calc_diff
 from quantization import quant_w4
+from test_w4a8_nvfp4 import _decode_nvfp4, _cast_fp8
 from test_mega_moe import (
     MegaMoECase, MODEL_TOKENS, mega_moe_group,
     _process_group, _all_gather, _relative_l2, _make_routes,
@@ -109,10 +110,19 @@ CASES = (
     MegaMoECase("kimi_k3_w4a8", 3584, 3072, 896, 16, 4096,
                tokens=(32, 64, 128, *MODEL_TOKENS), activation="situ", worlds=(8, 16, 32),
                precision="w4a8", routing="random", reference_tokens=8),
+    MegaMoECase("nvfp4_smoke", 512, 256, 8, 2, 129, tokens=(1, 0, 33, 129, 8),
+               precision="w4a8_nvfp4", routing="random", reference_tokens=129),
+    # Model-sized projections cover shared M decode and N64 scatter.
+    MegaMoECase("nvfp4_shared_decode", 7168, 5120, 4, 2, 129, tokens=(1, 33, 129, 0),
+               worlds=(1, 2), precision="w4a8_nvfp4", routing="random", reference_tokens=129),
+    MegaMoECase("minimax_m3_nvfp4", 7168, 5120, 384, 4, 4096,
+               tokens=(64, *MODEL_TOKENS), activation="swiglu_oai", clamp=7.0,
+               worlds=(8, 16, 32, 64), precision="w4a8_nvfp4", routing="random"),
 )
 
 
 SMOKE_CASES = tuple(c for c in CASES if c.name.startswith("smoke_"))
+NVFP4_SMOKE_CASE = next(c for c in CASES if c.name == "nvfp4_smoke")
 
 
 def check_output(actual, expected, max_diff=0.001):
@@ -154,6 +164,19 @@ def dequantize(q, s, blockwise=False):
 
 def make_weights(e, n, k, precision, rng):
     """Build quantized weights with FP8 temporaries bounded to one expert."""
+    if precision == "w4a8_nvfp4":
+        packed = torch.empty((e, n, k // 2), device="cuda", dtype=torch.uint8)
+        native = (torch.rand((e, n, k // 16), device="cuda", generator=rng) + .125).to(torch.float8_e4m3fn)
+        outer = (torch.rand((e, n // 128, k // 128), device="cuda", generator=rng) + .25) / 64
+        global_scale = torch.linspace(.5, 1., e, device="cuda")
+        ref = torch.empty((e, n, k), device="cuda", dtype=torch.float32)
+        for expert in range(e):
+            codes = torch.randint(16, (n, k), device="cuda", dtype=torch.uint8, generator=rng)
+            packed[expert] = codes[..., ::2] | (codes[..., 1::2] << 4)
+            values = _cast_fp8(_decode_nvfp4(codes, native[expert])).float()
+            scale = outer[expert].repeat_interleave(128, -2).repeat_interleave(128, -1)
+            ref[expert] = values * scale * global_scale[expert]
+        return (packed, native, outer, global_scale), ref
     if precision in ("w4a16", "w4a8"):
         source = torch.randn((e, n, k), device="cuda", dtype=torch.bfloat16, generator=rng) * 0.05
         ref, w, s = quant_w4(source, d="w4fa16_mma")
@@ -171,7 +194,7 @@ def make_weights(e, n, k, precision, rng):
 
 
 def reference(c, source, ids, weights, w1, w2, rank, tokens, *, situ_beta=4.0, situ_linear_beta=25.0):
-    blockwise = c.precision == "fp8_blockwise"
+    blockwise = c.precision in ("fp8_blockwise", "w4a8_nvfp4")
     if c.precision != "w4a16":
         q, s = quantize_rows(source, blockwise)
         source = dequantize(q, s, blockwise)
@@ -204,7 +227,7 @@ def reference(c, source, ids, weights, w1, w2, rank, tokens, *, situ_beta=4.0, s
                 activated = gated * up
         # The separate row quantizer consumes BF16 scratch; fused blockwise
         # quantization consumes FP32 activation values directly.
-        if c.precision != "fp8_blockwise":
+        if not blockwise:
             activated = activated.bfloat16()
         if c.precision != "w4a16":
             q, s = quantize_rows(activated, blockwise)
@@ -215,15 +238,24 @@ def reference(c, source, ids, weights, w1, w2, rank, tokens, *, situ_beta=4.0, s
     return result[rank, :tokens].bfloat16()
 
 
-def make_pipeline(c, group, rng, *, replicas=False, fast_math=True):
+def make_pipeline(c, group, rng, *, replicas=False, fast_math=True, execution="fused", master_experts=None):
     c.require_world()
     world = group.size()
     if replicas and c.experts // world < 2:
         pytest.skip("separate master and replica banks require at least two local slots")
     e = c.experts // world
+    masters = e - 1 if master_experts is None else master_experts
+    if replicas and not 0 < masters < e:
+        raise ValueError("master_experts must be between zero and the local expert count")
     raw1, ref1 = make_weights(e, 2 * c.intermediate, c.hidden, c.precision, rng)
     raw2, ref2 = make_weights(e, c.hidden, c.intermediate, c.precision, rng)
-    if c.precision == "w4a8":
+    if c.precision == "w4a8_nvfp4":
+        w1, w2 = dg.transform_weights_for_nvfp4_mega_moe(
+            raw1[:2], raw2[:2], l1_rhs_scales=raw1[2], l2_rhs_scales=raw2[2],
+            l1_weight_global_scale=raw1[3], l2_weight_global_scale=raw2[3], execution=execution)
+        mma_type, quantization = "fp8xfp8", "blockwise"
+        entry = dg.fp8_nvfp4_mega_moe
+    elif c.precision == "w4a8":
         w1, w2 = dg.transform_weights_for_w4a8_mega_moe(raw1, raw2)
         mma_type, quantization = "fp8xfp4", None
         entry = dg.fp8_fp4_mega_moe
@@ -258,11 +290,22 @@ def make_pipeline(c, group, rng, *, replicas=False, fast_math=True):
             assert master1[2] != replica1[2] and master2[2] != replica2[2]
             w1, w2 = master1, master2
         else:
-            replica1 = tuple(t[-1:].contiguous() for t in w1)
-            replica2 = tuple(t[-1:].contiguous() for t in w2)
-            w1 = tuple(t[:-1].contiguous() for t in w1)
-            w2 = tuple(t[:-1].contiguous() for t in w2)
+            replica1 = tuple(t[masters:].contiguous() for t in w1)
+            replica2 = tuple(t[masters:].contiguous() for t in w2)
+            w1 = tuple(t[:masters].contiguous() for t in w1)
+            w2 = tuple(t[:masters].contiguous() for t in w2)
         options.update(l1_weights_replicas=replica1, l2_weights_replicas=replica2)
+
+    if c.precision == "w4a8_nvfp4":
+        options["execution"] = execution
+        if execution == "dequantize":
+            def workspace(bank):
+                groups = bank[0].shape[0]
+                return (torch.empty(groups, 2*c.intermediate, c.hidden, device="cuda", dtype=torch.float8_e4m3fn),
+                        torch.empty(groups, c.hidden, c.intermediate, device="cuda", dtype=torch.float8_e4m3fn))
+            options["fp8_workspace"] = workspace(w1)
+            if replicas:
+                options["fp8_workspace_replicas"] = workspace(replica1)
 
     def forward(source, ids, weights, y, stats=None):
         dg.mega_moe_pre_dispatch(
@@ -276,11 +319,12 @@ def make_pipeline(c, group, rng, *, replicas=False, fast_math=True):
                            l1_weights=w1, l2_weights=w2, options=options, entry=entry, forward=forward)
 
 
-def run_case(c, group, *, replicas=False, fast_math=True, reference_tokens=None):
+def run_case(c, group, *, replicas=False, fast_math=True, reference_tokens=None, execution="fused", master_experts=None):
     rank, world = group.rank(), group.size()
     max_diff = 0.0015 if c.precision == "w4a8" else 0.001
     rng = torch.Generator(device="cuda").manual_seed(20261030 + rank)
-    pipeline = make_pipeline(c, group, rng, replicas=replicas, fast_math=fast_math)
+    pipeline = make_pipeline(c, group, rng, replicas=replicas, fast_math=fast_math,
+                             execution=execution, master_experts=master_experts)
     buffer, refs1, refs2 = pipeline.buffer, pipeline.ref1, pipeline.ref2
     e = c.experts // world
     source = torch.randn((c.capacity, c.hidden), device="cuda", dtype=torch.bfloat16, generator=rng) * 0.1
@@ -366,6 +410,24 @@ def run_case(c, group, *, replicas=False, fast_math=True, reference_tokens=None)
             forward()
             torch.cuda.synchronize()
             torch.testing.assert_close(y, replayed, rtol=0, atol=0)
+            if c.precision == "w4a8_nvfp4" and iteration == 0:
+                banks = [pipeline.l1_weights]
+                if replicas:
+                    banks.append(pipeline.options["l1_weights_replicas"])
+                for bank in banks:
+                    bank[1].copy_((bank[1].view(torch.float8_e4m3fn).float() * .5)
+                                  .to(torch.float8_e4m3fn).view(torch.uint8))
+                refs1.mul_(.5)
+                y.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                changed = reference(c, all_source, changed_ids[:, :checked], all_weights,
+                                    refs1, refs2, rank, min(tokens, checked))
+                check_output(y[:checked], changed, max_diff)
+                for bank in banks:
+                    bank[1].copy_((bank[1].view(torch.float8_e4m3fn).float() * 2)
+                                  .to(torch.float8_e4m3fn).view(torch.uint8))
+                refs1.mul_(2)
             weights.zero_()
             graph.replay()
             torch.cuda.synchronize()
@@ -379,28 +441,32 @@ def run_case(c, group, *, replicas=False, fast_math=True, reference_tokens=None)
     ("fp8_channelwise", "swiglu_step"), ("fp8_channelwise", "situ"),
     ("fp8_blockwise", "swiglu_step"), ("fp8_blockwise", "situ"),
     ("w4a16", "swiglu"), ("w4a16", "swiglu_step"), ("w4a16", "swiglu_oai"),
+    ("w4a8_nvfp4", "swiglu_step"), ("w4a8_nvfp4", "situ"), ("w4a8_nvfp4", "swiglu_oai"),
 ))
 def test_mega_moe_activation_parity(precision, activation, mega_moe_group):
-    base = next(c for c in SMOKE_CASES if c.precision == precision)
+    base = next(c for c in (*SMOKE_CASES, NVFP4_SMOKE_CASE) if c.precision == precision)
     case = replace(base, activation=activation, experts=4 * mega_moe_group.size(),
                    capacity=8, tokens=(8,), clamp=None if activation == "situ" else .125,
                    activation_alpha=.25 if activation == "swiglu_oai" else None,
                    worlds=DISTRIBUTED_WORLDS)
-    run_case(case, mega_moe_group, fast_math=False)
+    for execution in (("fused", "dequantize") if precision == "w4a8_nvfp4" else ("fused",)):
+        run_case(case, mega_moe_group, fast_math=False, execution=execution)
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c.name)
 def test_mega_moe_precision(case, mega_moe_group):
-    if case in SMOKE_CASES:
+    if case in SMOKE_CASES or case == NVFP4_SMOKE_CASE:
         # Keep four local experts at every EP, including separate replicas.
         case = replace(case, experts=4 * mega_moe_group.size(), worlds=DISTRIBUTED_WORLDS)
-    run_case(case, mega_moe_group)
+    for execution in (("fused", "dequantize") if case.precision == "w4a8_nvfp4" else ("fused",)):
+        run_case(case, mega_moe_group, execution=execution)
 
 
-@pytest.mark.parametrize("case", SMOKE_CASES, ids=lambda c: c.name)
+@pytest.mark.parametrize("case", (*SMOKE_CASES, NVFP4_SMOKE_CASE), ids=lambda c: c.name)
 def test_mega_moe_precision_replicas(case, mega_moe_group):
-    run_case(replace(case, experts=4 * mega_moe_group.size(), worlds=DISTRIBUTED_WORLDS,
-                     tokens=(1, 33)), mega_moe_group, replicas=True, fast_math=False)
+    for execution in (("fused", "dequantize") if case.precision == "w4a8_nvfp4" else ("fused",)):
+        run_case(replace(case, experts=4 * mega_moe_group.size(), worlds=DISTRIBUTED_WORLDS,
+                         tokens=(1, 33)), mega_moe_group, replicas=True, fast_math=False, execution=execution)
 
 
 def test_mega_moe_channelwise_quantization_reuse(mega_moe_group):
@@ -754,6 +820,117 @@ def test_mega_moe_precision_api(case, mega_moe_group):
         pipeline.buffer.destroy()
 
 
+@pytest.mark.parametrize("execution", ("fused", "dequantize"))
+def test_nvfp4_mega_moe_weight_preparation(execution, mega_moe_group):
+    from deep_gemm.mega import _interleave_weights
+
+    raw, scales, expected = [], [], []
+    mode = (dg.PreprocessMode.W4A8_NVFP4 if execution == "fused"
+            else dg.PreprocessMode.W4A8_NVFP4_FP8)
+    for layer, (n, k) in enumerate(((512, 512), (512, 256))):
+        rows = torch.arange(2 * n, device="cuda").reshape(2, n, 1)
+        cols = torch.arange(k // 2, device="cuda").reshape(1, 1, -1)
+        weight = ((rows * 7 + rows // 128 * 5 + cols * 3) % 256).to(torch.uint8)
+        native = ((torch.arange(2 * n * (k // 16), device="cuda").reshape(2, n, k // 16)
+                   % 17 + 1).float() / 16).to(torch.float8_e4m3fn)
+        raw.append((weight, native))
+        scales.append((torch.arange(2 * (n // 128) * (k // 128), device="cuda", dtype=torch.float32)
+                       .reshape(2, n // 128, k // 128) + 1) / 32)
+        if layer == 0:
+            weight, native = _interleave_weights(weight, 128), _interleave_weights(native, 128)
+        expected.append(dg.preprocess_weights_and_scales(mode, False, weight, native))
+
+    # Independent Python ordering and scale arithmetic must remain byte-exact.
+    for supplied, global_scale in ((False, None), (False, torch.tensor(.75, device="cuda")),
+                                   (True, torch.tensor([.75], device="cuda")),
+                                   (True, torch.tensor([.5, 1.5], device="cuda"))):
+        prepared = dg.transform_weights_for_nvfp4_mega_moe(
+            *raw, l1_rhs_scales=scales[0] if supplied else None,
+            l2_rhs_scales=scales[1] if supplied else None,
+            l1_weight_global_scale=global_scale, l2_weight_global_scale=global_scale, execution=execution)
+        for layer, bank in enumerate(prepared):
+            outer = scales[layer] if supplied else torch.ones_like(scales[layer])
+            if global_scale is not None:
+                outer = outer * global_scale.reshape(-1, 1, 1)
+            if layer == 0:
+                outer = _interleave_weights(outer, 1)
+            for actual, reference in zip(bank, (*expected[layer], outer)):
+                torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+    for kwargs in (dict(l1_rhs_scales=torch.zeros_like(scales[0])),
+                   dict(l2_weight_global_scale=torch.ones(2, 1, device="cuda")),
+                   dict(l1_weight_global_scale=torch.tensor(float("inf"), device="cuda"))):
+        with pytest.raises(ValueError):
+            dg.transform_weights_for_nvfp4_mega_moe(*raw, execution=execution, **kwargs)
+
+
+@pytest.mark.parametrize("execution", ("fused", "dequantize"))
+def test_nvfp4_mega_moe_workspace(execution, mega_moe_group):
+    case = replace(NVFP4_SMOKE_CASE,
+                   experts=4 * mega_moe_group.size(), worlds=DISTRIBUTED_WORLDS)
+    rng = torch.Generator(device="cuda").manual_seed(20261125 + mega_moe_group.rank())
+    pipeline = make_pipeline(case, mega_moe_group, rng, execution=execution)
+    y = torch.empty(1, case.hidden, device="cuda", dtype=torch.bfloat16)
+    try:
+        transform = dg.transform_weights_for_nvfp4_mega_moe
+        for invalid in ((), (None, None)):
+            with pytest.raises(TypeError):
+                transform(invalid, pipeline.raw2[:2], execution=execution)
+        with pytest.raises(ValueError, match="rank-3"):
+            transform((pipeline.raw1[0].flatten(), pipeline.raw1[1]), pipeline.raw2[:2], execution=execution)
+        for layer in (1, 2):
+            banks = [pipeline.l1_weights, pipeline.l2_weights]
+            banks[layer - 1] = (banks[layer - 1][0].flatten(), *banks[layer - 1][1:])
+            with pytest.raises(ValueError, match=f"l{layer}_weights must match"):
+                pipeline.entry(y, *banks, pipeline.buffer, **pipeline.options)
+            if execution == "fused":
+                banks = [pipeline.l1_weights, pipeline.l2_weights]
+                w, native, outer = banks[layer - 1]
+                unaligned = torch.empty(native.numel() + 1, device=native.device, dtype=native.dtype)[1:].view_as(native)
+                banks[layer - 1] = (w, unaligned, outer)
+                with pytest.raises(RuntimeError, match="native scales must be 16-byte aligned"):
+                    pipeline.entry(y, *banks, pipeline.buffer, **pipeline.options)
+        options = dict(pipeline.options)
+        if execution == "dequantize":
+            a, b = options["fp8_workspace"]
+            aliased = pipeline.buffer.buffer[:a.numel()].view(torch.float8_e4m3fn).view_as(a)
+            options["fp8_workspace"] = (aliased, b)
+            with pytest.raises(RuntimeError, match="overlap"):
+                pipeline.entry(y, pipeline.l1_weights, pipeline.l2_weights, pipeline.buffer, **options)
+        else:
+            options["fp8_workspace"] = (
+                torch.empty(4, 2 * case.intermediate, case.hidden, device="cuda", dtype=torch.float8_e4m3fn),
+                torch.empty(4, case.hidden, case.intermediate, device="cuda", dtype=torch.float8_e4m3fn))
+            with pytest.raises(RuntimeError, match="fused does not use"):
+                pipeline.entry(y, pipeline.l1_weights, pipeline.l2_weights, pipeline.buffer, **options)
+        options = {**pipeline.options, "execution": "dequantize" if execution == "fused" else "fused"}
+        with pytest.raises(ValueError, match="execution layout"):
+            pipeline.entry(y, pipeline.l1_weights, pipeline.l2_weights, pipeline.buffer, **options)
+    finally:
+        pipeline.buffer.destroy()
+
+
+def replay_nvfp4_mega_moe(args):
+    """Replay a complete-call dump with synthesized routes and quantized weights."""
+    if args.get("data_type") != "w4a8_nvfp4" or args.get("scope") != "forward":
+        raise ValueError("MegaMoE replay supports NVFP4 scope:forward records; per-stage dumps need live routing state")
+    with _process_group() as group:
+        ranks = args["ranks"]
+        if ranks != group.size():
+            raise ValueError(f"record requires {ranks} ranks; launch with torchrun --nproc-per-node={ranks}")
+        clamp = args.get("clamp", -1)
+        activation = args.get("activation", "swiglu")
+        case = MegaMoECase(
+            "nvfp4_replay", args["k"], args["n"] // 2, args["groups"] * ranks,
+            args["topk"], args["capacity"], tokens=(args["m"],), activation=activation,
+            clamp=None if clamp < 0 else clamp, precision="w4a8_nvfp4", routing="random",
+            activation_alpha=args.get("activation_alpha") if activation == "swiglu_oai" else None,
+            worlds=(ranks,))
+        run_case(case, group, execution=args.get("execution", "fused"),
+                 replicas=args["masters"] < args["groups"], master_experts=args["masters"],
+                 fast_math=bool(args.get("fast_math", 1)))
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if "--benchmark" in argv:
@@ -768,6 +945,8 @@ def main(argv=None):
     parser.add_argument("--fast-math", type=int, choices=(0, 1), default=1)
     parser.add_argument("--reference-tokens", type=int, default=0, help="check first N tokens/rank; 0 checks all")
     parser.add_argument("--replicas", action="store_true")
+    parser.add_argument("--execution", choices=("fused", "dequantize"), default="fused",
+                        help="NVFP4 weight execution mode")
     args = parser.parse_args(argv)
     case = next(c for c in CASES if c.name == args.case)
     case = replace(case, tokens=tuple(args.tokens) if args.tokens is not None else case.tokens,
@@ -776,6 +955,8 @@ def main(argv=None):
         parser.error("tokens must be nonnegative and no larger than a positive capacity")
     if args.reference_tokens < 0:
         parser.error("reference-tokens must be nonnegative")
+    if args.execution != "fused" and case.precision != "w4a8_nvfp4":
+        parser.error("--execution dequantize requires NVFP4 weights")
     with _process_group() as group:
         world = group.size()
         if world not in case.worlds or case.experts % world:
@@ -783,7 +964,7 @@ def main(argv=None):
         if args.replicas and case.experts // world < 2:
             raise ValueError("--replicas requires at least two local experts")
         run_case(case, group, replicas=args.replicas, fast_math=bool(args.fast_math),
-                 reference_tokens=args.reference_tokens)
+                 reference_tokens=args.reference_tokens, execution=args.execution)
 
 
 if __name__ == "__main__":

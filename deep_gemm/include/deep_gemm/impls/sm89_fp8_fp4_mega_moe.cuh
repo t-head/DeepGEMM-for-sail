@@ -10,20 +10,6 @@
 
 namespace deep_gemm::mega_moe::w4a8 {
 
-struct SingleTile {
-    int curr_group_m;
-    int curr_group_idx = 0;
-    bool pending = true;
-    CUTLASS_DEVICE int64_t curr_offset_a() const { return 0; }
-    CUTLASS_DEVICE int64_t curr_offset_c() const { return 0; }
-    CUTLASS_DEVICE bool fetch_next_work(uint32_t& m, uint32_t& n) {
-        m = n = 0;
-        const bool result = pending;
-        pending = false;
-        return result;
-    }
-};
-
 template <int BlockM, int BlockN, int K, int WarpM, int WarpN, int Stages, GatedActivation Activation,
           w4fa8::FragmentPolicy Fragment, w4fa8::ALoadPolicy ALoad>
 struct Gemm1 {
@@ -86,7 +72,7 @@ struct Gemm1 {
         params.ptr_scale = b_scale;
         params.ptr_d = reinterpret_cast<cutlass::bfloat16_t*>(out);
         params.ptr_a_scale = a_scale;
-        SingleTile scheduler{valid_m};
+        sched::SingleTileScheduler scheduler{valid_m};
         Kernel{}.run(params, smem, scheduler,
                      Epilogue{out, a_scale, stride, limit, alpha, inv_scale, situ_beta, situ_linear_beta,
                               queue_counter, next_ticket});

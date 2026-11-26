@@ -71,14 +71,11 @@ static std::optional<Config> get_tuned_nopad_config(
     return c;
 }
 
-static Config get_best_configs(GemmType type, int expected_m, int n, int k,
+static Config get_default_tile(GemmType type, int expected_m, int n, int k,
                                int a_scale_group, int b_scale_block) {
     const int num_sms = get_num_sms();
     const bool aligned_scales = b_scale_block == 128 && a_scale_group == 128 &&
         k > 512 && k % 128 == 0;
-    if (const auto tuned = get_tuned_nopad_config(type, expected_m, n, k, num_sms, aligned_scales))
-        return *tuned;
-
     // Scaled partial sums keep an extra FP32 accumulator. Start with M16;
     // wider aligned-scale tiles can amortize B decode without spilling it.
     Config c{};
@@ -105,6 +102,15 @@ static Config get_best_configs(GemmType type, int expected_m, int n, int k,
     if (aligned_scales && (c.block_m == 32 || c.block_m == 64) && c.block_n % 128 == 0 &&
             type != GemmType::MGroupedFused) c.num_stages = 3;
     return c;
+}
+
+static Config get_best_configs(GemmType type, int expected_m, int n, int k,
+                               int a_scale_group, int b_scale_block) {
+    const bool aligned_scales = b_scale_block == 128 && a_scale_group == 128 &&
+        k > 512 && k % 128 == 0;
+    if (const auto tuned = get_tuned_nopad_config(type, expected_m, n, k, get_num_sms(), aligned_scales))
+        return *tuned;
+    return get_default_tile(type, expected_m, n, k, a_scale_group, b_scale_block);
 }
 
 static Config config(GemmType type, int expected_m, int n, int k,

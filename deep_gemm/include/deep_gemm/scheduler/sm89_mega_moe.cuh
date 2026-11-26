@@ -6,6 +6,26 @@
 
 namespace deep_gemm::sched {
 
+// Adapt a tile already selected by MegaMoE to the grouped GEMM mainloop.
+struct SingleTileScheduler {
+    int curr_group_m;
+    int n_block = 0;
+    int curr_group_idx = 0;
+    bool pending = true;
+
+#if defined(__HGGC__)
+    CUTLASS_DEVICE int64_t curr_offset_a() const { return 0; }
+    CUTLASS_DEVICE int64_t curr_offset_c() const { return 0; }
+    CUTLASS_DEVICE bool fetch_next_work(uint32_t& m, uint32_t& n) {
+        m = 0;
+        n = n_block;
+        const bool result = pending;
+        pending = false;
+        return result;
+    }
+#endif
+};
+
 // The caller owns ticket publication and retirement: ordinary fetch retires
 // operand storage first, while fused epilogues may prefetch the next ticket.
 struct MegaMoEWorkQueue {

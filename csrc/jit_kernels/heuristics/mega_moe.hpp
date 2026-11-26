@@ -20,6 +20,7 @@
 #include "common_int8.hpp"
 #include "common_w4a16.hpp"
 #include "common_w4a8.hpp"
+#include "common_nvfp4_w4a8.hpp"
 #include "mega_moe_tuning.hpp"
 
 namespace deep_gemm::mega {
@@ -366,8 +367,8 @@ inline int channel_pull_group_size(const Gemm1Config& c, int expected_rows) {
 }
 
 using Config = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int, int>>;
-inline TuningConfig tuning_config(const TuningWorkload& workload) {
-    return select_tuning(workload);
+inline TuningConfig tuning_config(const TuningWorkload& workload, int expected_m) {
+    return select_tuning(workload, expected_m);
 }
 
 inline int threads(int bm, int bn, int wm, int wn) {
@@ -685,6 +686,71 @@ inline w4fa8::NativeKernelConfig w4a8_gemm_config(int expected, int n, int k, in
     return spec;
 }
 
+inline nvfp4::detail::Config nvfp4_gemm_config(
+    int expected, int n, int k, bool linear1, const std::optional<Tile>& tile) {
+    nvfp4::detail::Config c{};
+    if (tile) {
+        const auto& [bm, bn, bk, wm, wn, stages] = *tile;
+        c = {get_num_sms(), bm, bn, bk, wm, wn, bk, stages, 1};
+    } else {
+        c = nvfp4::detail::get_default_tile(GemmType::MGroupedNoPad, expected, n, k, 128, 128);
+        if (k >= 1024) {
+            // One M warp group covers the expected rows up to M64. Larger
+            // shared-decode tiles remain measured overrides.
+            c.block_m = c.warp_m = next_power_of_two(std::clamp(expected, 16, 64));
+            c.block_n = linear1 || c.block_m > 16 ? 128 : 256;
+            c.block_k = c.warp_k = 128;
+            // Small gate/up tiles favor wide N warps and a shorter operand ring.
+            const bool wide_warp = c.block_m == 16 || (linear1 && c.block_m == 32);
+            c.warp_n = wide_warp ? 64 : 32;
+            c.num_stages = wide_warp ? 2 : 3;
+        }
+        c.n_expand = 1;
+    }
+    TORCH_CHECK(!linear1 || (c.block_m <= 128 && (c.block_n == 128 || c.block_n == 256)),
+                "NVFP4 MegaMoE GEMM1 requires block_m <= 128 and block_n of 128 or 256");
+    return c;
+}
+
+inline int nvfp4_smem_prefix(const nvfp4::detail::Config& t, int k) {
+    const bool staged = nvfp4::detail::use_fast_block_scales(k, t.block_k, t.warp_k, 1, 128, 128) &&
+        nvfp4::detail::can_stage_block_scales(t.block_m, t.block_n, t.block_k, t.warp_m);
+    return 1024 + (staged ? (t.block_m + 32) * t.num_stages * int(sizeof(float)) : 0) +
+        (staged && nvfp4::detail::is_shared_decode_tile(t) ? t.block_n * t.block_k : 0);
+}
+
+inline Gemm1Config nvfp4_gemm1_config(
+    Gemm1Config c, int expected, int n, int k, const Gemm1Tuning& tuning) {
+    const auto g1 = nvfp4_gemm_config(expected, n, k, true, tuning.tile);
+    c.tile.block_m = g1.block_m; c.tile.block_n = g1.block_n; c.tile.block_k = g1.block_k;
+    c.tile.warp_m = g1.warp_m; c.tile.warp_n = g1.warp_n; c.tile.num_stages = g1.num_stages;
+    c.warp_k = g1.warp_k;
+    const int parts = 256 / g1.block_n;
+    c.num_threads = parts * (g1.block_m / g1.warp_m) * (g1.block_n / g1.warp_n) * (g1.block_k / g1.warp_k) * 32;
+    // Native operand and activation staging differ from FP8. Let compiled
+    // occupancy cap the cooperative grid instead of a fixed thread budget.
+    c.num_ctas = c.tile.num_sms * std::max(1, device_runtime->get_prop()->maxThreadsPerMultiProcessor / c.num_threads);
+    const int core_bytes = nvfp4::detail::smem_size(g1, 16, 128, 128, k);
+    const int slot_bytes = std::max(core_bytes,
+        nvfp4_smem_prefix(g1, k) + g1.block_m * (g1.block_n + 2) * int(sizeof(float)));
+    c.tile.smem_size = std::max({parts * slot_bytes, c.num_threads / 32 * k, c.dispatch.num_experts * 4});
+    TORCH_CHECK(c.tile.smem_size <= 256 * 1024, "NVFP4 MegaMoE tile exceeds shared-memory capacity");
+    return c;
+}
+
+inline ScatterConfig nvfp4_scatter_config(
+    ScatterConfig c, int expected, int n, int k, const Gemm2Tuning& tuning) {
+    const auto g2 = nvfp4_gemm_config(expected, n, k, false, tuning.tile);
+    c.block_m = g2.block_m; c.block_n = g2.block_n; c.block_k = g2.block_k;
+    c.warp_m = g2.warp_m; c.warp_n = g2.warp_n; c.warp_k = g2.warp_k;
+    c.num_stages = g2.num_stages;
+    c.num_threads = (c.block_m / c.warp_m) * (c.block_n / c.warp_n) * (c.block_k / c.warp_k) * 32;
+    c.smem_size = std::max(nvfp4::detail::smem_size(g2, 16, 128, 128, k),
+                          nvfp4_smem_prefix(g2, k) + g2.block_m * (g2.block_n / 2 + 4) * int(sizeof(uint32_t)));
+    TORCH_CHECK(c.smem_size <= 256 * 1024, "NVFP4 MegaMoE tile exceeds shared-memory capacity");
+    return c;
+}
+
 struct MegaMoEPrecisionConfigs {
     Gemm1Config l1;
     ScatterConfig l2;
@@ -700,9 +766,9 @@ inline const MegaMoEPrecisionConfigs& get_mega_moe_precision_configs(
                   capacity, tokens, masters, activation, device, get_num_sms()};
     if (const auto found = cache.find(key); found != cache.end())
         return found->second;
-    const auto tuning = tuning_config({precision, ranks, experts, topk, hidden, intermediate, tokens, activation});
     const int groups = experts / ranks;
     const int expected = mega::expected_expert_rows(tokens, topk, groups, ranks, capacity);
+    const auto tuning = tuning_config({precision, ranks, experts, topk, hidden, intermediate, tokens, activation}, expected);
     MegaMoEPrecisionConfigs result;
     result.expected_m = expected;
     if (precision == Precision::W4A16) {
@@ -744,6 +810,14 @@ inline const MegaMoEPrecisionConfigs& get_mega_moe_precision_configs(
         scatter.num_threads = w4fa8::get_num_threads(g2.tile);
         scatter.smem_size = w4a8_scatter_smem_size(g2.tile, intermediate);
         scatter.fragment = g2.fragment;
+    } else if (precision == Precision::W4A8NVFP4) {
+        // Reuse the blockwise transport plan, including its tuned pull grid.
+        // The native compute tiles and operand storage are selected separately.
+        result = get_mega_moe_precision_configs(Precision::FP8Blockwise, ranks, experts, topk,
+            hidden, intermediate, capacity, tokens, masters, activation, device);
+        result.l1 = nvfp4_gemm1_config(result.l1, expected, 2 * intermediate, hidden, tuning.gemm1);
+        result.l2 = nvfp4_scatter_config(result.l2, expected, hidden, intermediate, tuning.gemm2);
+        result.l1.metadata = {result.l2.block_m, true};
     } else {
         const bool blockwise = precision == Precision::FP8Blockwise;
         auto c = make_fp8_gemm1_config(ranks, experts, topk, hidden, capacity, std::nullopt, blockwise);
@@ -772,7 +846,7 @@ inline const MegaMoEPrecisionConfigs& get_mega_moe_precision_configs(
         g1.dispatch.pull_group_size = channel_pull_group_size(g1, expected);
     if (groups >= 128) {
         g1.metadata.block_m = g2.block_m;
-        g1.metadata.valid_rows = precision == Precision::FP8Blockwise ||
+        g1.metadata.valid_rows = precision == Precision::FP8Blockwise || precision == Precision::W4A8NVFP4 ||
             (precision == Precision::FP8Channelwise && g2.use_padded_valid_rows);
     }
     return cache.emplace(key, std::move(result)).first->second;

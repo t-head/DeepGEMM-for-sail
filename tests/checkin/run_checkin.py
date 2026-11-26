@@ -31,6 +31,10 @@ SCRIPT_SUITES = {
     'ZW-M890P-MegaMoE': [
         '-m pytest -q -s --disable-warnings -x -k smoke tests/test_mega_moe.py',
         '-m pytest -q -s --disable-warnings -x '
+        '-k "nvfp4_smoke or nvfp4_shared_decode or nvfp4_mega_moe_weight_preparation or '
+        'nvfp4_mega_moe_workspace or '
+        '(activation_parity and nvfp4)" tests/test_mega_moe_precisions.py',
+        '-m pytest -q -s --disable-warnings -x '
         'tests/test_mega_gate.py::test_mega_gate_scoring_modes '
         'tests/test_mega_gate.py::test_mega_gate_sigmoid_infinite_logits '
         'tests/test_mega_gate.py::test_mega_gate_sigmoid_routing_controls '

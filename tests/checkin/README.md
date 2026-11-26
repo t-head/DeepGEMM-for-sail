@@ -57,6 +57,9 @@ For masked GEMM, the `test_m_grouped_gemm_masked->test_func:` log line contains 
 The single-device suite runs the public smoke tests for SwiGLU, SwiGLU-Step
 and SiTU, including invalid inputs and workspace reuse. It also runs the MegaGate
 scoring-mode, infinite-logit, and API-contract tests on the same M890P runner.
+NVFP4 MegaMoE smoke tests exercise fused and per-call decoded FP8 execution,
+prepared weight layouts and scales, all four gated activations, replica banks,
+model-size partial tiles, updated-input Graph replay and FP8 workspace ownership.
 
 ```bash
 python tests/checkin/run_checkin.py --suite ZW-M890P-MegaMoE

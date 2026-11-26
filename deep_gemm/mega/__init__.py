@@ -19,6 +19,7 @@ __all__ = [
     "transform_weights_for_fp8_mega_moe", "transform_weights_for_w4a16_mega_moe",
     "fp8_fp8_mega_moe", "bf16_fp4_mega_moe",
     "transform_weights_for_w4a8_mega_moe", "fp8_fp4_mega_moe",
+    "transform_weights_for_nvfp4_mega_moe", "fp8_nvfp4_mega_moe",
     "int8_int8_mega_moe",
 ]
 
@@ -510,9 +511,12 @@ def transform_weights_for_w4a16_mega_moe(
 
 def _check_routed_buffer(
     y: torch.Tensor,
-    l1_weights: Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, float]],
+    l1_weights: Union[Tuple[torch.Tensor, torch.Tensor],
+                      Tuple[torch.Tensor, torch.Tensor, Union[torch.Tensor, float]]],
     sym_buffer: SymmBuffer,
     weight_components: int = 2,
+    *,
+    weight_shape: Optional[Tuple[int, int]] = None,
 ) -> None:
     sym_buffer._check_live()
     if (
@@ -521,10 +525,12 @@ def _check_routed_buffer(
         or y.shape[1] != sym_buffer.hidden
     ):
         raise ValueError("output must have shape [tokens, workspace hidden]")
+    expected_shape = (2 * sym_buffer.intermediate_hidden,) if weight_shape is None else weight_shape
     if (not isinstance(l1_weights, (tuple, list)) or len(l1_weights) != weight_components
-            or not isinstance(l1_weights[0], torch.Tensor)
-            or l1_weights[0].ndim != 3 or l1_weights[0].shape[1] != 2 * sym_buffer.intermediate_hidden):
-        raise ValueError("l1_weights must match the workspace intermediate_hidden")
+            or not isinstance(l1_weights[0], torch.Tensor) or l1_weights[0].ndim != 3
+            or l1_weights[0].shape[1:1 + len(expected_shape)] != expected_shape):
+        expected = "shape and execution layout" if weight_shape is not None else "intermediate_hidden"
+        raise ValueError(f"l1_weights must match the workspace {expected}")
 
 
 def fp8_fp8_mega_moe(
@@ -660,3 +666,83 @@ def fp8_fp4_mega_moe(
         sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
         activation, activation_clamp, fast_math, situ_beta, situ_linear_beta, activation_alpha,
         l1_weights_replicas, l2_weights_replicas, sym_buffer.staging_config)
+
+
+def transform_weights_for_nvfp4_mega_moe(
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+    *,
+    l1_rhs_scales: Optional[torch.Tensor] = None,
+    l2_rhs_scales: Optional[torch.Tensor] = None,
+    l1_weight_global_scale: Optional[torch.Tensor] = None,
+    l2_weight_global_scale: Optional[torch.Tensor] = None,
+    execution: str = "fused",
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+           Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Prepare NVFP4 K16 weights for blockwise FP8 MegaMoE.
+
+    Raw pairs contain uint8 [E,N,K/2] E2M1 and E4M3 [E,N,K/16]. Optional
+    FP32 rhs_scales are [E,N/128,K/128], defaulting to one. Native K16 scales
+    must already absorb the reciprocal of rhs_scales, as for NVFP4 GEMM.
+    FP32 scalar/[E] global scales are folded into the outer FP32 multiplier.
+    Each returned bank is (prepared W4, native scale bytes, outer FP32 scales).
+    GEMM1 gate/up rows are interleaved in blocks of 128. Prepare replica banks
+    separately. The fused and dequantize layouts are not interchangeable.
+    """
+    return _C.transform_weights_for_nvfp4_mega_moe(
+        l1_weights, l2_weights, l1_rhs_scales, l2_rhs_scales,
+        l1_weight_global_scale, l2_weight_global_scale, execution)
+
+
+def fp8_nvfp4_mega_moe(
+    y: torch.Tensor,
+    l1_weights: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    sym_buffer: SymmBuffer,
+    cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+    activation: str = "swiglu",
+    activation_clamp: Optional[float] = None,
+    fast_math: bool = True,
+    *,
+    l1_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    l2_weights_replicas: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    situ_beta: Optional[float] = 4.0,
+    situ_linear_beta: Optional[float] = 25.0,
+    activation_alpha: Optional[float] = None,
+    execution: str = "fused",
+    fp8_workspace: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    fp8_workspace_replicas: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+) -> None:
+    """Complete E4M3 x NVFP4 MoE with BF16 output in original token order.
+
+    Both modes use SymmBuffer(mma_type='fp8xfp8', quantization='blockwise').
+    Activation and replica options follow fp8_fp4_mega_moe.
+    Fused execution decodes each tile inside GEMM, without a full FP8 weight
+    workspace. Dequantize refreshes caller-owned FP8 [E,2I,H] and [E,H,I]
+    workspaces on every call, then runs FP8 blockwise MegaMoE. Replica banks
+    need corresponding workspaces only in dequantize execution. Prepare each
+    bank for the selected execution mode. Routing weights apply once in combine.
+    """
+    if (not isinstance(sym_buffer, SymmBuffer) or sym_buffer.mma_type != "fp8xfp8"
+            or sym_buffer.quantization != "blockwise"):
+        raise TypeError("NVFP4 requires SymmBuffer(mma_type='fp8xfp8', quantization='blockwise')")
+    if execution not in ("fused", "dequantize"):
+        raise ValueError("execution must be 'fused' or 'dequantize'")
+    h, i = sym_buffer.hidden, sym_buffer.intermediate_hidden
+    expected = ((h // 32, 8 * i), (i // 32, 4 * h)) if execution == "fused" else ((2 * i, h // 8), (h, i // 8))
+    _check_routed_buffer(y, l1_weights, sym_buffer, weight_components=3, weight_shape=expected[0])
+    if (not isinstance(l2_weights, (tuple, list)) or len(l2_weights) != 3
+            or not isinstance(l2_weights[0], torch.Tensor) or l2_weights[0].ndim != 3
+            or l2_weights[0].shape[1:] != expected[1]):
+        raise ValueError("l2_weights must match the workspace shape and execution layout")
+    activation = _normalize_activation(activation)
+    if activation != "situ":
+        situ_beta = None if situ_beta == 4.0 else situ_beta
+        situ_linear_beta = None if situ_linear_beta == 25.0 else situ_linear_beta
+    _C.fp8_nvfp4_mega_moe(
+        y, l1_weights, l2_weights, cumulative_local_expert_recv_stats,
+        sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
+        activation, activation_clamp, fast_math, situ_beta, situ_linear_beta, activation_alpha,
+        l1_weights_replicas, l2_weights_replicas, sym_buffer.staging_config,
+        execution, fp8_workspace, fp8_workspace_replicas)

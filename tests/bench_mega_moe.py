@@ -438,7 +438,8 @@ def _benchmark_precision_case(case, group, args):
 
     rank, world = group.rank(), group.size()
     rng = torch.Generator(device="cuda").manual_seed(args.seed + rank)
-    pipeline = make_pipeline(case, group, rng, replicas=args.replicas, fast_math=bool(args.fast_math))
+    pipeline = make_pipeline(case, group, rng, replicas=args.replicas, fast_math=bool(args.fast_math),
+                             execution=args.execution)
     source = torch.randn(case.capacity, case.hidden, device="cuda", dtype=torch.bfloat16, generator=rng) * .1
     try:
         for requested in case.tokens:
@@ -476,7 +477,8 @@ def _benchmark_precision_case(case, group, args):
             if rank == 0:
                 print(json.dumps(dict(case=case.name, precision=case.precision, world_size=world,
                                       tokens_per_rank=token_counts, capacity=case.capacity, routing=case.routing,
-                                      seed=args.seed, fast_math=bool(args.fast_math), correctness=correctness,
+                                      seed=args.seed, fast_math=bool(args.fast_math), execution=args.execution,
+                                      correctness=correctness,
                                       benchmark=timing, baseline=dict(kind="none", status="not_requested"))), flush=True)
     finally:
         pipeline.buffer.destroy()
@@ -484,7 +486,7 @@ def _benchmark_precision_case(case, group, args):
 
 def main(argv=None, *, cases=None):
     precision_parser = argparse.ArgumentParser(add_help=False)
-    precision_parser.add_argument("--precision", choices=("w4a4", "int8_channelwise", "fp8_channelwise", "fp8_blockwise", "w4a16", "w4a8"))
+    precision_parser.add_argument("--precision", choices=("w4a4", "int8_channelwise", "fp8_channelwise", "fp8_blockwise", "w4a16", "w4a8", "w4a8_nvfp4"))
     selection, _ = precision_parser.parse_known_args(argv)
     if cases is None:
         if selection.precision and selection.precision not in ("w4a4", "int8_channelwise"):
@@ -512,6 +514,8 @@ def main(argv=None, *, cases=None):
     parser.add_argument("--num-max-tokens-per-rank", "--capacity", dest="capacity", type=int)
     parser.add_argument("--routing", choices=("round_robin", "random", "skewed"), default="round_robin")
     parser.add_argument("--fast-math", type=int, choices=(0, 1), default=1)
+    parser.add_argument("--execution", choices=("fused", "dequantize"), default="fused",
+                        help="NVFP4 weight execution mode; decoding is included in timing")
     parser.add_argument("--reference-tokens", type=int, default=0,
                         help="check first N tokens/rank; 0 checks all")
     parser.add_argument("--no-check", action="store_true", help="skip numerical reference checks")
@@ -541,6 +545,8 @@ def main(argv=None, *, cases=None):
         parser.error("reference-tokens/warmup must be nonnegative; iterations/repeats must be positive")
     if args.baseline != "none" and case.precision != "w4a4":
         parser.error("the DeepEP baseline adapter supports W4A4 only; use --baseline none for this precision")
+    if args.execution != "fused" and case.precision != "w4a8_nvfp4":
+        parser.error("--execution dequantize requires NVFP4 weights")
     args.mode = args.mode or ("eager" if args.baseline == "normal" else "graph")
     if args.baseline == "normal" and args.mode != "eager":
         parser.error("DeepEP normal requires eager timing because dispatch returns CPU expert counts; "

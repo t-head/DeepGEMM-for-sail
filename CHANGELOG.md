@@ -8,6 +8,11 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Added
 
+- **M890 NVFP4 W4A8 MegaMoE**: adds complete routed execution with native K16 scales,
+  blockwise FP8 activation/weight scales, and caller-selected fused or per-call
+  full-weight decoding. Reuses FP8 blockwise transport and supports separate
+  master/replica banks and Graph replay.
+
 - **Zhenwu810E INT8 AVG MQA**: adds `int8_mqa_avg_logits` and
   `int8_paged_mqa_avg_logits` with H4/H8, logical D128 and BF16 output.
   Accepts explicit FP32 quantization scales per Q/head and per KV token.

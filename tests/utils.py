@@ -1195,7 +1195,8 @@ def parse_deepgemm_string_re(s):
     supported_quant_type = ["non_quantized", "block", "channel", "group"]
     import re
     supported_gemm_type.append("KGroupedContiguous")
-    dg_params = r"(KGroupedContiguous|GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|HcPrenormGemm|Normal|MqaAvgLogits|PagedMqaAvgLogits|PagedSparseMqaLogits|SparseMqaLogits|MqaLogits|PagedMqaLogits|BatchGemm|MegaMhc|AttentionRegression|Preprocess|Activation|MoeAlign|MegaGate),(.+)"
+    supported_gemm_type.append("MegaMoE")
+    dg_params = r"(KGroupedContiguous|GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|HcPrenormGemm|Normal|MqaAvgLogits|PagedMqaAvgLogits|PagedSparseMqaLogits|SparseMqaLogits|MqaLogits|PagedMqaLogits|BatchGemm|MegaMhc|AttentionRegression|Preprocess|Activation|MoeAlign|MegaGate|MegaMoE),(.+)"
     pattern = re.compile(dg_params)
     m = pattern.search(s.strip("."))
     if not m:

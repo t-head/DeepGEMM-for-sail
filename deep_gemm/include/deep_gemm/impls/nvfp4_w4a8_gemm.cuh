@@ -127,7 +127,7 @@ template <int ShapeN, int ShapeK,
           int kGroupSize = 16, int N_EXPAND = 1,
           int kAScaleGroup = 0,
           bool kHasAScale = false, bool kHasWeightGlobalScale = false,
-          bool kHasBScale = false, int kBScaleBlock = 0>
+          bool kHasBScale = false, int kBScaleBlock = 0, bool kPrefetchLut = true>
 class W4A8GEMM {
 public:
   using ElementA = cutlass::float_e4m3_t;
@@ -309,7 +309,7 @@ public:
     int weight_global_scale_stride;
     const float* ptr_b_scale;
 
-    CUTLASS_HOST
+    CUTLASS_HOST_DEVICE
     Params(const ElementA* ptr_a_,
           const int* ptr_b_,
           const ElementScale* ptr_scale_,
@@ -335,16 +335,32 @@ public:
     return deep_gemm::nvfp4::detail::w4_reshape_warpk<32, BlockK, WarpsOnK, mode>(t);
   }
 
-  CUTLASS_DEVICE
-  void
-  operator()(Params const& params, char* smem_buf) {
-    int thread_idx = threadIdx.x;
-    int warp_idx = canonical_warp_idx_sync();
+  struct CtaThreadGroup {
+    CUTLASS_DEVICE int thread_index() const { return threadIdx.x; }
+    CUTLASS_DEVICE int warp_index() const { return canonical_warp_idx_sync(); }
+    CUTLASS_DEVICE void sync() const { __syncthreads(); }
+  };
+
+  struct DefaultEpilogue {};
+
+  CUTLASS_DEVICE void operator()(Params const& params, char* smem_buf) {
+    TileScheduler scheduler{params.scheduler};
+    run(params, smem_buf, scheduler, DefaultEpilogue{});
+  }
+
+  // MegaMoE supplies its expert scheduler and fused activation/scatter store.
+  // Ordinary GEMMs retain their existing scheduler and epilogue at compile time.
+  template <class Scheduler, class Epilogue, class ThreadGroup = CtaThreadGroup>
+  CUTLASS_DEVICE void run(Params const& params, char* smem_buf,
+                         Scheduler& deep_scheduler, const Epilogue& epilogue,
+                         ThreadGroup thread_group = {}) {
+    constexpr bool kUseCustomEpilogue = !cute::is_same_v<Epilogue, DefaultEpilogue>;
+    int thread_idx = thread_group.thread_index();
+    int warp_idx = thread_group.warp_index();
     int warpm_idx = warp_idx % WarpsOnM;
     int warpn_idx = (warp_idx / WarpsOnM) % WarpsOnN;
     int warpk_idx = (warp_idx / WarpsOnM) / WarpsOnN;
     int lane_idx = thread_idx % NumThreadsPerWarp;
-    TileScheduler deep_scheduler{params.scheduler};
     SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
     auto staged_a_scales = [&]() {
       return reinterpret_cast<float*>(storage.smem_lut.data() + (Nvfp8Decode ? 128 : 32));
@@ -360,7 +376,7 @@ public:
       for (int i = thread_idx; i < 127; i += MaxThreadsPerBlock)
         storage.smem_lut[i] = kNvfp4E4m3ScaleLut[i];
     }
-    __syncthreads();
+    thread_group.sync();
     Tensor sA = make_tensor(make_smem_ptr(storage.smem_a.data()), SmemLayoutA{}); // (BLK_M,BLK_K,PIPE)
     Tensor sB = make_tensor(make_smem_ptr(storage.smem_b.data()), SmemLayoutB{}); // (BLK_K/32,BLK_N*4,PIPE)
     Tensor sReduce = make_tensor(make_smem_ptr<ElementAcc>(storage.smem_reduce.data()), SmemLayoutReduce{}); // (16*64,WARPS_ON_N,WARPS_ON_K)
@@ -449,12 +465,23 @@ public:
     while (deep_scheduler.fetch_next_work(m_block_idx, n_block_idx)) {
 
       int coord_l = kGemmType == GemmType::Normal ? 0 : deep_scheduler.curr_group_idx;
-      const int64_t scale_offset_l = int64_t(coord_l) * (K / kGroupSize) * N;
-      const auto* native_scale_base = params.ptr_scale + scale_offset_l;
+      const int weight_group = kUseCustomEpilogue ? 0 : coord_l;
+      const auto* weight_base = [&]() {
+        if constexpr (kUseCustomEpilogue) return epilogue.weight(params.ptr_b, coord_l, int64_t(N) * K / 8);
+        else return params.ptr_b;
+      }();
+      const auto* native_scale_base = [&]() {
+        if constexpr (kUseCustomEpilogue) return epilogue.scale(params.ptr_scale, coord_l, int64_t(N) * K / 16);
+        else return params.ptr_scale + int64_t(coord_l) * (K / kGroupSize) * N;
+      }();
+      const auto* outer_scale_base = [&]() {
+        if constexpr (kUseCustomEpilogue) return epilogue.outer_scale(params.ptr_b_scale, coord_l, int64_t(N / 128) * (K / 128));
+        else return params.ptr_b_scale;
+      }();
       n_block_idx *= N_EXPAND;
 
-      Tensor mB_nkl = make_tensor(make_gmem_ptr(params.ptr_b), make_shape(Int<K / 32>{}, Int<N * 4>{}, Int<L>{}), strideB); // (k/32,n*4,l)
-      Tensor mB_nk = make_mix_tensor_like(mB_nkl(_,_,coord_l)); // (k/32,n*4)
+      Tensor mB_nkl = make_tensor(make_gmem_ptr(weight_base), make_shape(Int<K / 32>{}, Int<N * 4>{}, Int<L>{}), strideB); // (k/32,n*4,l)
+      Tensor mB_nk = make_mix_tensor_like(mB_nkl(_,_,weight_group)); // (k/32,n*4)
       Tensor gB = local_tile(mB_nk, TileB{}, make_coord(_, n_block_idx)); // (BLK_K/32,BLK_N*4,blocks_k)
       Tensor tBgB = gmem_thr_copy_B.partition_S(gB);
 
@@ -566,7 +593,8 @@ public:
             const int local_row = thread_idx + chunk * MaxThreadsPerBlock;
             if (local_row < BlockM) {
               const int64_t row = deep_scheduler.curr_offset_a() / K + m_block_idx * BlockM + local_row;
-              const auto* src = params.ptr_a_scale + row * (K / 128) + k_tile_iter;
+              const int64_t offset = row * (K / 128) + k_tile_iter;
+              const auto* src = params.ptr_a_scale + offset;
               auto* dst = staged_a_scales() + k_pipe * BlockM + local_row;
               ScaleCopy::copy(*reinterpret_cast<const uint32_t*>(src),
                               *reinterpret_cast<uint32_t*>(dst), local_row < residual_m);
@@ -575,7 +603,7 @@ public:
           if (thread_idx < deep_gemm::math::ceil_div(BlockN, 128)) {
             constexpr int n_blocks = deep_gemm::math::ceil_div(N, 128);
             const int n = n_block_idx * BlockN / 128 + thread_idx;
-            const auto* src = params.ptr_b_scale + (int64_t(coord_l) * n_blocks + n) * (K / 128) + k_tile_iter;
+            const auto* src = outer_scale_base + (int64_t(weight_group) * n_blocks + n) * (K / 128) + k_tile_iter;
             auto* dst = staged_b_scales() + k_pipe * 32 + thread_idx;
             ScaleCopy::copy(*reinterpret_cast<const uint32_t*>(src),
                             *reinterpret_cast<uint32_t*>(dst), n < n_blocks);
@@ -649,10 +677,10 @@ public:
         return scale;
       };
       // These are outer FP8 channel scales, independent of FP4 K-block scales.
-      const float* __restrict__ b_scale_ptr = params.ptr_b_scale;
+      const float* __restrict__ b_scale_ptr = outer_scale_base;
       auto channel_scale = [&](int col) {
         if constexpr (kHasBScale && !BlockBScale)
-          return b_scale_ptr[int64_t(coord_l) * N + n_block_idx * BlockN + col];
+          return b_scale_ptr[int64_t(weight_group) * N + n_block_idx * BlockN + col];
         else
           return 1.0f;
       };
@@ -662,7 +690,7 @@ public:
           if (global_n >= N) return 1.0f;
           constexpr int n_blocks = (N + kBScaleBlock - 1) / kBScaleBlock;
           constexpr int k_blocks = (K + kBScaleBlock - 1) / kBScaleBlock;
-          return b_scale_ptr[(int64_t(coord_l) * n_blocks + global_n / kBScaleBlock) * k_blocks
+          return b_scale_ptr[(int64_t(weight_group) * n_blocks + global_n / kBScaleBlock) * k_blocks
                              + global_k / kBScaleBlock];
         } else {
           return 1.0f;
@@ -762,7 +790,7 @@ public:
               });
             }
           });
-          __syncthreads();
+          thread_group.sync();
         }
       };
       auto load_decoded = [&](auto kb) {
@@ -882,7 +910,7 @@ public:
 
         // Issue independent table reads for both N fragments before MMA.
         // Keeping them in registers hides lookup latency without decoding B twice.
-        constexpr bool PrefetchLut = FastBlockScale && !ShareDecodedB &&
+        constexpr bool PrefetchLut = kPrefetchLut && FastBlockScale && !ShareDecodedB &&
             BlockM == 64 && BlockK == 128 && WarpN == 32 &&
             kGemmType == GemmType::MGroupedNoPad;
         auto prefetched_luts = [&]() {
@@ -1080,7 +1108,7 @@ public:
                 copy_aligned(accum(_, m_idx, n_idx), sReduce_tile(_, r2s_idx, warpn_idx, warpk_idx));
               }
             }
-            __syncthreads();
+            thread_group.sync();
           }
           if (warpk_idx == 0) {
             #pragma unroll
@@ -1094,7 +1122,7 @@ public:
               }
             }
           }
-          __syncthreads();
+          thread_group.sync();
         }
       };
 
@@ -1260,14 +1288,19 @@ public:
 
       auto finish_work = [&]() {
         cp_async_wait<0>();
-        __syncthreads();
+        thread_group.sync();
         epilogue_cta_reduce();
-        #if __HGGC_ARCH__ == 150
-          epilogue_no_tsm();
-        #else
-          epilogue_with_tsm();
-        #endif
-        __syncthreads();
+        if constexpr (kUseCustomEpilogue) {
+          epilogue.store(accum, cAccum, deep_scheduler, m_block_idx, n_block_idx,
+                         min(BlockM, residual_m), smem_buf + offsetof(SharedStorage, smem_a));
+        } else {
+          #if __HGGC_ARCH__ == 150
+            epilogue_no_tsm();
+          #else
+            epilogue_with_tsm();
+          #endif
+        }
+        thread_group.sync();
       };
 
       if constexpr(N_EXPAND > 1) {
@@ -1291,7 +1324,7 @@ public:
         auto k_tile_count_reset = k_tile_count;
 
         cp_async_wait<kNumStages - 1>();
-        __syncthreads();
+        thread_group.sync();
         if constexpr(K_BLOCK_MAX > 1) {
           s2r_prologue();
         }
@@ -1308,7 +1341,7 @@ public:
 
             if (K_BLOCK_MAX == 1 || k_block == K_BLOCK_MAX - 2) {
               cp_async_wait<kNumStages-2>();
-              __syncthreads();
+              thread_group.sync();
               if (k_tile_count > 0 || n_iter < N_EXPAND - 1) {
                 if (k_tile_iter == K_TILE_COUNT) {
                   num_n_copy_done++;
@@ -1362,7 +1395,7 @@ public:
             k_tile_count = k_tile_count_reset;
 
             cp_async_wait<kNumStages-1>();
-            __syncthreads();
+            thread_group.sync();
 
             s2r_prologue();
           }
@@ -1382,7 +1415,7 @@ public:
 
         auto run_mainloop = [&](auto active_m_fragments) {
           cp_async_wait<kNumStages-2>();
-          __syncthreads();
+          thread_group.sync();
           if constexpr(K_BLOCK_MAX > 1 && !RollingOperands) {
             s2r_prologue_impl(active_m_fragments);
           }
@@ -1411,7 +1444,7 @@ public:
                 // this stage to the next tile's asynchronous producer.
                 update_s2r_source(smem_pipe_read);
                 cp_async_wait<kNumStages-2>();
-                __syncthreads();
+                thread_group.sync();
                 ++compute_k_tile;
               }
             } else {
@@ -1433,7 +1466,7 @@ public:
               if (k_block == K_BLOCK_MAX - 1) {
                 update_s2r_source(smem_pipe_read);
                 cp_async_wait<kNumStages-2>();
-                __syncthreads();
+                thread_group.sync();
               }
 
               if constexpr (K_BLOCK_MAX > 1) {

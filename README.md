@@ -586,20 +586,21 @@ Shared experts remain outside the routed pipeline; `num_shared_experts` must be 
 
 All precisions use `SymmBuffer` or `get_symm_buffer_for_mega_moe` for workspace
 allocation. Select the mode below; FP8 additionally distinguishes scale granularity
-with `quantization` (channelwise by default). These backends require PPU1.5.
+with `quantization` (channelwise by default). These backends require M890.
 
 | Backend | Compute | Workspace mode | Activation | EP limit |
 |---|---|---|---|---|
 | FP8 channelwise | `fp8_fp8_mega_moe` | `mma_type="fp8xfp8", quantization="channelwise"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
 | FP8 blockwise | `fp8_fp8_mega_moe` | `mma_type="fp8xfp8", quantization="blockwise"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
 | E4M3 x MXFP4 | `fp8_fp4_mega_moe` | `mma_type="fp8xfp4"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
+| E4M3 x NVFP4 | `fp8_nvfp4_mega_moe` | `mma_type="fp8xfp8", quantization="blockwise"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
 | BF16 x MXFP4 | `bf16_fp4_mega_moe` | `mma_type="bf16xfp4"` | SwiGLU, STEP, SwiGLU-OAI, SiTU | 64 |
 
 All MegaMoE backends pass FP32 GEMM1 accumulators to FP32 gated activation.
 Sigmoid and tanh always use the native PPU instructions, including when
-`fast_math=False`. W4A8 and channelwise FP8 round the activation result to BF16
+`fast_math=False`. MXFP4 W4A8 and channelwise FP8 round the activation result to BF16
 scratch before a separate FP32 row quantizer emits E4M3 values and one FP32
-scale per row. FP4 and blockwise FP8 keep FP32 values through fused activation
+scale per row. FP4 and blockwise FP8 (including NVFP4 W4A8) keep FP32 values through fused activation
 quantization, producing group32 E8M0 and group128 FP32 scales respectively.
 W4A16 converts only the final activation result to BF16 for GEMM2. Existing clamp
 boundary conventions and quantization granularities are preserved.
@@ -682,7 +683,7 @@ scales, without requantization. In these weight shapes, E is the number of
 local experts in the bank, N the output width, and K the input width. All raw
 weights and scales must be contiguous and on the same device.
 
-W4A16 and W4A8 take uint8-packed MXFP4 weights `[E,2I,H/2]` and `[E,H,I/2]`,
+W4A16 and MXFP4 W4A8 take uint8-packed MXFP4 weights `[E,2I,H/2]` and `[E,H,I/2]`,
 with raw uint8 UE8M0 group-32 scales `[E,2I,H/32]` and `[E,H,I/32]`.
 GEMM1 raw rows contain all gate rows followed by all up rows. The W4A16
 transform interleaves gate/up rows in groups of eight and packs its scale layout.
@@ -701,6 +702,69 @@ W4A8 input and activated output use rowwise E4M3 quantization, as for FP8
 channelwise, with the chosen activation fused into GEMM1.
 Transformed weights are specific to their backend and must not be interchanged.
 
+On M890, NVFP4 uses `transform_weights_for_nvfp4_mega_moe` with packed E2M1 weights and
+E4M3 K16 scales. Optional `l1_rhs_scales` / `l2_rhs_scales` are FP32 128x128
+multipliers; the native scales must already absorb their reciprocals, as for
+[NVFP4 GEMM](docs/api/nvfp4_w4a8.md). Optional per-tensor/per-expert global scales
+are folded into those FP32 multipliers during preparation. Outer and global
+scales must be positive and finite. Each bank contains
+`(prepared_weight, native_scale_bytes, outer_scales)`; GEMM1 gate/up rows are
+interleaved in blocks of 128. Use the existing FP8 blockwise symmetric workspace.
+Prepared weights must be 8-byte aligned; fused native scale bytes must be
+16-byte aligned. The preparation helper provides these alignments.
+Both modes round the native K16 decoded weights to E4M3 before applying the
+outer/global multipliers, matching the NVFP4 GEMM decode-to-FP8 contract.
+
+Both preparation and compute take `execution`: `"fused"` (default) decodes
+weights inside GEMM1 and GEMM2; `"dequantize"` decodes both banks on every call
+before running FP8 blockwise MegaMoE. Common activation and replica options
+follow `fp8_fp4_mega_moe`; execution and FP8 workspaces are keyword-only options.
+Dequantize requires explicit
+`fp8_workspace=(l1_fp8, l2_fp8)` with contiguous E4M3 shapes `[E,2I,H]` and
+`[E,H,I]`. Replica banks require `fp8_workspace_replicas` in this mode. Allocate
+these separately from operands and symmetric storage, retain them for Graph
+replay, and do not share them between concurrent calls. Fused execution needs
+no full FP8 weight workspace. The prepared layouts are mode-specific.
+
+```python
+execution = "fused"  # Use "dequantize" with caller-owned FP8 weight workspaces.
+l1, l2 = dg.transform_weights_for_nvfp4_mega_moe(
+    (w13_nvfp4, w13_native_scales), (w2_nvfp4, w2_native_scales),
+    l1_rhs_scales=w13_fp8_scales, l2_rhs_scales=w2_fp8_scales, execution=execution)
+workspace = dg.SymmBuffer(
+    group, num_experts=384, num_max_tokens_per_rank=4096,
+    num_topk=4, hidden=7168, intermediate_hidden=5120,
+    mma_type="fp8xfp8", quantization="blockwise")
+y = torch.empty_like(x)
+fp8_workspace = None
+if execution == "dequantize":
+    e, h, i = w13_nvfp4.shape[0], workspace.hidden, workspace.intermediate_hidden
+    fp8_workspace = tuple(
+        torch.empty(shape, device=x.device, dtype=torch.float8_e4m3fn)
+        for shape in ((e, 2 * i, h), (e, h, i)))
+dg.mega_moe_pre_dispatch(
+    x, topk_ids, topk_weights,
+    workspace.x, workspace.x_sf, workspace.topk_idx, workspace.topk_weights,
+    num_tokens=x.shape[0], mma_type=workspace.mma_type)
+dg.fp8_nvfp4_mega_moe(y, l1, l2, workspace, execution=execution,
+                     fp8_workspace=fp8_workspace)
+```
+
+Correctness and complete-call timing use the existing runners:
+
+```bash
+python -m pytest -q tests/test_mega_moe_precisions.py -k nvfp4
+torchrun --standalone --nproc-per-node=8 tests/bench_mega_moe.py \
+    --precision w4a8_nvfp4 --case minimax_m3_nvfp4 --execution fused
+```
+
+Set `PPU_LIB_SHOW_PARAMS=1` to emit complete `MegaMoE,...,scope:forward` records;
+replay one using `tests/run_deep_gemm.py --format '<record>'` with the recorded
+rank count. Format replay runs correctness checks with new routes and weights
+and supports the default SiTU parameters; use the benchmark runner for timing.
+Per-stage records omit the device-generated routing state
+and cannot be replayed independently.
+
 FP8 `x` is E4M3 `[capacity,H]`, with FP32 `x_sf` `[capacity,1]` for channelwise
 or `[capacity,H/128]` for blockwise. W4A16 `x` is BF16 `[capacity,H]`, and
 `x_sf` is an empty `[capacity,0]` view. `mega_moe_pre_dispatch` fills these
@@ -718,8 +782,8 @@ and statistics alive until execution and any captured graph replays finish.
 
 The common compute arguments retain their names and meaning. Precision-specific
 entry points omit the MXFP4 `recipe`: FP8 granularities are selected by
-the workspace, W4A8 weight groups are fixed at 32, and W4A16 does not quantize
-activations. SwiGLU-OAI uses
+the workspace, MXFP4 W4A8 weight groups are fixed at 32, NVFP4 W4A8 weight
+groups are fixed at 16, and W4A16 does not quantize activations. SwiGLU-OAI uses
 keyword-only `activation_alpha=None` (effective default `1.702`); an explicit
 alpha is accepted only for OAI. SiTU uses `situ_beta=4` and
 `situ_linear_beta=25`; `situ_linear_beta=None` disables the up softcap, while

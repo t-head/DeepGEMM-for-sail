@@ -45,6 +45,68 @@ struct Gemm1 {
     }
 };
 
+template <bool Clamp, GatedActivation Activation>
+struct GatedTileValues {
+    const float* tile;
+    float limit, alpha, beta, linear_beta;
+    CUTLASS_DEVICE float2 operator()(int row, int column) const {
+        const float2 g = *reinterpret_cast<const float2*>(tile + row * 258 + column);
+        const float2 u = *reinterpret_cast<const float2*>(tile + row * 258 + 128 + column);
+        return make_float2(
+            routed_gated_activation<Activation, bool(DG_MOE_FAST_MATH)>(
+                g.x, u.x, Clamp ? limit : -1.f, alpha, beta, linear_beta),
+            routed_gated_activation<Activation, bool(DG_MOE_FAST_MATH)>(
+                g.y, u.y, Clamp ? limit : -1.f, alpha, beta, linear_beta));
+    }
+};
+
+template <int kN, int kNumThreads, bool ScaleColumnMajor, class Values>
+__device__ __forceinline__ void quantize_activated_tile(
+        const Values& input, uint8_t* output, float* scales, int pool_rows,
+        int valid_rows, int n_block, int thread, int writable_rows) {
+    const int lane = thread % 8;
+    for (int row = thread / 8; row < writable_rows; row += kNumThreads / 8) {
+        float values[16];
+        float amax = 1e-10f;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < 8; ++i) {
+            float2 activated = make_float2(0.0f, 0.0f);
+            if (row < valid_rows) {
+                activated = input(row, lane * 16 + i * 2);
+            }
+            values[2 * i] = activated.x;
+            values[2 * i + 1] = activated.y;
+            amax = fmaxf(amax, fmaxf(fabsf(activated.x), fabsf(activated.y)));
+        }
+        amax = epilogue::quant::warp_amax<8>(amax);
+        const auto quant_scale = epilogue::quant::fp8_block_scale<bool(DG_MOE_FAST_MATH)>(amax);
+        if (lane == 0) {
+            const int64_t offset = ScaleColumnMajor
+                ? int64_t(n_block) * pool_rows + row : int64_t(row) * (kN / 256) + n_block;
+            scales[offset] = quant_scale.scale;
+        }
+        __align__(16) uint16_t packed[8];
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < 8; ++i)
+            packed[i] = epilogue::quant::fp8_pair(values[2 * i] * quant_scale.inverse,
+                                                values[2 * i + 1] * quant_scale.inverse);
+        *reinterpret_cast<uint4*>(output + int64_t(row) * (kN / 2) + n_block * 128 + lane * 16) =
+            *reinterpret_cast<uint4*>(packed);
+    }
+    __syncthreads();
+}
+
+
+template <int kN, int kNumThreads, bool kClamp, GatedActivation Activation, bool ScaleColumnMajor = true>
+__device__ __forceinline__ void quantize_gated_tile(
+        const float* tile, uint8_t* output, float* scales, int pool_rows,
+        int valid_rows, int n_block, int thread, float swiglu_limit,
+        float activation_alpha, float situ_beta, float situ_linear_beta, int writable_rows) {
+    quantize_activated_tile<kN, kNumThreads, ScaleColumnMajor>(
+        GatedTileValues<kClamp, Activation>{tile, swiglu_limit, activation_alpha, situ_beta, situ_linear_beta},
+        output, scales, pool_rows, valid_rows, n_block, thread, writable_rows);
+}
+
 template <int kN, int kNumThreads, bool kClamp, GatedActivation Activation, class Accum, class Coordinates>
 __device__ __forceinline__ void swiglu_quant_epilogue(
         Accum& accum, const Coordinates& coords, uint8_t* output, float* scales,
@@ -81,41 +143,9 @@ __device__ __forceinline__ void swiglu_quant_epilogue(
         }
     }
     __syncthreads();
-    const int lane = thread % 8;
-    for (int row = thread / 8; row < writable_rows; row += kNumThreads / 8) {
-        float values[16];
-        float amax = 1e-10f;
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < 8; ++i) {
-            float2 activated = make_float2(0.0f, 0.0f);
-            if (row < valid_rows) {
-                float2 g = *reinterpret_cast<const float2*>(
-                    tile + row * kStride + lane * 16 + i * 2);
-                float2 u = *reinterpret_cast<const float2*>(
-                    tile + row * kStride + 128 + lane * 16 + i * 2);
-                activated = make_float2(
-                    routed_gated_activation<Activation, bool(DG_MOE_FAST_MATH)>(
-                        g.x, u.x, kClamp ? swiglu_limit : -1.0f, activation_alpha, situ_beta, situ_linear_beta),
-                    routed_gated_activation<Activation, bool(DG_MOE_FAST_MATH)>(
-                        g.y, u.y, kClamp ? swiglu_limit : -1.0f, activation_alpha, situ_beta, situ_linear_beta));
-            }
-            values[2 * i] = activated.x;
-            values[2 * i + 1] = activated.y;
-            amax = fmaxf(amax, fmaxf(fabsf(activated.x), fabsf(activated.y)));
-        }
-        amax = epilogue::quant::warp_amax<8>(amax);
-        const auto quant_scale = epilogue::quant::fp8_block_scale<bool(DG_MOE_FAST_MATH)>(amax);
-        if (lane == 0)
-            scales[int64_t(n_block) * pool_rows + row] = quant_scale.scale;
-        __align__(16) uint16_t packed[8];
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < 8; ++i)
-            packed[i] = epilogue::quant::fp8_pair(values[2 * i] * quant_scale.inverse,
-                                                values[2 * i + 1] * quant_scale.inverse);
-        *reinterpret_cast<uint4*>(output + int64_t(row) * (kN / 2) + n_block * 128 + lane * 16) =
-            *reinterpret_cast<uint4*>(packed);
-    }
-    __syncthreads();
+    quantize_gated_tile<kN, kNumThreads, kClamp, Activation>(tile, output, scales,
+        pool_rows, valid_rows, n_block, thread, swiglu_limit, activation_alpha,
+        situ_beta, situ_linear_beta, writable_rows);
 }
 
 template <int kN, int kK, bool kClamp, GatedActivation Activation = GatedActivation::SwiGLU, int kComputeM = 128>
@@ -156,11 +186,28 @@ __device__ __forceinline__ void gemm1_block(
         output_scales, pool_rows, valid_rows, n_block, thread, smem, swiglu_limit, activation_alpha, situ_beta, situ_linear_beta, writable_rows);
 }
 
+// The communication loop depends on a GEMM1 backend, not a weight format.
+template <int N, int K, int M>
+struct FP8Gemm1Backend : Gemm1<N, K, M> {
+    static constexpr bool ScaleColumnMajor = true;
+    static constexpr uint32_t WorkBatch = 2;
+    static constexpr int64_t WeightBytes = int64_t(N) * K;
+    template <bool Clamp, GatedActivation Activation>
+    CUTLASS_DEVICE static void run(const uint8_t* a, const float* sa, const uint8_t* b,
+        const float* sb, const uint8_t*, uint8_t* output, float* scales,
+        int pool_rows, int valid, int nb, int thread, char* smem, float limit,
+        float alpha, float beta, float linear_beta, int writable) {
+        gemm1_block<N, K, Clamp, Activation, M>(a, sa, b, sb, output, scales, pool_rows,
+            valid, nb, thread, smem, limit, alpha, beta, linear_beta, writable);
+    }
+};
+
 template <uint32_t kRanks, uint32_t kCTAs, uint32_t kExperts,
           uint32_t kTopk, uint32_t kHidden, uint32_t kN, uint32_t kPullCTAs,
           bool kClamp = false,
           uint32_t kMasterExperts = kExperts / kRanks, GatedActivation Activation = GatedActivation::SwiGLU,
-          uint32_t kComputeM = 128, uint32_t kGemm2BlockM = 0>
+          uint32_t kComputeM = 128, uint32_t kGemm2BlockM = 0,
+          class Backend = FP8Gemm1Backend<kN, kHidden, kComputeM>>
 CUTLASS_DEVICE void dispatch_gemm1_kernel_device(
         void* workspace_base, const layout::SymBuffer<>& sym_buffer,
         int64_t* ids, const uint8_t* input,
@@ -169,11 +216,12 @@ CUTLASS_DEVICE void dispatch_gemm1_kernel_device(
         uint8_t* output, float* output_scales,
         uint32_t num_tokens, uint32_t cap, float swiglu_limit = 0.0f, float activation_alpha = 1.0f, float situ_beta = 4.0f, float situ_linear_beta = 25.0f,
         const uint8_t* w1_replicas = nullptr, const float* s1_replicas = nullptr,
-        uint64_t routing_bytes = 0) {
+        uint64_t routing_bytes = 0, const uint8_t* native_scales = nullptr,
+        const uint8_t* replica_native_scales = nullptr) {
     static_assert(kRanks > 0 && kRanks <= 64 && kExperts % kRanks == 0);
     constexpr uint32_t kEpr = kExperts / kRanks;
     constexpr uint32_t kBlockM = 128, kBlockN = 256;
-    constexpr uint32_t kThreads = Gemm1<kN, kHidden, kComputeM>::kNumThreads;
+    constexpr uint32_t kThreads = Backend::kNumThreads;
     constexpr uint32_t kWarps = kThreads / 32, kScales = kHidden / 128;
     constexpr uint32_t kNBlocks = kN / kBlockN;
     static_assert(kHidden % 128 == 0 && kN % kBlockN == 0);
@@ -184,7 +232,7 @@ CUTLASS_DEVICE void dispatch_gemm1_kernel_device(
     const uint32_t sm = blockIdx.x, thread = threadIdx.x;
     const uint32_t warp = thread / 32, lane = thread % 32;
     const layout::Workspace ws(workspace_base, kRanks, kExperts, cap, kTopk, routing_bytes);
-    constexpr uint32_t kWorkBatch = 2;
+    constexpr uint32_t kWorkBatch = Backend::WorkBatch;
     if (sm == 0 && thread == 0)
         *ws.get_gemm1_work_count_ptr() = (kCTAs - kPullCTAs) * kWorkBatch;
     for (uint32_t g = sm * kThreads + thread;
@@ -198,8 +246,8 @@ CUTLASS_DEVICE void dispatch_gemm1_kernel_device(
     const layout::Gemm2Metadata gemm2_meta(gemm2_metadata, kEpr);
     if (sm == 0 && warp == 0)
         gemm2_meta.store_expert_layout<kEpr, kBlockM, kGemm2BlockM>(blocks, lane, gemm2_block_info);
-    static_assert(kComputeM == 128 ||
-        (kComputeM == 32 || kComputeM == 192));
+    static_assert(kComputeM == 16 || kComputeM == 32 || kComputeM == 64 ||
+                  kComputeM == 128 || kComputeM == 192);
     auto* work_counter = ws.get_gemm1_work_count_ptr();
     // Reuse the MMA arena between tiles. The epilogue retires its reads
     // before prime(); ArrivalCache::wait retires ticket reads before MMA.
@@ -232,7 +280,8 @@ CUTLASS_DEVICE void dispatch_gemm1_kernel_device(
                 mega_moe::detail::warp_async_copy_global_to_shared(scratch,
                     sym_buffer.map(input + uint64_t(token) * kHidden, src), kHidden, lane);
                 for (uint32_t sf = lane; sf < kScales; sf += 32)
-                    pool_scales[uint64_t(sf) * ws.num_max_pool_tokens + dst] =
+                    pool_scales[Backend::ScaleColumnMajor
+                        ? uint64_t(sf) * ws.num_max_pool_tokens + dst : uint64_t(dst) * kScales + sf] =
                         *sym_buffer.map(scales + uint64_t(token) * kScales + sf, src);
                 if (lane == 0) {
                     *ws.get_token_src_metadata_ptr(dst) = {src, token, topk_slot};
@@ -277,21 +326,25 @@ CUTLASS_DEVICE void dispatch_gemm1_kernel_device(
             uint32_t weight_expert = expert;
             const uint8_t* weight_base = w1;
             const float* scale_base = s1;
+            const uint8_t* native_base = native_scales;
             if constexpr (kMasterExperts < kEpr) {
                 if (weight_expert >= kMasterExperts) {
                     weight_expert -= kMasterExperts;
                     weight_base = w1_replicas;
                     scale_base = s1_replicas;
+                    native_base = replica_native_scales;
                 }
             }
             const uint32_t writable = local_begin + kComputeM >= rows
                 ? dispatch_blocks * kBlockM - local_begin : kComputeM;
             auto* tile_output = output + uint64_t(base) * (kN / 2);
-            gemm1_block<kN, kHidden, kClamp, Activation, kComputeM>(
-                pool + uint64_t(base) * kHidden, pool_scales + base,
-                weight_base + uint64_t(weight_expert) * kN * kHidden,
+            Backend::template run<kClamp, Activation>(
+                pool + uint64_t(base) * kHidden,
+                pool_scales + (Backend::ScaleColumnMajor ? base : uint64_t(base) * kScales),
+                weight_base + uint64_t(weight_expert) * Backend::WeightBytes,
                 scale_base + uint64_t(weight_expert) * (kN / 128) * kScales,
-                tile_output, output_scales + base,
+                native_base ? native_base + uint64_t(weight_expert) * kN * kHidden / 16 : nullptr,
+                tile_output, output_scales + (Backend::ScaleColumnMajor ? base : uint64_t(base) * (kN / 256)),
                 ws.num_max_pool_tokens, valid, n, thread, reinterpret_cast<char*>(smem),
                 swiglu_limit, activation_alpha, situ_beta, situ_linear_beta, writable);
             if (++work == batch_end) {
