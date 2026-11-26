@@ -5,6 +5,7 @@
 #include <torch/extension.h>
 #include <limits>
 #include <c10/core/DeviceGuard.h>
+#include <c10/cuda/CUDAGuard.h>
 #include "../jit_kernels/impls/epilogue_class.hpp"
 #include "../jit_kernels/impls/fp8_gemm.hpp"
 #include "../jit_kernels/impls/ppuxx_layout.hpp"
@@ -901,64 +902,123 @@ void m_grouped_fp8_gemm_nt_nopad(const std::pair<torch::Tensor, torch::Tensor>& 
     }
 }
 
-static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
-                                              const torch::Tensor& b,
-                                              const torch::Tensor& d,
-                                              const std::optional<std::vector<int>>& ks_cpu,
-                                              const torch::Tensor& grouped_layout,
-                                              const std::optional<torch::Tensor>& c,
-                                              const std::string& compiled_dims,
-                                              const bool& use_psum_layout,
-                                              const std::shared_ptr<EpilogueClass>& epilogue_class) {
-    // Validate before reading dimensions or allowing early_return to write d.
-    DG_HOST_ASSERT(a.is_cuda() and a.dim() == 2);
-    DG_HOST_ASSERT(b.is_cuda() and b.dim() == 2);
-    DG_HOST_ASSERT(d.is_cuda() and d.dim() == 3);
-    DG_HOST_ASSERT(a.device() == b.device() and a.device() == d.device());
-    DG_HOST_ASSERT(grouped_layout.device() == a.device());
-    DG_HOST_ASSERT(not c.has_value() or
-                   (c->is_cuda() and c->dim() == 3 and c->device() == a.device()));
-
-    // Shape checks
-    DG_HOST_ASSERT(a.size(0) <= std::numeric_limits<int>::max() &&
-                   b.size(0) <= std::numeric_limits<int>::max());
-    const auto [num_groups, m, n] = get_shape<3>(d);
-    DG_HOST_ASSERT(num_groups > 0);
-    const auto [sum_k_a, m_] = get_shape<2>(a);
-    const auto [sum_k_b, n_] = get_shape<2>(b);
-    const int k_capacity = std::min(sum_k_a, sum_k_b);
-    const int sum_k = check_k_grouped_args(ks_cpu, grouped_layout, num_groups,
-                                           use_psum_layout, 128, k_capacity);
-    DG_HOST_ASSERT(m == m_ and n == n_);
-    DG_HOST_ASSERT(sum_k >= 0 and sum_k <= sum_k_a and sum_k <= sum_k_b);
-    DG_HOST_ASSERT(not c.has_value() or c->sizes() == d.sizes());
-
-    // Contiguity checks
-    DG_HOST_ASSERT(a.is_contiguous());
-    DG_HOST_ASSERT(b.is_contiguous());
-    DG_HOST_ASSERT(d.is_contiguous());
-    DG_HOST_ASSERT(not c.has_value() or c->is_contiguous());
-
-    // PPU kernels have fixed input/output types.
-    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16 and b.scalar_type() == torch::kBFloat16);
+// None selects device lengths, or device inclusive prefixes with use_psum_layout.
+// Training tuning arguments apply only to the device-length path.
+static void k_grouped_bf16_gemm_tn_contiguous(
+        const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
+        const std::optional<std::vector<int>>& ks_cpu, const torch::Tensor& grouped_layout,
+        const std::optional<torch::Tensor>& c, const std::string& compiled_dims,
+        const bool& use_psum_layout, const std::shared_ptr<EpilogueClass>& epilogue_class,
+        const std::optional<int>& max_group_k, const std::optional<torch::Tensor>& cta_probe,
+        const int compute_cus, const std::optional<torch::Tensor>& first_flags, const int config_k) {
+    // Validate all host-known contracts before any copy, zero or GEMM write.
+    DG_HOST_ASSERT(a.is_cuda() && a.dim() == 2 && a.is_contiguous());
+    DG_HOST_ASSERT(b.is_cuda() && b.dim() == 2 && b.is_contiguous());
+    DG_HOST_ASSERT(d.is_cuda() && d.dim() == 3 && d.is_contiguous());
+    DG_HOST_ASSERT(a.device() == b.device() && a.device() == d.device());
+    DG_HOST_ASSERT(grouped_layout.device() == a.device() && grouped_layout.is_contiguous());
+    DG_HOST_ASSERT(grouped_layout.dim() == 1 && grouped_layout.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16 && b.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(d.scalar_type() == torch::kFloat);
-
-    // Dispatch implementation
-    if (get_ppu_arch() == AC_PPU0015) {
-        // Reject unsupported options before early_return can copy or zero d.
-        DG_HOST_ASSERT(c.has_value());
-        DG_HOST_ASSERT(use_psum_layout or (ks_cpu.has_value() and not ks_cpu.value().empty()));
-        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues are not supported on PPU1.5");
-        DG_HOST_ASSERT(compiled_dims == "mn" and "This implementation specializes both M and N");
-        DG_HOST_ASSERT(c->scalar_type() == torch::kFloat);
-
-        if (early_return(m, n, sum_k, d, c))
-            return;
-        k_grouped_bf16_gemm_tn_contiguous_impl(a, b, c, d, m, n, sum_k, ks_cpu, grouped_layout,
-                                               use_psum_layout);
-    } else {
-        DG_HOST_UNREACHABLE("Unsupported architecture");
+    const auto [groups, m, n] = get_shape<3>(d);
+    DG_HOST_ASSERT(a.size(0)<=INT32_MAX && b.size(0)<=INT32_MAX);
+    const auto [capacity_a, m_] = get_shape<2>(a);
+    const auto [capacity_b, n_] = get_shape<2>(b);
+    const int capacity=std::min(capacity_a,capacity_b);
+    DG_HOST_ASSERT(groups>0 && m == m_ && n == n_);
+    DG_HOST_ASSERT(grouped_layout.numel() == groups);
+    if (c) {
+        DG_HOST_ASSERT(c->device() == d.device() && c->sizes() == d.sizes());
+        DG_HOST_ASSERT(c->is_contiguous() && c->scalar_type() == torch::kFloat);
     }
+    const c10::cuda::CUDAGuard guard(a.device());
+    DG_HOST_ASSERT(get_ppu_arch() == AC_PPU0015);
+    DG_HOST_ASSERT(compiled_dims == "mn" && epilogue_class == nullptr);
+    const auto overlaps = [](const torch::Tensor& lhs, const torch::Tensor& rhs) {
+        const auto left = reinterpret_cast<uintptr_t>(lhs.data_ptr());
+        const auto right = reinterpret_cast<uintptr_t>(rhs.data_ptr());
+        return lhs.numel() && rhs.numel() && left < right + rhs.numel() * rhs.element_size()
+            && right < left + lhs.numel() * lhs.element_size();
+    };
+    DG_HOST_ASSERT(!overlaps(d, a) && !overlaps(d, b) && !overlaps(d, grouped_layout));
+    DG_HOST_ASSERT(!c || c->data_ptr() == d.data_ptr() || !overlaps(*c, d));
+
+    const bool device_lengths = !ks_cpu.has_value() && !use_psum_layout;
+    int logical_k=capacity;
+    std::vector<int> tuning_ks;
+    if (device_lengths) {
+        DG_HOST_ASSERT(groups > 0 && m > 0 && n > 0 && capacity > 0 && capacity % 128 == 0);
+        DG_HOST_ASSERT(a.numel() <= INT32_MAX && b.numel() <= INT32_MAX && d.numel() <= INT32_MAX);
+        const int bound = max_group_k.value_or(capacity);
+        DG_HOST_ASSERT(bound > 0 && bound % 128 == 0 && bound <= capacity);
+        DG_HOST_ASSERT(config_k >= 0 && config_k % 128 == 0);
+        DG_HOST_ASSERT(compute_cus >= 0 && compute_cus <= get_num_sms());
+        tuning_ks.assign(groups, config_k ? config_k : bound);
+        if (cta_probe) {
+            DG_HOST_ASSERT(!c || c->data_ptr() == d.data_ptr());
+            DG_HOST_ASSERT(cta_probe->device() == d.device() && cta_probe->is_contiguous());
+            DG_HOST_ASSERT(cta_probe->scalar_type() == torch::kInt64);
+            DG_HOST_ASSERT(!overlaps(*cta_probe, a) && !overlaps(*cta_probe, b)
+                           && !overlaps(*cta_probe, d) && !overlaps(*cta_probe, grouped_layout));
+            DG_HOST_ASSERT(!c || !overlaps(*cta_probe, *c));
+        }
+        if (first_flags) {
+            const auto& flags = *first_flags;
+            DG_HOST_ASSERT(c && c->data_ptr() == d.data_ptr() && !cta_probe);
+            DG_HOST_ASSERT(flags.device() == d.device() && flags.dim() == 1 && flags.numel() == groups);
+            DG_HOST_ASSERT(flags.is_contiguous() && flags.scalar_type() == torch::kInt32);
+            DG_HOST_ASSERT(!overlaps(flags, d) && !overlaps(flags, a)
+                           && !overlaps(flags, b) && !overlaps(flags, grouped_layout));
+        }
+    } else {
+        // Preserve the original host-metadata contract and positional arguments.
+        DG_HOST_ASSERT(c && (use_psum_layout || (ks_cpu && !ks_cpu->empty())));
+        DG_HOST_ASSERT(!max_group_k && !cta_probe && compute_cus == 0 && !first_flags && config_k == 0);
+        logical_k=check_k_grouped_args(ks_cpu,grouped_layout,groups,use_psum_layout,128,capacity);
+        DG_HOST_ASSERT(logical_k>=0 && logical_k<=capacity_a && logical_k<=capacity_b);
+    }
+    if (early_return(m,n,logical_k,d,c))
+        return;
+    k_grouped_bf16_gemm_tn_contiguous_impl(
+        a,b,c,d,m,n,logical_k,device_lengths ? std::optional<std::vector<int>>(tuning_ks) : ks_cpu,grouped_layout,
+        device_lengths, cta_probe, compute_cus, c.has_value(),
+        first_flags ? first_flags->data_ptr<int32_t>() : nullptr,use_psum_layout);
+}
+
+
+// Each segment stores row-major BF16 A/B with GPU 128-aligned prefix offsets.
+// Offsets must be monotonic, begin at0, and end within each segment's capacity.
+static void k_grouped_bf16_gemm_tn_segmented(
+        const std::vector<torch::Tensor>& a,const std::vector<torch::Tensor>& b,
+        const torch::Tensor& d,const std::vector<torch::Tensor>& offsets,
+        int config_k,bool accumulate=true,int max_continuous_k=0,const std::optional<torch::Tensor>& first_flags=std::nullopt) {
+    DG_HOST_ASSERT(a.size()>0 && a.size()<=8 && b.size()==a.size() && offsets.size()==a.size());
+    DG_HOST_ASSERT(d.is_cuda() && d.dim()==3 && d.is_contiguous() && d.scalar_type()==torch::kFloat);
+    const auto [g,m,n]=get_shape<3>(d);DG_HOST_ASSERT(g>0 && m>0 && n>0 && d.numel()<=INT32_MAX);
+    DG_HOST_ASSERT(config_k>0 && config_k%128==0);
+    const auto overlap=[](const torch::Tensor& x,const torch::Tensor& y) {
+        const auto p=reinterpret_cast<uintptr_t>(x.data_ptr()),q=reinterpret_cast<uintptr_t>(y.data_ptr());
+        return x.numel() && y.numel() && p<q+y.numel()*y.element_size() && q<p+x.numel()*x.element_size();
+    };
+    for(size_t j=0;j<a.size();++j) {
+        DG_HOST_ASSERT(a[j].is_cuda() && b[j].is_cuda() && offsets[j].is_cuda());
+        DG_HOST_ASSERT(a[j].device()==d.device() && b[j].device()==d.device() && offsets[j].device()==d.device());
+        DG_HOST_ASSERT(a[j].dim()==2 && b[j].dim()==2 && a[j].is_contiguous() && b[j].is_contiguous());
+        DG_HOST_ASSERT(a[j].scalar_type()==torch::kBFloat16 && b[j].scalar_type()==torch::kBFloat16);
+        DG_HOST_ASSERT(a[j].size(0)==b[j].size(0) && a[j].size(0)%128==0 && a[j].size(1)==m && b[j].size(1)==n);
+        DG_HOST_ASSERT(a[j].numel()<=INT32_MAX && b[j].numel()<=INT32_MAX);
+        DG_HOST_ASSERT(offsets[j].dim()==1 && offsets[j].is_contiguous() && offsets[j].scalar_type()==torch::kInt32 && offsets[j].numel()==g+1);
+        DG_HOST_ASSERT(!overlap(d,a[j]) && !overlap(d,b[j]) && !overlap(d,offsets[j]));
+    }
+    const c10::cuda::CUDAGuard guard(d.device());DG_HOST_ASSERT(get_ppu_arch()==AC_PPU0015);
+    DG_HOST_ASSERT(max_continuous_k==0 || max_continuous_k==5120 || max_continuous_k==10240);
+    if(first_flags) {
+        const auto& flags=*first_flags;
+        DG_HOST_ASSERT(accumulate && flags.device()==d.device() && flags.dim()==1 && flags.numel()==g);
+        DG_HOST_ASSERT(flags.is_contiguous() && flags.scalar_type()==torch::kInt32 && !overlap(flags,d));
+        for(size_t j=0;j<a.size();++j)DG_HOST_ASSERT(!overlap(flags,a[j]) && !overlap(flags,b[j]) && !overlap(flags,offsets[j]));
+    }
+    k_grouped_bf16_segmented_impl_host(a,b,offsets,d,config_k,accumulate,max_continuous_k,first_flags?first_flags->data_ptr<int32_t>():nullptr);
 }
 
 void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& lhs, const torch::Tensor& rhs,
@@ -2033,6 +2093,15 @@ static void acblaslt_gemm_tt(const torch::Tensor& a, const torch::Tensor& b,
 
 
 static void register_apis(pybind11::module_& m) {
+    m.def("_mega_moe_training_capture_key", []() -> uint64_t {
+        hggcStreamCaptureStatus status;
+        unsigned long long id=0;
+        DG_HGGC_RUNTIME_CHECK(hggcStreamGetCaptureInfo(current_stream(), &status, &id));
+        // Reserve0for eager execution even if the runtime's first capture ID is0.
+        return status==hggcStreamCaptureStatusActive ? uint64_t(id)+1 : 0;
+    });
+    m.def("k_grouped_bf16_gemm_tn_segmented",&k_grouped_bf16_gemm_tn_segmented,
+          py::arg("a"),py::arg("b"),py::arg("d"),py::arg("offsets"),py::arg("config_k"),py::arg("accumulate")=true,py::arg("max_continuous_k")=0,py::arg("first_flags")=std::nullopt);
     // BF16 GEMMs
     m.def("gemm_fp32_fp32_fp32_nt", &gemm_fp32_fp32_fp32_nt,
           py::arg("a"), py::arg("b"), py::arg("d"));
@@ -2047,7 +2116,13 @@ static void register_apis(pybind11::module_& m) {
     m.def("k_grouped_bf16_gemm_tn_contiguous", &k_grouped_bf16_gemm_tn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("ks_cpu"), py::arg("grouped_layout"),
           py::arg("c") = std::nullopt, py::arg("compiled_dims") = "mn", py::arg("use_psum_layout") = false,
-          py::arg("epilogue") = nullptr);
+          py::arg("epilogue") = nullptr, py::kw_only(),
+          py::arg("max_group_k") = std::nullopt, py::arg("cta_probe") = std::nullopt,
+          py::arg("compute_cus") = 0, py::arg("first_flags") = std::nullopt, py::arg("config_k") = 0,
+          "Pass ks_cpu=None with use_psum_layout=False for device-resident lengths; "
+          "max_group_k defaults to the smaller input capacity. In length mode c=None "
+          "overwrites d, while c=d accumulates in place. Host metadata and device "
+          "inclusive prefixes retain their required FP32 c argument.");
     m.def("m_grouped_bf16_gemm_nt_contiguous", &m_grouped_bf16_gemm_nt_contiguous, py::arg("lhs"),
           py::arg("rhs"), py::arg("out"), py::arg("m_indices"), py::arg("compiled_dims") = "nk",
           py::arg("use_psum_layout") = false, py::arg("ensure_zero_padding") = true,

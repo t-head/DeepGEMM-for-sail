@@ -10,6 +10,28 @@
 
 namespace deep_gemm {
 
+static hggcDataType scalar_type_to_native_acblaslt_type(at::ScalarType type) {
+    switch (type) {
+        case at::ScalarType::Half: return HGGC_R_16F;
+        case at::ScalarType::BFloat16: return HGGC_R_16BF;
+        case at::ScalarType::Float: return HGGC_R_32F;
+        case at::ScalarType::Double: return HGGC_R_64F;
+        case at::ScalarType::ComplexHalf: return HGGC_C_16F;
+        case at::ScalarType::ComplexFloat: return HGGC_C_32F;
+        case at::ScalarType::ComplexDouble: return HGGC_C_64F;
+        case at::ScalarType::Char: return HGGC_R_8I;
+        case at::ScalarType::Byte: return HGGC_R_8U;
+        case at::ScalarType::Short: return HGGC_R_16I;
+        case at::ScalarType::Int: return HGGC_R_32I;
+        case at::ScalarType::Long: return HGGC_R_64I;
+        case at::ScalarType::Bool: return HGGC_R_8U;
+        case at::ScalarType::Float8_e4m3fn: return HGGC_R_8F_E4M3;
+        case at::ScalarType::Float8_e5m2: return HGGC_R_8F_E5M2;
+        default: TORCH_CHECK(false, "Unsupported native acBLASLt tensor dtype: ", type);
+    }
+}
+
+
 static auto get_acblaslt_layout(const hggcDataType& type, const int& rows, const int& cols, const int& ld,
                                 const std::optional<int>& batch_count = std::nullopt,
                                 const std::optional<int>& batch_offset = std::nullopt) {
@@ -106,9 +128,9 @@ static void acblaslt_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs,
     const auto trans_b = a_major == MajorType::K ? ACBLAS_OP_N : ACBLAS_OP_T;
 
     // Matrix layouts
-    const auto hggc_type_a = at::cuda::ScalarTypeToCudaDataType(rhs.scalar_type());
-    const auto hggc_type_b = at::cuda::ScalarTypeToCudaDataType(lhs.scalar_type());
-    const auto hggc_type_d = at::cuda::ScalarTypeToCudaDataType(out.scalar_type());
+    const auto hggc_type_a = scalar_type_to_native_acblaslt_type(rhs.scalar_type());
+    const auto hggc_type_b = scalar_type_to_native_acblaslt_type(lhs.scalar_type());
+    const auto hggc_type_d = scalar_type_to_native_acblaslt_type(out.scalar_type());
     const auto layout_a = b_major == MajorType::K ? get_acblaslt_layout(hggc_type_a, k, n, rhs.stride(0))
                                                            : get_acblaslt_layout(hggc_type_a, n, k, rhs.stride(1));
     const auto layout_b = a_major == MajorType::K ? get_acblaslt_layout(hggc_type_b, k, m, lhs.stride(0))
