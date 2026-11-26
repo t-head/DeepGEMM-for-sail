@@ -665,8 +665,11 @@ def test_gemm_bf16xfp32_automatic_registration():
     from daily.run_daily import load_script_checks
     root = Path(__file__).parent
     for board, filename in (("ZW-M890P", "890p"), ("ZW-810E", "810e")):
-        assert any("test_gemm_bf16xfp32.py" in spec for spec in SCRIPT_SUITES[board])
-        assert any("test_gemm_bf16xfp32.py" in spec for spec in load_script_checks(board))
+        checkin = [spec for spec in SCRIPT_SUITES[board] if "test_gemm_bf16xfp32.py" in spec]
+        daily = [spec for spec in load_script_checks(board) if "test_gemm_bf16xfp32.py" in spec]
+        assert len(checkin) == len(daily) == 1
+        assert checkin[0].split()[:3] == ["-P", "-m", "pytest"]
+        assert daily[0].split()[:4] == ["python", "-P", "-m", "pytest"]
         cases = [case for case in load_cases(root / "checkin" / f"checkin_{filename}.list") if "data_type:bf16xfp32," in case]
         assert cases and any("use_fp32_output:0" in case for case in cases) and any("use_fp32_output:1" in case for case in cases)
         assert all(("expect_error:BF16xFP32 GEMM is disabled on PPU1.0" in case) == (filename == "810e") for case in cases)

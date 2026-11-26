@@ -24,11 +24,11 @@ SUITES = {'ZW-810E': 'checkin_810e.list', 'ZW-M890P': 'checkin_890p.list'}
 SCRIPT_SUITES = {
     'ZW-810E': [
         '-m pytest -q -s --disable-warnings -x tests/test_cold_graph_capture.py -k bf16',
-        '-m pytest -q -s --disable-warnings -x tests/test_gemm_bf16xfp32.py',
+        '-P -m pytest -q -s --disable-warnings -x tests/test_gemm_bf16xfp32.py',
     ],
     'ZW-M890P': [
         '-m pytest -q -s --disable-warnings -x tests/test_cold_graph_capture.py',
-        '-m pytest -q -s --disable-warnings -x tests/test_gemm_bf16xfp32.py',
+        '-P -m pytest -q -s --disable-warnings -x tests/test_gemm_bf16xfp32.py',
     ],
     'ZW-M890P-MegaMoE': [
         '-m pytest -q -s --disable-warnings -x -k smoke tests/test_mega_moe.py',
