@@ -71,11 +71,15 @@ class MegaMoECase:
     def mma_type(self):
         return "int8xint8" if self.precision == "int8_channelwise" else "fp4xfp4"
 
+    @property
+    def supported_arches(self):
+        if self.precision == "w4a16":
+            return ((8, 0), (8, 9))
+        return ((8, 0),) if self.precision == "int8_channelwise" else ((8, 9),)
+
     def require_world(self):
-        arch = torch.cuda.get_device_capability()
-        expected = (8, 0) if self.precision == "int8_channelwise" else (8, 9)
-        if arch != expected:
-            pytest.skip(f"{self.precision} MegaMoE requires SM{expected[0]}{expected[1]}")
+        if torch.cuda.get_device_capability() not in self.supported_arches:
+            pytest.skip(f"{self.precision} MegaMoE requires one of {self.supported_arches}")
         world = dist.get_world_size()
         if world not in self.worlds:
             pytest.skip(f"{self.name} requires EP{self.worlds}; launched EP{world}")

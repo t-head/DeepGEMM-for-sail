@@ -126,8 +126,8 @@ inline int get_kernel_occupancy(const std::shared_ptr<KernelRuntime>& runtime,
     return blocks;
 }
 
-template <bool Int8>
-class MegaMoEPreDispatchRuntime final : public LaunchRuntime<MegaMoEPreDispatchRuntime<Int8>> {
+template <layout::MegaMoEStorageFormat Format>
+class MegaMoEPreDispatchRuntime final : public LaunchRuntime<MegaMoEPreDispatchRuntime<Format>> {
 public:
     static constexpr const char* kName = "mega_moe_pre_dispatch";
     struct Args {
@@ -146,9 +146,9 @@ public:
 #include <deep_gemm/impls/mega_moe_pre_dispatch.cuh>
 using TopkIdx = {};
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&deep_gemm::mega_moe_pre_dispatch<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, TopkIdx, {}>);
+    auto ptr = reinterpret_cast<void*>(&deep_gemm::mega_moe_pre_dispatch<static_cast<deep_gemm::layout::MegaMoEStorageFormat>({}), {}, {}, {}, {}, {}, {}, {}, {}, {}, TopkIdx, {}>);
 }}
-)", args.topk_idx.scalar_type() == torch::kInt32 ? "int32_t" : "int64_t", Int8,
+)", args.topk_idx.scalar_type() == torch::kInt32 ? "int32_t" : "int64_t", static_cast<int>(Format),
     args.hidden, args.num_topk, args.num_max_tokens_per_rank, args.num_ranks, args.num_experts, args.intermediate_hidden,
     args.staging.scales, args.staging.counts, args.staging.tokens, is_bf16x8_aligned(args.hidden_states));
     }
@@ -159,13 +159,13 @@ static void __instantiate_kernel() {{
     }
 };
 
-template <bool Int8>
+template <layout::MegaMoEStorageFormat Format>
 static void mega_moe_pre_dispatch_impl(
     const torch::Tensor& hidden_states, const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
     const std::vector<int64_t>& sym_buffer_ptrs,
     int num_ranks, int num_experts, int num_max_tokens_per_rank, int rank_idx,
     int hidden, int intermediate_hidden, int num_topk, const layout::MegaMoEStaging& staging) {
-    using Runtime = MegaMoEPreDispatchRuntime<Int8>;
+    using Runtime = MegaMoEPreDispatchRuntime<Format>;
     typename Runtime::Args args{hidden, num_topk, num_max_tokens_per_rank, num_ranks, num_experts, intermediate_hidden,
         {dim3(1), dim3(256), 0}, hidden_states.data_ptr(), topk_idx, topk_weights.data_ptr<float>(),
         static_cast<uint32_t>(hidden_states.size(0)), layout::SymBuffer<>(sym_buffer_ptrs, rank_idx), staging};

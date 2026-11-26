@@ -11,10 +11,12 @@
 #include "int8_gemm.hpp"
 #include "mega_moe_runtime.hpp"
 #include "../heuristics/mega_moe.hpp"
-#include <hggc_ad.h>
+#include "sm80_mega_moe_copy.hpp"
 
 namespace deep_gemm::mega_int8 {
 
+using mega::CopyStreamResources;
+using mega::SM80MegaMoECopyRuntime;
 using mega::for_ranks;
 using mega::get_kernel_occupancy;
 
@@ -26,46 +28,6 @@ static mega::MegaMoEGemmProfile gemm_profile(const Args& args, int num_sms) {
             {num_sms, c.block_m, c.block_n, c.block_k, c.warp_m, c.warp_n, c.num_stages,
              args.launch_args.smem_size}};
 }
-
-DECL_LAZY_HGGC_DRIVER_FUNCTION(hgStreamSetAttributeAD);
-
-// One workspace owns one copy stream and its events. Workspace aliases share
-// these resources and must execute serially, including Graph replays.
-struct CopyStreamResources {
-    int device;
-    hggcStream_t copy = nullptr;
-    hggcEvent_t fork = nullptr, done = nullptr, launched = nullptr;
-
-    explicit CopyStreamResources(int device_) : device(device_) {
-        try {
-            DG_HGGC_RUNTIME_CHECK(hggcStreamCreateWithFlags(&copy, hggcStreamNonBlocking));
-            // The dedicated stream always runs copy work on the vector-CU pool.
-            HGstreamAttrValueAD attr{};
-            attr.yieldMultiprocessor = HGAD_YIELD_MULTIPROCESSOR_INTENSIVE;
-            DG_HGGC_DRIVER_CHECK(lazy_hgStreamSetAttributeAD(
-                copy, HGAD_STREAM_ATTRIBUTE_YIELD_MULTIPROCESSOR, &attr));
-            DG_HGGC_RUNTIME_CHECK(hggcEventCreateWithFlags(&fork, hggcEventDisableTiming));
-            DG_HGGC_RUNTIME_CHECK(hggcEventCreateWithFlags(&done, hggcEventDisableTiming));
-        } catch (...) {
-            if (done) hggcEventDestroy(done);
-            if (fork) hggcEventDestroy(fork);
-            if (copy) hggcStreamDestroy(copy);
-            throw;
-        }
-    }
-    CopyStreamResources(const CopyStreamResources&) = delete;
-    CopyStreamResources& operator=(const CopyStreamResources&) = delete;
-    ~CopyStreamResources() {
-        int previous = device;
-        if (hggcGetDevice(&previous) != hggcSuccess || hggcSetDevice(device) != hggcSuccess)
-            return;
-        if (launched) hggcEventDestroy(launched);
-        hggcEventDestroy(done);
-        hggcEventDestroy(fork);
-        hggcStreamDestroy(copy);
-        if (previous != device) hggcSetDevice(previous);
-    }
-};
 
 struct Int8GatedEpilogueParams : INT8GemmCutlass3Runtime::EpilogueParamNoTsm {
     float activation_limit = 0.0f;
@@ -209,61 +171,6 @@ extern "C" __global__ __launch_bounds__(256) void megamoe_int8_quant(
     }
 };
 
-class Int8MegaMoECopyRuntime final : public LaunchRuntime<Int8MegaMoECopyRuntime> {
-public:
-    struct Args {
-        int n, k, block_m, block_k, groups, ranks, k_tiles_per_flag, capacity, topk, threads;
-        LaunchArgs launch_args;
-        sched::Int8MegaMoESchedulerArguments scheduler;
-        bool split_sync = false;
-    };
-    static std::string generate_impl(const Args& a) {
-        return fmt::format(R"(
-#define DG_MEGAMOE_SPLIT_SYNC {}
-#include <deep_gemm/impls/int8_mega_moe_dispatch.cuh>
-using Kernel = deep_gemm::sm80::MegaMoECopyKernel<{},{},{},{},{},{},{},{},{},{}>;
-static_assert(Kernel::SharedStorageSize == {});
-static_assert(sizeof(Kernel::Arguments) == {});
-extern "C" __global__ __launch_bounds__({}) void megamoe_int8_dispatch_copy(
-        Kernel::Arguments scheduler) {{
-    extern __shared__ char smem[];
-    Kernel::run(scheduler, smem);
-}}
-)", static_cast<int>(a.split_sync), a.n, a.k, a.block_m, a.block_k, a.groups, a.ranks,
-            a.k_tiles_per_flag, a.capacity, a.topk, a.threads,
-            a.launch_args.smem_size, sizeof(a.scheduler), a.threads);
-    }
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args a) {
-        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, a.scheduler));
-    }
-
-    static void launch_on_stream(const std::shared_ptr<KernelRuntime>& runtime, const Args& args,
-                                 hggcStream_t stream, hggcEvent_t launch_event = nullptr) {
-        if (is_compile_only())
-            return;
-        const auto& launch = args.launch_args;
-        auto config = construct_launch_config(runtime->kernel, stream, launch.smem_size,
-                                              launch.grid_dim, launch.block_dim);
-        LaunchAttrHandle attr{};
-        if (launch_event) {
-#if HGGCRT_VERSION >= 12080 && defined(DG_JIT_USE_RUNTIME_API)
-            attr.id = hggcLaunchAttributeLaunchCompletionEvent;
-            attr.val.launchCompletionEvent.event = launch_event;
-#else
-            attr.id = HG_LAUNCH_ATTRIBUTE_LAUNCH_COMPLETION_EVENT;
-            attr.value.launchCompletionEvent.event = reinterpret_cast<HGevent>(launch_event);
-#endif
-            config.attrs = &attr;
-            config.numAttrs = 1;
-        }
-        if (get_env<int>("DG_JIT_DEBUG"))
-            printf("Launch kernel with {%d, %d} x %d  %d, shared memory: %d bytes, stream: %ld\n",
-                   launch.grid_dim.x, launch.grid_dim.y, launch.block_dim.x, launch.block_dim.y,
-                   launch.smem_size, (uintptr_t)stream);
-        launch_impl(runtime->kernel, config, args);
-    }
-};
-
 template <typename Runtime>
 static void launch_gemm(typename Runtime::Args& args, int num_sms) {
     auto runtime = compiler->build(args.kernel_name, Runtime::generate(args));
@@ -287,9 +194,8 @@ static void launch_int8_split_stage1(typename Runtime::Args& args, int num_sms, 
     DG_HOST_ASSERT(copy_threads >= 64 && copy_threads >= Runtime::kRanks &&
                    copy_threads % 32 == 0 && copy_threads <= device_runtime->get_prop()->maxThreadsPerBlock);
     constexpr int ranks = Runtime::kRanks;
-    const int row_map_bytes = ceil_div(4 * ranks + 8 * tile.block_m, 16) * 16;
-    const int smem = std::max(row_map_bytes, 4 * args.groups * (ranks + 4));
-    Int8MegaMoECopyRuntime::Args copy_args{
+    const int smem = SM80MegaMoECopyRuntime::shared_bytes(tile.block_m, ranks, args.groups);
+    SM80MegaMoECopyRuntime::Args copy_args{
         args.intermediate * 2, args.hidden, tile.block_m, tile.block_k, args.groups, ranks,
         tile.k_tiles_per_flag, args.capacity, args.topk, copy_threads,
         {dim3(copy_ctas), dim3(copy_threads), smem}, args.kernel_params.scheduler, args.split_sync};
@@ -335,7 +241,7 @@ static void launch_int8_split_stage1(typename Runtime::Args& args, int num_sms, 
         compute = active_compiler->build(args.kernel_name, Runtime::generate(args));
         const int blocks = get_kernel_occupancy(compute, threads, args.launch_args.smem_size);
         args.launch_args.grid_dim.x = num_sms * blocks;
-        copy = active_compiler->build("megamoe_int8_dispatch_copy", Int8MegaMoECopyRuntime::generate(copy_args));
+        copy = active_compiler->build("megamoe_int8_dispatch_copy", SM80MegaMoECopyRuntime::generate(copy_args));
         get_kernel_occupancy(copy, copy_threads, smem);
         if (cache_plan)
             plans.push_back({key, context, active_compiler, active_compiler->signature,
@@ -368,7 +274,7 @@ static void launch_int8_split_stage1(typename Runtime::Args& args, int num_sms, 
     DG_HGGC_RUNTIME_CHECK(hggcEventRecord(streams.fork, caller));
     DG_HGGC_RUNTIME_CHECK(hggcStreamWaitEvent(streams.copy, streams.fork, 0));
     try {
-        Int8MegaMoECopyRuntime::launch_on_stream(copy, copy_args, streams.copy, launch_event);
+        SM80MegaMoECopyRuntime::launch_on_stream(copy, copy_args, streams.copy, launch_event);
         // LCE gates GEMM admission; device-ready flags still guard copied data.
         if (launch_event)
             DG_HGGC_RUNTIME_CHECK(hggcStreamWaitEvent(caller, launch_event, 0));
