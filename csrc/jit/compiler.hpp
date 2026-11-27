@@ -147,7 +147,8 @@ public:
         // Each calling thread owns its lookup table; hits need no shared-map mutation.
         // The underlying runtime cache already retains every loaded kernel for its lifetime.
         static thread_local std::map<Key, std::shared_ptr<KernelRuntime>> cache;
-        const auto key = std::make_tuple(this, name, Runtime::compile_key(args));
+        const auto key = std::make_tuple(this, name+"$$training_fp8="+std::to_string(training_fp8_mma_flags(name))
+            +"$$bf16_mma="+bf16_training_mma_reuse_flag(name), Runtime::compile_key(args));
         if (const auto it = cache.find(key); it != cache.end())
             return it->second;
 
@@ -156,8 +157,39 @@ public:
         return runtime;
     }
 
+    virtual std::string get_kernel_flags(const std::string&) const { return {}; }
+
+    static bool training_fp8_mma_flags(const std::string& name) {
+        if(name.rfind("fp8_training_nt_wgrad",0)==0) {
+            const int enabled=get_env<int>("DG_JIT_FP8_DW_MMA_FLAGS",0);
+            DG_HOST_ASSERT(enabled==0 || enabled==1);
+            return get_ppu_arch()==AC_PPU0015 && enabled;
+        }
+        const int enabled=get_env<int>("DG_JIT_FP8_TRAINING_MMA_FLAGS",0);
+        DG_HOST_ASSERT(enabled==0 || enabled==1);
+        if(name=="fp8_training_peer_return_pipeline") {
+            const int policy=get_env<int>("DG_JIT_FP8_RETURN_PIPELINE_MMA_FLAGS",1);
+            DG_HOST_ASSERT(policy==0 || policy==1);
+            return get_ppu_arch()==AC_PPU0015 && enabled && policy;
+        }
+        const bool eligible=name=="fp8_training_inline_source" || name=="fp8_training_peer_return" || name=="fp8_training_peer_return_wide16"
+            || name.rfind("fp8_training_peer_return_register16",0)==0 || name=="fp8_training_peer_expertbatch" || name.rfind("fp8_training_broadcast64_",0)==0;
+        return get_ppu_arch()==AC_PPU0015 && enabled && eligible;
+    }
+    static std::string bf16_training_mma_reuse_flag(const std::string& name) {
+        const int enabled=get_env<int>("DG_JIT_BF16_TRAINING_MMA_REUSE",0);
+        DG_HOST_ASSERT(enabled==0 || enabled==1);
+        const bool mega_moe_training=enabled && name.rfind("bf16_peer_",0)==0;
+        return get_ppu_arch() == AC_PPU0015 && mega_moe_training
+            ? "-ppu-pref-mma-reuse=true" : "";
+    }
+
     std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code) const {
-        const auto kernel_signature = fmt::format("{}$${}$${}$${}", name, signature, flags, code);
+        const auto options = get_kernel_flags(name);
+        auto kernel_signature = fmt::format("{}$${}$${}$${}", name, signature, flags + options, code);
+        if (training_fp8_mma_flags(name)) kernel_signature += "$$training_fp8_native_mma=1";
+        if (const auto option = bf16_training_mma_reuse_flag(name); !option.empty())
+            kernel_signature += "$$" + option;
         const auto dir_path = cache_dir_path / "cache" / fmt::format("kernel.{}.{}", name, get_hex_digest(kernel_signature));
 
         // Hit the runtime cache
@@ -271,18 +303,14 @@ public:
         flags += " -x hg";
     }
 
-    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name) const override {
-        // Write the code into the cache directory
-        const auto code_path = dir_path / "kernel.cu";
-        put(code_path, code);
-
+    std::string get_kernel_flags(const std::string& name) const override {
         // Per-kernel scheduling options.
         std::string per_kernel_flags;
         if (get_ppu_arch() == AC_PPU0015) {
             per_kernel_flags = " -Xllvm -ppu-patch-fence-ppu=false -Xllvm -wno-loop-miss-transform"
                                " -Xllvm -ppu-cg-to-kp1=true -Xllvm -ppu-fix-uninit=true";
             const bool is_blockwise_scatter = name.find("fp8_blockwise_mega_moe_scatter") != std::string::npos;
-            const bool use_warp_interleaving =
+            const bool use_warp_interleaving = training_fp8_mma_flags(name) ||
                 (name.find("fp8_grouped_deep_gemm") != std::string::npos) ||
                 (name.find("fp8_deep_gemm") != std::string::npos) ||
                 (name.find("fp8_blockwise_mega_moe_dispatch_gemm1") != std::string::npos) ||
@@ -294,6 +322,8 @@ public:
                 const bool is_bf16_cute_free = name.find("bf16_deep_gemm_cute_free") != std::string::npos;
                 if (is_bf16_cute_free) {
                     per_kernel_flags += " -Xllvm -ppu-pref-mma-reuse=true";
+                } else if (const auto option = bf16_training_mma_reuse_flag(name); !option.empty()) {
+                    per_kernel_flags += " -Xllvm " + option;
                 }
             } else {
                 per_kernel_flags += " -Xllvm -ppu-blksync-nb-schedule-boundary=true"
@@ -315,6 +345,16 @@ public:
             per_kernel_flags += " -Xllvm -ppu-reassign-subregs=true"
                                 " -Xllvm -ppu-pref-fma-reuse=true"
                                 " -Xllvm -ppu-pref-mma-reuse=true";
+        return per_kernel_flags;
+    }
+
+    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name) const override {
+        // Write the code into the cache directory
+        const auto code_path = dir_path / "kernel.cu";
+        put(code_path, code);
+
+        const auto per_kernel_flags = get_kernel_flags(name);
+
         // Include paths for actlize and DeepGEMM headers
         std::string include_flags;
         for (const auto& path: actlize_include_paths())
@@ -403,7 +443,7 @@ public:
                 });
 
                 const bool is_blockwise_scatter = name.find("fp8_blockwise_mega_moe_scatter") != std::string::npos;
-                const bool use_warp_interleaving =
+                const bool use_warp_interleaving = training_fp8_mma_flags(name) ||
                     (name.find("fp8_grouped_deep_gemm") != std::string::npos) ||
                     (name.find("fp8_deep_gemm") != std::string::npos) ||
                     (name.find("fp8_blockwise_mega_moe_dispatch_gemm1") != std::string::npos) ||
@@ -414,6 +454,8 @@ public:
                     opts_insert({
                         "--ppu-tuning-options=-ppu-simt-branch=false",
                     });
+                    if (const auto option = bf16_training_mma_reuse_flag(name); !option.empty())
+                        opts_insert({"--ppu-tuning-options=" + option});
                 } else {
                     opts_insert({
                         "--ppu-tuning-options=-ppu-blksync-nb-schedule-boundary=true",

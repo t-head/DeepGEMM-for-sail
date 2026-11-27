@@ -51,6 +51,7 @@ from ._C import (
     bf16_gemm_tt,
     gemm_fp32_fp32_fp32_nt,
     k_grouped_bf16_gemm_tn_contiguous,
+    k_grouped_bf16_gemm_tn_segmented,
     m_grouped_bf16_gemm_nt_contiguous,
     m_grouped_bf16_gemm_nt_masked,
     m_grouped_bf16_gemm_nt_nopad,

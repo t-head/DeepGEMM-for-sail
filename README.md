@@ -111,6 +111,10 @@ bash install.sh
 
 Then, import `deep_gemm` in your Python project, and enjoy!
 
+## MegaMoE training
+
+See the [training guide](docs/mega_moe_training.md) for BF16 and blockwise FP8 MegaMoE training, bidirectional communication/compute fusion, DeepEP baselines, and EP32/EP64 reproduction recipes. The optimized `MegaMoEPlan` targets ZW-M890P within one physical supernode.
+
 ## Interfaces
 
 #### Notices

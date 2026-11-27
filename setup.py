@@ -147,6 +147,22 @@ RELEASE_VERSION = 'v1.1.0'  # Release version
 
 
 def get_package_version(ppu_sdk_version):
+    # Standard source distributions retain their exact wheel version in
+    # PKG-INFO and may be rebuilt without Git history. Match the SDK explicitly.
+    if ppu_sdk_version == (0, 0, 0):
+        raise RuntimeError('PPU SDK version unavailable; check hgcc --version for the selected SDK')
+    package_info = os.path.join(current_dir, 'PKG-INFO')
+    if not os.path.exists(os.path.join(current_dir, '.git')) and os.path.isfile(package_info):
+        from email.parser import Parser
+        import re
+        with open(package_info, encoding='utf-8') as metadata_file:
+            metadata = Parser().parsestr(metadata_file.read())
+        version = metadata.get('Version', '')
+        sdk = re.search(r'\.ppu(\d+)\.(\d+)\.(\d+)(?:\.g[0-9a-f]+)?$', version)
+        if (metadata.get('Name') != 'deep_gemm' or sdk is None
+                or tuple(map(int, sdk.groups())) != ppu_sdk_version):
+            raise RuntimeError('Source distribution metadata does not match deep_gemm and the selected PPU SDK')
+        return version
     try:
         from setuptools_scm import Configuration
         from setuptools_scm.git import parse
@@ -159,9 +175,7 @@ def get_package_version(ppu_sdk_version):
         'git', 'describe', '--tags', '--long', '--match', release_tag,
     ])
     if scm is None or scm.node is None:
-        raise RuntimeError('Git commit information unavailable; build from a Git repository with commit history')
-    if ppu_sdk_version == (0, 0, 0):
-        raise RuntimeError('PPU SDK version unavailable; check hgcc --version for the selected SDK')
+        raise RuntimeError('Git commit information unavailable; build from a Git repository with commit history or a source distribution containing PKG-INFO')
 
     ppu_version = '.'.join(map(str, ppu_sdk_version))
     local_version = f'{RELEASE_VERSION}.ppu{ppu_version}'
@@ -172,6 +186,7 @@ def get_package_version(ppu_sdk_version):
 
 if __name__ == '__main__':
     extra_cxx_args = ["-O3", "-std=c++17", "-DUSE_HGGC"]
+    build_include_dirs.append(os.path.join(ppu_sdk, "CUDA_SDK", "targets", "x86_64-linux", "include"))
     extra_hgcc_args = ["-O3", "-std=c++17", "--use_fast_math", "-DUSE_HGGC"]
 
     ppu_sdk_version = get_ppu_sdk_version()

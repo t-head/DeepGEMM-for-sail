@@ -1,0 +1,1002 @@
+{
+  "scope": "Complete routed expert layer forward/backward with live weights and fresh F32 DW; excludes optimizer, attention, router and shared experts.",
+  "target": {
+    "chip": "ZW-M890P",
+    "architecture": "ppu0015",
+    "sdk": "2.2.0-663c22",
+    "torch": "2.11.0",
+    "devices_per_host": 8,
+    "hosts_per_supernode": 8
+  },
+  "global_experts": 512,
+  "topk": 10,
+  "precision_note": "Both paths use rowwise E4M3 activations, blockwise FP8 weights and K128 FP8 DW with F32 accumulation/output. MegaMoE may reuse row-FP8 source caches for DW; matching formats do not imply identical quantization boundaries.",
+  "architecture_note": "Qwen3.5-397B-A17B uses H4096/I1024/E512/top-k10, verified against the official config. Qwen3.8-2.4T-A95B uses H8192/I2048/E512/top-k10, verified against the supplied checkpoint config. Tokens per rank are benchmark workload choices; checkpoint MXFP4 weights are not loaded.",
+  "target_2_to_3x_achieved": false,
+  "bf16_transport_note": "Qwen3.5-397B-A17B BF16 peer recipes use validated mode2 shared-memory batch NCP return; Qwen3.8-2.4T-A95B BF16 and all FP8/DeepEP recipes use mode0. This is a transport change; BF16 operands and F32 DW remain unchanged.",
+  "control_collective_note": "Peer plans disable Torch control MNNVL for metadata startup stability; their hot data path uses custom same-supernode P2P. DeepEP controls explicitly enable MNNVL and must report one scale-out group, preserving the complete physical-supernode fast path. Timings with multiple DeepEP scale-out groups are excluded.",
+  "source_pipeline_note": "Selected shape-specific policies: Qwen3.5-397B-A17B uses inline forward bulk ILP8 and 512-thread/39-CTA backward bulk ILP8; Qwen3.8-2.4T-A95B uses 6 forward source CTAs and 33 GEMM CTAs at EP32/EP64, plus 512-thread/39-CTA backward bulk ILP4. DW pack grid is 8 CTAs per CU.",
+  "deepep_preparation": {
+    "helper": "tests/benchmark_mega_moe_training.py --prepare-deepep-compat",
+    "required_for_tested_sdk_wheel": true,
+    "compatibility_identity_file": "build/campaign/deepep-native-scope/compat-manifest.json"
+  },
+  "performance_evidence": "docs/mega_moe_training.md",
+  "lut_profiles": {
+    "fp8-qwen3.8-2.4t-a95b-stage3": {
+      "ZW-M890P_bf16_kgroupedcontiguous.lut": "# groups M N maxK BM BN BK WM WN stages\n8 4096 8192 65536 256 256 64 64 64 3\n8 4096 8192 131072 256 256 64 64 64 3\n8 4096 8192 260096 256 256 64 64 64 3\n8 4096 8192 262144 256 256 64 64 64 3\n8 4096 8192 520192 256 256 64 64 64 3\n8 8192 2048 65536 256 256 64 64 64 3\n8 8192 2048 131072 256 256 64 64 64 3\n8 8192 2048 260096 256 256 64 64 64 3\n8 8192 2048 262144 256 256 64 64 64 3\n8 8192 2048 520192 256 256 64 64 64 3\n16 4096 8192 65536 256 256 64 64 64 3\n16 4096 8192 131072 256 256 64 64 64 3\n16 4096 8192 260096 256 256 64 64 64 3\n16 4096 8192 262144 256 256 64 64 64 3\n16 4096 8192 520192 256 256 64 64 64 3\n16 8192 2048 65536 256 256 64 64 64 3\n16 8192 2048 131072 256 256 64 64 64 3\n16 8192 2048 260096 256 256 64 64 64 3\n16 8192 2048 262144 256 256 64 64 64 3\n16 8192 2048 520192 256 256 64 64 64 3\n"
+    },
+    "fp8-qwen3.5-397b-a17b-stage3": {
+      "ZW-M890P_bf16_kgroupedcontiguous.lut": "# groups M N maxK BM BN BK WM WN stages\n16 2048 4096 65536 256 256 64 64 64 3\n16 4096 1024 65536 256 256 64 64 64 3\n16 2048 4096 83968 256 256 64 64 64 3\n16 4096 1024 83968 256 256 64 64 64 3\n16 2048 4096 86016 256 256 64 64 64 3\n16 4096 1024 86016 256 256 64 64 64 3\n16 2048 4096 131072 256 256 64 64 64 3\n16 4096 1024 131072 256 256 64 64 64 3\n16 2048 4096 262144 256 256 64 64 64 3\n16 4096 1024 262144 256 256 64 64 64 3\n16 2048 4096 520192 256 256 64 64 64 3\n16 4096 1024 520192 256 256 64 64 64 3\n"
+    },
+    "bf16-stage3": {
+      "ZW-M890P_bf16_kgroupedcontiguous.lut": "# groups M N configK BM BN BK WM WN stages; common fixed path for all models\n8 2048 4096 65536 256 256 64 64 64 3\n8 2048 4096 83968 256 256 64 64 64 3\n8 2048 4096 86016 256 256 64 64 64 3\n8 2048 4096 131072 256 256 64 64 64 3\n8 2048 4096 260096 256 256 64 64 64 3\n8 2048 4096 262144 256 256 64 64 64 3\n8 2048 4096 520192 256 256 64 64 64 3\n8 4096 1024 65536 256 256 64 64 64 3\n8 4096 1024 83968 256 256 64 64 64 3\n8 4096 1024 86016 256 256 64 64 64 3\n8 4096 1024 131072 256 256 64 64 64 3\n8 4096 1024 260096 256 256 64 64 64 3\n8 4096 1024 262144 256 256 64 64 64 3\n8 4096 1024 520192 256 256 64 64 64 3\n8 4096 8192 65536 256 256 64 64 64 3\n8 4096 8192 83968 256 256 64 64 64 3\n8 4096 8192 86016 256 256 64 64 64 3\n8 4096 8192 131072 256 256 64 64 64 3\n8 4096 8192 260096 256 256 64 64 64 3\n8 4096 8192 262144 256 256 64 64 64 3\n8 4096 8192 520192 256 256 64 64 64 3\n8 8192 2048 65536 256 256 64 64 64 3\n8 8192 2048 83968 256 256 64 64 64 3\n8 8192 2048 86016 256 256 64 64 64 3\n8 8192 2048 131072 256 256 64 64 64 3\n8 8192 2048 260096 256 256 64 64 64 3\n8 8192 2048 262144 256 256 64 64 64 3\n8 8192 2048 520192 256 256 64 64 64 3\n16 2048 4096 65536 256 256 64 64 64 3\n16 2048 4096 83968 256 256 64 64 64 3\n16 2048 4096 86016 256 256 64 64 64 3\n16 2048 4096 131072 256 256 64 64 64 3\n16 2048 4096 260096 256 256 64 64 64 3\n16 2048 4096 262144 256 256 64 64 64 3\n16 2048 4096 520192 256 256 64 64 64 3\n16 4096 1024 65536 256 256 64 64 64 3\n16 4096 1024 83968 256 256 64 64 64 3\n16 4096 1024 86016 256 256 64 64 64 3\n16 4096 1024 131072 256 256 64 64 64 3\n16 4096 1024 260096 256 256 64 64 64 3\n16 4096 1024 262144 256 256 64 64 64 3\n16 4096 1024 520192 256 256 64 64 64 3\n16 4096 8192 65536 256 256 64 64 64 3\n16 4096 8192 83968 256 256 64 64 64 3\n16 4096 8192 86016 256 256 64 64 64 3\n16 4096 8192 131072 256 256 64 64 64 3\n16 4096 8192 260096 256 256 64 64 64 3\n16 4096 8192 262144 256 256 64 64 64 3\n16 4096 8192 520192 256 256 64 64 64 3\n16 8192 2048 65536 256 256 64 64 64 3\n16 8192 2048 83968 256 256 64 64 64 3\n16 8192 2048 86016 256 256 64 64 64 3\n16 8192 2048 131072 256 256 64 64 64 3\n16 8192 2048 260096 256 256 64 64 64 3\n16 8192 2048 262144 256 256 64 64 64 3\n16 8192 2048 520192 256 256 64 64 64 3\n"
+    }
+  },
+  "format_version": 11,
+  "common_environment": {
+    "DG_BF16_WGRAD_COMPUTE_CUS": "0",
+    "DG_MOE_REUSE_FORWARD_CONTEXT": "1",
+    "DG_MOE_FP8_FUSED_QUANT_CTAS_PER_CU": "16",
+    "DG_MOE_FP8_WEIGHT_PREP_CTAS_PER_CU": "8",
+    "DG_MOE_FP8_FUSE_DHIDDEN_ACTIVATION": "0",
+    "DG_MOE_FP8_INPUT_SLICES": "1",
+    "DG_MOE_PEER_STAGE_CTAS_PER_CU": "4",
+    "DG_JIT_BF16_TRAINING_MMA_REUSE": "0"
+  },
+  "recipe_defaults": {
+    "measurement": {
+      "status": "configuration_only",
+      "performance_reference": "docs/mega_moe_training.md",
+      "note": "Source and performance evidence are versioned separately; consult the performance reference for validated revisions."
+    }
+  },
+  "variant_defaults": {
+    "deepep/bf16": {
+      "communication": "BF16 dispatch/combine payloads",
+      "dw": "BF16 operands, F32 accumulation/output",
+      "required_deepep_scaleout_groups": 1,
+      "lut_profile": "fp8-qwen3.8-2.4t-a95b-stage3",
+      "environment": {
+        "PCCL_MNNVL_ENABLE": "1",
+        "NCCL_MNNVL_ENABLE": "1",
+        "DG_MOE_FP8_ACTIVE_QUANTIZATION": "0",
+        "DG_MOE_FP8_MN_MAJOR_SCALES": "0",
+        "DG_MOE_FP8_ASYNC_WEIGHTS": "0",
+        "DG_MOE_FP8_WEIGHT_QUANTIZER": "0",
+        "DG_MOE_FP8_SOURCE_DISPATCH": "0",
+        "DG_MOE_FP8_TRANSPOSE_QUANTIZED_WEIGHTS": "0",
+        "DG_MOE_FP8_VECTOR_ROW_QUANT": "0",
+        "DG_MOE_FP8_FUSED_STAGE_QUANT": "0",
+        "DG_MOE_FP8_WEIGHT_TRANSPOSE_SWIZZLE": "0",
+        "DG_MOE_FP8_TILED_GRAD_QUANT": "0",
+        "DG_MOE_FP8_RETURN_STORE_BYTES": "16",
+        "DG_MOE_FP8_FUSED_WEIGHT_PREPARE": "0",
+        "DG_MOE_FP8_WGRAD": "0",
+        "DG_MOE_FP8_WGRAD_BLOCK_K": "128",
+        "DG_MOE_FP8_WGRAD_FUSED_PRODUCER": "0",
+        "DG_MOE_FP8_WGRAD_PREP_PIPELINE": "0",
+        "DG_MOE_FP8_WGRAD_STABLE_ROUTING": "0",
+        "DG_MOE_FP8_WGRAD_CONFIG": "192,256,128,48,64,4",
+        "DG_MOE_FP8_WGRAD_PACK_CTAS": "4",
+        "DG_JIT_FP8_DW_MMA_FLAGS": "1",
+        "DG_MOE_FP8_DW_ROUTE_BLOCK": "2048",
+        "DG_MOE_FP8_DW_NATIVE_PREFIX": "1",
+        "DG_MOE_FP8_WGRAD_NATIVE_BLOCKWISE": "0",
+        "DG_MOE_FP8_WGRAD_DW1_PIPELINE": "0",
+        "DG_MOE_FP8_EXPERT_SOURCE_FP8": "0",
+        "DG_MOE_FP8_WGRAD_REUSE_ROW_SCALES": "0",
+        "DG_MOE_FP8_SOURCE_REFETCH_PHASE": "early",
+        "DG_MOE_FP8_DW_METADATA_MODE": "0",
+        "DG_MOE_FP8_DW_SWIZZLE_M": "2",
+        "DG_MOE_FP8_VECTOR_ACTIVATION": "0",
+        "DG_MOE_FP8_DW_SCALE_M": "1",
+        "DG_MOE_FP8_RAW_GRADIENT_SOURCE_PREFETCH": "0",
+        "DG_MOE_FP8_RAW_GRADIENT_SOURCE_GRID": "0",
+        "DG_MOE_FP8_RAW_GRADIENT_TILE_ILP": "2",
+        "DG_MOE_FP8_RAW_GRADIENT_SCORE_ILP": "4",
+        "DG_MOE_FP8_RAW_GRADIENT_SCORE_THREADS": "256",
+        "DG_MOE_FP8_RAW_GRADIENT_GEMM_CTAS": "0",
+        "DG_MOE_FP8_RAW_GRADIENT_QUANT_CTAS": "0",
+        "DG_MOE_FP8_RAW_GRADIENT_QUANT_THREADS": "256",
+        "DG_MOE_FP8_RETURN_REMOTE_MODE": "0",
+        "DG_MOE_DEEPEP_ACTIVE_RECEIVE": "1",
+        "DG_MOE_FP8_SOURCE_SHARED_BASE": "0",
+        "DG_MOE_FP8_DW_FROM_ROW_CACHE": "0",
+        "DG_MOE_BF16_RETURN_NCP_MODE": "0"
+      }
+    },
+    "deepep/fp8": {
+      "communication": "BF16 dispatch/combine payloads",
+      "dw": "blockwise FP8 operands, F32 accumulation/output",
+      "required_deepep_scaleout_groups": 1,
+      "lut_profile": "fp8-qwen3.8-2.4t-a95b-stage3",
+      "environment": {
+        "PCCL_MNNVL_ENABLE": "1",
+        "NCCL_MNNVL_ENABLE": "1",
+        "DG_MOE_FP8_ACTIVE_QUANTIZATION": "1",
+        "DG_MOE_FP8_MN_MAJOR_SCALES": "1",
+        "DG_MOE_FP8_ASYNC_WEIGHTS": "0",
+        "DG_MOE_FP8_WEIGHT_QUANTIZER": "2",
+        "DG_MOE_FP8_TRANSPOSE_QUANTIZED_WEIGHTS": "1",
+        "DG_MOE_FP8_VECTOR_ROW_QUANT": "1",
+        "DG_MOE_FP8_FUSED_STAGE_QUANT": "0",
+        "DG_MOE_FP8_WEIGHT_TRANSPOSE_SWIZZLE": "1",
+        "DG_MOE_FP8_TILED_GRAD_QUANT": "0",
+        "DG_MOE_FP8_RETURN_STORE_BYTES": "16",
+        "DG_MOE_FP8_FUSED_WEIGHT_PREPARE": "1",
+        "DG_MOE_FP8_WGRAD": "1",
+        "DG_MOE_FP8_WGRAD_BLOCK_K": "128",
+        "DG_MOE_FP8_WGRAD_FUSED_PRODUCER": "0",
+        "DG_MOE_FP8_WGRAD_PREP_PIPELINE": "0",
+        "DG_MOE_FP8_WGRAD_STABLE_ROUTING": "1",
+        "DG_MOE_FP8_WGRAD_CONFIG": "192,256,128,48,64,4",
+        "DG_MOE_FP8_WGRAD_PACK_CTAS": "4",
+        "DG_JIT_FP8_DW_MMA_FLAGS": "1",
+        "DG_MOE_FP8_DW_ROUTE_BLOCK": "2048",
+        "DG_MOE_FP8_DW_NATIVE_PREFIX": "1",
+        "DG_MOE_FP8_WGRAD_NATIVE_BLOCKWISE": "1",
+        "DG_MOE_FP8_WGRAD_DW1_PIPELINE": "0",
+        "DG_MOE_FP8_EXPERT_SOURCE_FP8": "0",
+        "DG_MOE_FP8_WGRAD_REUSE_ROW_SCALES": "0",
+        "DG_MOE_FP8_SOURCE_REFETCH_PHASE": "early",
+        "DG_MOE_FP8_DW_METADATA_MODE": "1",
+        "DG_MOE_FP8_DW_SWIZZLE_M": "2",
+        "DG_MOE_FP8_VECTOR_ACTIVATION": "4",
+        "DG_MOE_FP8_DW_SCALE_M": "64",
+        "DG_MOE_FP8_RAW_GRADIENT_SOURCE_PREFETCH": "0",
+        "DG_MOE_FP8_RAW_GRADIENT_SOURCE_GRID": "0",
+        "DG_MOE_FP8_RAW_GRADIENT_TILE_ILP": "2",
+        "DG_MOE_FP8_RAW_GRADIENT_SCORE_ILP": "4",
+        "DG_MOE_FP8_RAW_GRADIENT_SCORE_THREADS": "256",
+        "DG_MOE_FP8_RAW_GRADIENT_GEMM_CTAS": "0",
+        "DG_MOE_FP8_RAW_GRADIENT_QUANT_CTAS": "0",
+        "DG_MOE_FP8_RAW_GRADIENT_QUANT_THREADS": "256",
+        "DG_MOE_FP8_RETURN_REMOTE_MODE": "0",
+        "DG_MOE_DEEPEP_ACTIVE_RECEIVE": "1",
+        "DG_MOE_BF16_RETURN_NCP_MODE": "0"
+      }
+    },
+    "megamoe/bf16": {
+      "communication": "BF16 dispatch/combine payloads",
+      "dw": "BF16 operands, F32 accumulation/output",
+      "environment": {
+        "PCCL_MNNVL_ENABLE": "0",
+        "NCCL_MNNVL_ENABLE": "0",
+        "DG_MOE_FP8_INPUT_THREADS": "256",
+        "DG_MOE_FP8_INPUT_CTAS": "8",
+        "DG_MOE_SKIP_MASKED_ROUTE_ZERO": "1",
+        "DG_MOE_WGRAD_FIRST_NONEMPTY": "1",
+        "DG_MOE_WGRAD_FIRST_OVERWRITE": "0",
+        "DG_MOE_FP8_EXPERT_SOURCE_CTAS": "624",
+        "DG_MOE_FP8_EXPERT_SOURCE_ROWS": "16",
+        "DG_BF16_WGRAD_TILE_CHUNK": "0",
+        "DG_MOE_FP8_TRANSPOSE_QUANTIZED_WEIGHTS": "0",
+        "DG_MOE_FP8_VECTOR_ROW_QUANT": "0",
+        "DG_MOE_FP8_FUSED_STAGE_QUANT": "0",
+        "DG_MOE_FP8_WEIGHT_TRANSPOSE_SWIZZLE": "0",
+        "DG_MOE_FP8_RETURN_STORE_BYTES": "4",
+        "DG_MOE_FP8_FUSED_WEIGHT_PREPARE": "0",
+        "DG_MOE_BF16_GRAD_PRODUCER": "1",
+        "DG_MOE_FP8_EXPERT_FWD_BATCH": "0",
+        "DG_MOE_FP8_EXPERT_GRAD_BATCH": "0",
+        "DG_MOE_FP8_WGRAD": "0",
+        "DG_MOE_FP8_WGRAD_NATIVE_BLOCKWISE": "0",
+        "DG_MOE_FP8_DW_SCALE_M": "1",
+        "DG_MOE_FP8_DW_METADATA_MODE": "0"
+      }
+    },
+    "megamoe/fp8": {
+      "communication": "FP8 source-side quantization/cache with tile-ready input consumption and fused BF16 returns",
+      "dw": "blockwise FP8 operands, F32 accumulation/output",
+      "lut_profile": "fp8-qwen3.8-2.4t-a95b-stage3",
+      "environment": {
+        "PCCL_MNNVL_ENABLE": "0",
+        "NCCL_MNNVL_ENABLE": "0",
+        "DG_MOE_FP8_ACTIVE_QUANTIZATION": "1",
+        "DG_MOE_FP8_MN_MAJOR_SCALES": "1",
+        "DG_MOE_FP8_ASYNC_WEIGHTS": "0",
+        "DG_MOE_FP8_WEIGHT_QUANTIZER": "2",
+        "DG_MOE_FP8_INPUT_CTAS": "8",
+        "DG_MOE_FP8_INPUT_THREADS": "256",
+        "DG_MOE_FP8_TRANSPOSE_QUANTIZED_WEIGHTS": "1",
+        "DG_MOE_FP8_VECTOR_ROW_QUANT": "1",
+        "DG_MOE_FP8_FUSED_STAGE_QUANT": "3",
+        "DG_MOE_FP8_WEIGHT_TRANSPOSE_SWIZZLE": "1",
+        "DG_MOE_FP8_TILED_GRAD_QUANT": "2",
+        "DG_MOE_FP8_RETURN_STORE_BYTES": "16",
+        "DG_MOE_FP8_FUSED_WEIGHT_PREPARE": "1",
+        "DG_JIT_FP8_TRAINING_MMA_FLAGS": "1",
+        "DG_MOE_BF16_GRAD_PRODUCER": "0",
+        "DG_MOE_SKIP_MASKED_ROUTE_ZERO": "1",
+        "DG_MOE_WGRAD_FIRST_OVERWRITE": "0",
+        "DG_MOE_WGRAD_FIRST_NONEMPTY": "1",
+        "DG_MOE_FP8_EXPERT_FWD_BATCH": "2",
+        "DG_MOE_FP8_EXPERT_GRAD_BATCH": "1",
+        "DG_MOE_FP8_EXPERT_SOURCE_CTAS": "390",
+        "DG_MOE_FP8_EXPERT_SOURCE_ROWS": "16",
+        "DG_MOE_WGRAD_AGGREGATE_WINDOWS": "1",
+        "DG_MOE_WGRAD_AGGREGATE_TILE": "0",
+        "DG_MOE_FP8_EXPERT_FWD_CTAS": "390",
+        "DG_MOE_FP8_EXPERT_GRAD_CTAS": "390",
+        "DG_MOE_FP8_EXPERT_SOURCE_ILP": "2",
+        "DG_MOE_FP8_WGRAD": "1",
+        "DG_MOE_FP8_WGRAD_PREP_PIPELINE": "0",
+        "DG_MOE_FP8_WGRAD_BLOCK_K": "128",
+        "DG_JIT_FP8_DW_MMA_FLAGS": "1",
+        "DG_MOE_FP8_WGRAD_FUSED_PRODUCER": "0",
+        "DG_MOE_FP8_WGRAD_CONFIG": "192,256,128,48,64,4",
+        "DG_MOE_FP8_WGRAD_PACK_CTAS": "8",
+        "DG_MOE_FP8_WGRAD_STABLE_ROUTING": "1",
+        "DG_MOE_FP8_DW_ROUTE_BLOCK": "2048",
+        "DG_MOE_FP8_DW_NATIVE_PREFIX": "1",
+        "DG_MOE_FP8_WGRAD_NATIVE_BLOCKWISE": "1",
+        "DG_MOE_FP8_WGRAD_DW1_PIPELINE": "0",
+        "DG_MOE_FP8_EXPERT_SOURCE_FP8": "1",
+        "DG_MOE_FP8_SOURCE_REFETCH_PHASE": "serial",
+        "DG_MOE_FP8_WGRAD_REUSE_ROW_SCALES": "0",
+        "DG_MOE_FP8_SOURCE_SHARED_BASE": "1",
+        "DG_MOE_FP8_DW_FROM_ROW_CACHE": "1",
+        "DG_MOE_FP8_DW_METADATA_MODE": "1",
+        "DG_MOE_FP8_DW_SWIZZLE_M": "2",
+        "DG_MOE_FP8_VECTOR_ACTIVATION": "4",
+        "DG_MOE_FP8_SOURCE_PREP_REUSE": "3",
+        "DG_MOE_FP8_INLINE_SOURCE": "1",
+        "DG_MOE_FP8_DW_SCALE_M": "64",
+        "DG_MOE_FP8_RAW_GRADIENT_SOURCE": "7",
+        "DG_MOE_FP8_RAW_GRADIENT_QUANT_PIPELINE": "1",
+        "DG_MOE_FP8_RAW_GRADIENT_TILE_PIPELINE": "1",
+        "DG_MOE_FP8_RAW_GRADIENT_SCORE_OVERLAP": "1",
+        "DG_MOE_FP8_RAW_GRADIENT_GEMM_CONFIG": "192,128,128,48,32,4",
+        "DG_MOE_FP8_RAW_GRADIENT_TILE_CTAS": "4",
+        "DG_MOE_FP8_RAW_GRADIENT_TILE_THREADS": "512",
+        "DG_MOE_FP8_RAW_GRADIENT_SOURCE_PREFETCH": "0",
+        "DG_MOE_FP8_RAW_GRADIENT_SOURCE_GRID": "39",
+        "DG_MOE_FP8_RAW_GRADIENT_TILE_ILP": "2",
+        "DG_MOE_FP8_RAW_GRADIENT_SCORE_ILP": "4",
+        "DG_MOE_FP8_RAW_GRADIENT_SCORE_THREADS": "256",
+        "DG_MOE_FP8_RAW_GRADIENT_GEMM_CTAS": "0",
+        "DG_MOE_FP8_RAW_GRADIENT_QUANT_CTAS": "0",
+        "DG_MOE_FP8_RAW_GRADIENT_QUANT_THREADS": "256",
+        "DG_MOE_FP8_RETURN_REMOTE_MODE": "2",
+        "DG_MOE_DEEPEP_ACTIVE_RECEIVE": "0",
+        "DG_MOE_FP8_INLINE_SOURCE_BULK": "1",
+        "DG_MOE_FP8_RAW_GRADIENT_SOURCE_BULK": "1",
+        "DG_MOE_BF16_RETURN_NCP_MODE": "0",
+        "DG_MOE_FP8_FWD_TILE_SOURCE_THREADS": "512"
+      }
+    }
+  },
+  "argument_defaults": {
+    "common": [
+      "--topk",
+      "10",
+      "--scope",
+      "step",
+      "--reuse-packed-dy",
+      "--expert-local-grad",
+      "--wgrad-overlap",
+      "none",
+      "--warmup",
+      "5",
+      "--iterations",
+      "20",
+      "--repeats",
+      "5",
+      "--fresh-weight-gradients"
+    ],
+    "models": {
+      "Qwen3.5-397B-A17B": [
+        "--hidden",
+        "4096",
+        "--intermediate",
+        "1024",
+        "--tokens",
+        "4096",
+        "--chunk-tokens",
+        "4096",
+        "--ring-rows",
+        "520192"
+      ],
+      "Qwen3.8-2.4T-A95B": [
+        "--hidden",
+        "8192",
+        "--intermediate",
+        "2048",
+        "--tokens",
+        "16384",
+        "--ring-rows",
+        "260096"
+      ]
+    },
+    "eps": {
+      "32": [
+        "--local-experts",
+        "16",
+        "--topology",
+        "same-physical-supernode-ep32"
+      ],
+      "64": [
+        "--local-experts",
+        "8",
+        "--topology",
+        "same-physical-supernode-ep64"
+      ]
+    },
+    "backends": {
+      "deepep": [
+        "--backend",
+        "elastic",
+        "--deepep-scaleup",
+        "--deepep-comm-sms",
+        "38",
+        "--fuse-activation-backward",
+        "--dispatch-producer",
+        "--producer-input-aiu",
+        "--producer-local-aiu",
+        "--block-m",
+        "128",
+        "--fuse-fc1-activation",
+        "--input-copy-ilp",
+        "8",
+        "--dgrad-compute-cus",
+        "0",
+        "--overlap-expert-dy"
+      ],
+      "megamoe": [
+        "--backend",
+        "megamoe"
+      ]
+    },
+    "precisions": {
+      "bf16": [
+        "--gate-up-layout",
+        "g8",
+        "--compute",
+        "bf16"
+      ],
+      "fp8": [
+        "--compute",
+        "fp8",
+        "--gate-up-layout",
+        "split"
+      ]
+    }
+  },
+  "lut_checksums": {
+    "fp8-qwen3.8-2.4t-a95b-stage3": {
+      "ZW-M890P_bf16_kgroupedcontiguous.lut": "6327fb210d997c8a3bc2f7ddc5370e022747b02c2f3f46cd129b67a4566151fa"
+    },
+    "fp8-qwen3.5-397b-a17b-stage3": {
+      "ZW-M890P_bf16_kgroupedcontiguous.lut": "46d102a86d200b20a7a995166671b989e9448d786e3740c061bd12287f23ef1b"
+    },
+    "bf16-stage3": {
+      "ZW-M890P_bf16_kgroupedcontiguous.lut": "65afbfdb4b1e20f577bd9c35a8be533a232ce9822e51d0f3515c7e1b24dcc472"
+    }
+  },
+  "recipes": [
+    {
+      "id": "qwen3.5-397b-a17b-ep32-fp8-megamoe",
+      "ep": 32,
+      "model": "Qwen3.5-397B-A17B",
+      "precision": "fp8",
+      "backend": "megamoe",
+      "environment": {
+        "DEEPEP_NUM_MAX_ICN_PEERS": "32",
+        "DG_MOE_FP8_FWD_TILE_SOURCE_PIPELINE": "0",
+        "DG_MOE_FP8_FWD_TILE_SOURCE_CTAS": "8",
+        "DG_MOE_FP8_FWD_TILE_GEMM_CTAS": "31",
+        "DG_MOE_FP8_INLINE_SOURCE_BULK_ILP": "8",
+        "DG_MOE_FP8_RAW_GRADIENT_BULK_ILP": "8",
+        "DG_MOE_ROUTE_CAPACITY": "520192"
+      },
+      "benchmark_arguments": [
+        "--block-m",
+        "128",
+        "--no-fuse-dispatch"
+      ],
+      "source_pipeline": {
+        "forward": "inline bulk ILP8",
+        "backward": "512 threads,39 source CTAs,native full compute grid",
+        "forward_source_ctas": 0,
+        "forward_compute_ctas": 39,
+        "dw_pack_ctas_per_cu": 8,
+        "forward_tile_pipeline": false,
+        "backward_source_threads": 512,
+        "backward_source_ctas": 39,
+        "backward_compute_ctas": 39,
+        "backward_bulk_ilp": 8,
+        "dw_pack_grid_ctas": 312,
+        "dw_gemm_grid_ctas": 39
+      }
+    },
+    {
+      "id": "qwen3.8-2.4t-a95b-ep32-fp8-megamoe",
+      "ep": 32,
+      "model": "Qwen3.8-2.4T-A95B",
+      "precision": "fp8",
+      "backend": "megamoe",
+      "environment": {
+        "DEEPEP_NUM_MAX_ICN_PEERS": "32",
+        "DG_MOE_FP8_FWD_TILE_SOURCE_PIPELINE": "1",
+        "DG_MOE_FP8_FWD_TILE_SOURCE_CTAS": "6",
+        "DG_MOE_FP8_FWD_TILE_GEMM_CTAS": "33",
+        "DG_MOE_FP8_INLINE_SOURCE_BULK_ILP": "4",
+        "DG_MOE_FP8_RAW_GRADIENT_BULK_ILP": "4",
+        "DG_MOE_FP8_RAW_GRADIENT_TILE_THREADS": "256",
+        "DG_MOE_ROUTE_CAPACITY": "260096"
+      },
+      "benchmark_arguments": [
+        "--chunk-tokens",
+        "16384",
+        "--block-m",
+        "128",
+        "--no-fuse-dispatch"
+      ],
+      "source_pipeline": {
+        "forward": "tile producer and capped GEMM",
+        "backward": "256 threads,39 source CTAs,native full compute grid",
+        "forward_source_ctas": 6,
+        "forward_compute_ctas": 33,
+        "dw_pack_ctas_per_cu": 8,
+        "forward_tile_pipeline": true,
+        "backward_source_threads": 256,
+        "backward_source_ctas": 39,
+        "backward_compute_ctas": 39,
+        "backward_bulk_ilp": 4,
+        "dw_pack_grid_ctas": 312,
+        "dw_gemm_grid_ctas": 39
+      }
+    },
+    {
+      "id": "qwen3.5-397b-a17b-ep64-fp8-megamoe",
+      "ep": 64,
+      "model": "Qwen3.5-397B-A17B",
+      "precision": "fp8",
+      "backend": "megamoe",
+      "environment": {
+        "DEEPEP_NUM_MAX_ICN_PEERS": "64",
+        "DG_MOE_FP8_FWD_TILE_SOURCE_PIPELINE": "0",
+        "DG_MOE_FP8_FWD_TILE_SOURCE_CTAS": "6",
+        "DG_MOE_FP8_FWD_TILE_GEMM_CTAS": "33",
+        "DG_MOE_FP8_INLINE_SOURCE_BULK_ILP": "8",
+        "DG_MOE_FP8_RAW_GRADIENT_BULK_ILP": "8",
+        "DG_MOE_ROUTE_CAPACITY": "520192"
+      },
+      "benchmark_arguments": [
+        "--block-m",
+        "128",
+        "--no-fuse-dispatch"
+      ],
+      "source_pipeline": {
+        "forward": "inline bulk ILP8",
+        "backward": "512 threads,39 source CTAs,native full compute grid",
+        "forward_source_ctas": 0,
+        "forward_compute_ctas": 39,
+        "dw_pack_ctas_per_cu": 8,
+        "forward_tile_pipeline": false,
+        "backward_source_threads": 512,
+        "backward_source_ctas": 39,
+        "backward_compute_ctas": 39,
+        "backward_bulk_ilp": 8,
+        "dw_pack_grid_ctas": 312,
+        "dw_gemm_grid_ctas": 39
+      }
+    },
+    {
+      "id": "qwen3.8-2.4t-a95b-ep64-fp8-megamoe",
+      "ep": 64,
+      "model": "Qwen3.8-2.4T-A95B",
+      "precision": "fp8",
+      "backend": "megamoe",
+      "environment": {
+        "DEEPEP_NUM_MAX_ICN_PEERS": "64",
+        "DG_MOE_FP8_FWD_TILE_SOURCE_PIPELINE": "1",
+        "DG_MOE_FP8_FWD_TILE_SOURCE_CTAS": "6",
+        "DG_MOE_FP8_FWD_TILE_GEMM_CTAS": "33",
+        "DG_MOE_FP8_INLINE_SOURCE_BULK_ILP": "4",
+        "DG_MOE_FP8_RAW_GRADIENT_BULK_ILP": "4",
+        "DG_MOE_ROUTE_CAPACITY": "260096"
+      },
+      "benchmark_arguments": [
+        "--chunk-tokens",
+        "16384",
+        "--block-m",
+        "128",
+        "--no-fuse-dispatch"
+      ],
+      "source_pipeline": {
+        "forward": "tile producer and capped GEMM",
+        "backward": "512 threads,39 source CTAs,native full compute grid",
+        "forward_source_ctas": 6,
+        "forward_compute_ctas": 33,
+        "dw_pack_ctas_per_cu": 8,
+        "forward_tile_pipeline": true,
+        "backward_source_threads": 512,
+        "backward_source_ctas": 39,
+        "backward_compute_ctas": 39,
+        "backward_bulk_ilp": 4,
+        "dw_pack_grid_ctas": 312,
+        "dw_gemm_grid_ctas": 39
+      }
+    },
+    {
+      "id": "qwen3.5-397b-a17b-ep32-bf16-megamoe",
+      "ep": 32,
+      "model": "Qwen3.5-397B-A17B",
+      "precision": "bf16",
+      "backend": "megamoe",
+      "environment": {
+        "DG_MOE_WGRAD_AGGREGATE_WINDOWS": "1",
+        "DG_MOE_WGRAD_AGGREGATE_TILE": "0",
+        "DG_MOE_FP8_EXPERT_FWD_CTAS": "624",
+        "DG_MOE_FP8_EXPERT_GRAD_CTAS": "624",
+        "DEEPEP_NUM_MAX_ICN_PEERS": "32",
+        "DG_MOE_FP8_EXPERT_SOURCE_ILP": "1",
+        "DG_MOE_BF16_RETURN_NCP_MODE": "2",
+        "DG_MOE_ROUTE_CAPACITY": "520192"
+      },
+      "benchmark_arguments": [
+        "--deepep-scaleup",
+        "--deepep-comm-sms",
+        "38",
+        "--fuse-activation-backward",
+        "--gemm-config",
+        "256",
+        "64",
+        "64",
+        "64",
+        "3",
+        "--dispatch-producer",
+        "--producer-input-aiu",
+        "--producer-local-aiu",
+        "--block-m",
+        "256",
+        "--fuse-fc1-activation",
+        "--input-copy-ilp",
+        "8",
+        "--dgrad-compute-cus",
+        "0",
+        "--fuse-dhidden-scores",
+        "--transpose-free-dgrad"
+      ],
+      "lut_profile": "fp8-qwen3.5-397b-a17b-stage3"
+    },
+    {
+      "id": "qwen3.8-2.4t-a95b-ep32-bf16-megamoe",
+      "ep": 32,
+      "model": "Qwen3.8-2.4T-A95B",
+      "precision": "bf16",
+      "backend": "megamoe",
+      "environment": {
+        "DG_MOE_WGRAD_AGGREGATE_WINDOWS": "1",
+        "DG_MOE_WGRAD_AGGREGATE_TILE": "0",
+        "DG_MOE_FP8_EXPERT_FWD_CTAS": "624",
+        "DG_MOE_FP8_EXPERT_GRAD_CTAS": "624",
+        "DEEPEP_NUM_MAX_ICN_PEERS": "32",
+        "DG_MOE_BF16_RETURN_NCP_MODE": "0",
+        "DG_MOE_ROUTE_CAPACITY": "260096",
+        "DG_MOE_BF16_SOURCE_OWNED_TILES": "3"
+      },
+      "benchmark_arguments": [
+        "--deepep-scaleup",
+        "--deepep-comm-sms",
+        "38",
+        "--chunk-tokens",
+        "16384",
+        "--fuse-activation-backward",
+        "--gemm-config",
+        "256",
+        "64",
+        "64",
+        "64",
+        "3",
+        "--dispatch-producer",
+        "--producer-input-aiu",
+        "--producer-local-aiu",
+        "--block-m",
+        "256",
+        "--fuse-fc1-activation",
+        "--input-copy-ilp",
+        "8",
+        "--dgrad-compute-cus",
+        "0",
+        "--fuse-dhidden-scores",
+        "--transpose-free-dgrad"
+      ],
+      "lut_profile": "bf16-stage3"
+    },
+    {
+      "id": "qwen3.5-397b-a17b-ep64-bf16-megamoe",
+      "ep": 64,
+      "model": "Qwen3.5-397B-A17B",
+      "precision": "bf16",
+      "backend": "megamoe",
+      "environment": {
+        "DEEPEP_NUM_MAX_ICN_PEERS": "64",
+        "DG_MOE_FP8_EXPERT_SOURCE_ILP": "1",
+        "DG_MOE_BF16_RETURN_NCP_MODE": "2",
+        "DG_MOE_ROUTE_CAPACITY": "520192"
+      },
+      "benchmark_arguments": [
+        "--deepep-scaleup",
+        "--deepep-comm-sms",
+        "38",
+        "--fuse-activation-backward",
+        "--gemm-config",
+        "256",
+        "64",
+        "64",
+        "64",
+        "3",
+        "--dispatch-producer",
+        "--producer-input-aiu",
+        "--producer-local-aiu",
+        "--block-m",
+        "256",
+        "--fuse-fc1-activation",
+        "--input-copy-ilp",
+        "8",
+        "--dgrad-compute-cus",
+        "0",
+        "--fuse-dhidden-scores",
+        "--transpose-free-dgrad"
+      ],
+      "lut_profile": "fp8-qwen3.5-397b-a17b-stage3"
+    },
+    {
+      "id": "qwen3.8-2.4t-a95b-ep64-bf16-megamoe",
+      "ep": 64,
+      "model": "Qwen3.8-2.4T-A95B",
+      "precision": "bf16",
+      "backend": "megamoe",
+      "environment": {
+        "DEEPEP_NUM_MAX_ICN_PEERS": "64",
+        "DG_MOE_WGRAD_AGGREGATE_WINDOWS": "1",
+        "DG_MOE_WGRAD_AGGREGATE_TILE": "0",
+        "DG_MOE_FP8_EXPERT_FWD_CTAS": "624",
+        "DG_MOE_FP8_EXPERT_GRAD_CTAS": "624",
+        "PYTORCH_ALLOC_CONF": "expandable_segments:True,max_split_size_mb:256",
+        "DG_MOE_FP8_EXPERT_SOURCE_ILP": "1",
+        "DG_MOE_BF16_RETURN_NCP_MODE": "0",
+        "DG_MOE_ROUTE_CAPACITY": "260096",
+        "DG_MOE_BF16_SOURCE_OWNED_TILES": "3"
+      },
+      "benchmark_arguments": [
+        "--deepep-scaleup",
+        "--deepep-comm-sms",
+        "38",
+        "--chunk-tokens",
+        "16384",
+        "--fuse-activation-backward",
+        "--gemm-config",
+        "256",
+        "64",
+        "64",
+        "64",
+        "3",
+        "--dispatch-producer",
+        "--producer-input-aiu",
+        "--producer-local-aiu",
+        "--block-m",
+        "256",
+        "--fuse-fc1-activation",
+        "--input-copy-ilp",
+        "8",
+        "--dgrad-compute-cus",
+        "0",
+        "--fuse-dhidden-scores",
+        "--transpose-free-dgrad"
+      ],
+      "lut_profile": "fp8-qwen3.8-2.4t-a95b-stage3"
+    },
+    {
+      "id": "qwen3.5-397b-a17b-ep32-bf16-deepep",
+      "ep": 32,
+      "model": "Qwen3.5-397B-A17B",
+      "precision": "bf16",
+      "backend": "deepep",
+      "environment": {
+        "DEEPEP_NUM_MAX_ICN_PEERS": "32"
+      },
+      "benchmark_arguments": []
+    },
+    {
+      "id": "qwen3.8-2.4t-a95b-ep32-bf16-deepep",
+      "ep": 32,
+      "model": "Qwen3.8-2.4T-A95B",
+      "precision": "bf16",
+      "backend": "deepep",
+      "environment": {
+        "DEEPEP_NUM_MAX_ICN_PEERS": "32"
+      },
+      "benchmark_arguments": [
+        "--chunk-tokens",
+        "5504"
+      ]
+    },
+    {
+      "id": "qwen3.5-397b-a17b-ep64-bf16-deepep",
+      "ep": 64,
+      "model": "Qwen3.5-397B-A17B",
+      "precision": "bf16",
+      "backend": "deepep",
+      "environment": {
+        "DEEPEP_NUM_MAX_ICN_PEERS": "64"
+      },
+      "benchmark_arguments": []
+    },
+    {
+      "id": "qwen3.8-2.4t-a95b-ep64-bf16-deepep",
+      "ep": 64,
+      "model": "Qwen3.8-2.4T-A95B",
+      "precision": "bf16",
+      "backend": "deepep",
+      "environment": {
+        "DEEPEP_NUM_MAX_ICN_PEERS": "64"
+      },
+      "benchmark_arguments": [
+        "--chunk-tokens",
+        "3968"
+      ]
+    },
+    {
+      "id": "qwen3.5-397b-a17b-ep32-fp8-deepep",
+      "ep": 32,
+      "model": "Qwen3.5-397B-A17B",
+      "precision": "fp8",
+      "backend": "deepep",
+      "environment": {
+        "DG_MOE_FP8_SOURCE_DISPATCH": "1",
+        "DEEPEP_NUM_MAX_ICN_PEERS": "32"
+      },
+      "benchmark_arguments": [],
+      "communication": "Source-quantized FP8 forward dispatch; BF16 backward redispatch and combines"
+    },
+    {
+      "id": "qwen3.8-2.4t-a95b-ep32-fp8-deepep",
+      "ep": 32,
+      "model": "Qwen3.8-2.4T-A95B",
+      "precision": "fp8",
+      "backend": "deepep",
+      "environment": {
+        "DG_MOE_FP8_SOURCE_DISPATCH": "1",
+        "DEEPEP_NUM_MAX_ICN_PEERS": "32"
+      },
+      "benchmark_arguments": [
+        "--chunk-tokens",
+        "5504"
+      ],
+      "communication": "Source-quantized FP8 forward dispatch; BF16 backward redispatch and combines"
+    },
+    {
+      "id": "qwen3.5-397b-a17b-ep64-fp8-deepep",
+      "ep": 64,
+      "model": "Qwen3.5-397B-A17B",
+      "precision": "fp8",
+      "backend": "deepep",
+      "environment": {
+        "DG_MOE_FP8_SOURCE_DISPATCH": "0",
+        "DEEPEP_NUM_MAX_ICN_PEERS": "64"
+      },
+      "benchmark_arguments": [],
+      "communication": "BF16 dispatch/combine; receiver-side row-FP8 quantization"
+    },
+    {
+      "id": "qwen3.8-2.4t-a95b-ep64-fp8-deepep",
+      "ep": 64,
+      "model": "Qwen3.8-2.4T-A95B",
+      "precision": "fp8",
+      "backend": "deepep",
+      "environment": {
+        "DG_MOE_FP8_SOURCE_DISPATCH": "0",
+        "DEEPEP_NUM_MAX_ICN_PEERS": "64"
+      },
+      "benchmark_arguments": [
+        "--chunk-tokens",
+        "3968"
+      ],
+      "communication": "BF16 dispatch/combine; receiver-side row-FP8 quantization"
+    },
+    {
+      "id": "qwen3.5-397b-a17b-ep32-bf16-deepep-compact",
+      "ep": 32,
+      "model": "Qwen3.5-397B-A17B",
+      "precision": "bf16",
+      "backend": "deepep",
+      "environment": {
+        "DEEPEP_NUM_MAX_ICN_PEERS": "32"
+      },
+      "benchmark_arguments": [
+        "--deepep-layout",
+        "compact"
+      ],
+      "layout": "compact",
+      "reference_windowed_recipe": "qwen3.5-397b-a17b-ep32-bf16-deepep",
+      "capacity": {
+        "policy": "representative_route_histogram_with_device_overflow_checks",
+        "headroom": 1.25,
+        "planning_in_steady_state_timing": false,
+        "routing_rebuilt_each_forward": true,
+        "overflow": "error_then_replan_and_recapture_or_use_windowed"
+      }
+    },
+    {
+      "id": "qwen3.8-2.4t-a95b-ep32-bf16-deepep-compact",
+      "ep": 32,
+      "model": "Qwen3.8-2.4T-A95B",
+      "precision": "bf16",
+      "backend": "deepep",
+      "environment": {
+        "DEEPEP_NUM_MAX_ICN_PEERS": "32"
+      },
+      "benchmark_arguments": [
+        "--chunk-tokens",
+        "5504",
+        "--deepep-layout",
+        "compact"
+      ],
+      "layout": "compact",
+      "reference_windowed_recipe": "qwen3.8-2.4t-a95b-ep32-bf16-deepep",
+      "capacity": {
+        "policy": "representative_route_histogram_with_device_overflow_checks",
+        "headroom": 1.25,
+        "planning_in_steady_state_timing": false,
+        "routing_rebuilt_each_forward": true,
+        "overflow": "error_then_replan_and_recapture_or_use_windowed"
+      }
+    },
+    {
+      "id": "qwen3.5-397b-a17b-ep64-bf16-deepep-compact",
+      "ep": 64,
+      "model": "Qwen3.5-397B-A17B",
+      "precision": "bf16",
+      "backend": "deepep",
+      "environment": {
+        "DEEPEP_NUM_MAX_ICN_PEERS": "64"
+      },
+      "benchmark_arguments": [
+        "--deepep-layout",
+        "compact"
+      ],
+      "layout": "compact",
+      "reference_windowed_recipe": "qwen3.5-397b-a17b-ep64-bf16-deepep",
+      "capacity": {
+        "policy": "representative_route_histogram_with_device_overflow_checks",
+        "headroom": 1.25,
+        "planning_in_steady_state_timing": false,
+        "routing_rebuilt_each_forward": true,
+        "overflow": "error_then_replan_and_recapture_or_use_windowed"
+      }
+    },
+    {
+      "id": "qwen3.8-2.4t-a95b-ep64-bf16-deepep-compact",
+      "ep": 64,
+      "model": "Qwen3.8-2.4T-A95B",
+      "precision": "bf16",
+      "backend": "deepep",
+      "environment": {
+        "DEEPEP_NUM_MAX_ICN_PEERS": "64"
+      },
+      "benchmark_arguments": [
+        "--chunk-tokens",
+        "3968",
+        "--deepep-layout",
+        "compact"
+      ],
+      "layout": "compact",
+      "reference_windowed_recipe": "qwen3.8-2.4t-a95b-ep64-bf16-deepep",
+      "capacity": {
+        "policy": "representative_route_histogram_with_device_overflow_checks",
+        "headroom": 1.25,
+        "planning_in_steady_state_timing": false,
+        "routing_rebuilt_each_forward": true,
+        "overflow": "error_then_replan_and_recapture_or_use_windowed"
+      }
+    },
+    {
+      "id": "qwen3.5-397b-a17b-ep32-fp8-deepep-compact",
+      "ep": 32,
+      "model": "Qwen3.5-397B-A17B",
+      "precision": "fp8",
+      "backend": "deepep",
+      "environment": {
+        "DG_MOE_FP8_SOURCE_DISPATCH": "1",
+        "DEEPEP_NUM_MAX_ICN_PEERS": "32"
+      },
+      "benchmark_arguments": [
+        "--deepep-layout",
+        "compact"
+      ],
+      "layout": "compact",
+      "reference_windowed_recipe": "qwen3.5-397b-a17b-ep32-fp8-deepep",
+      "capacity": {
+        "policy": "representative_route_histogram_with_device_overflow_checks",
+        "headroom": 1.25,
+        "planning_in_steady_state_timing": false,
+        "routing_rebuilt_each_forward": true,
+        "overflow": "error_then_replan_and_recapture_or_use_windowed"
+      },
+      "communication": "Source-quantized FP8 forward dispatch; BF16 backward redispatch and combines"
+    },
+    {
+      "id": "qwen3.8-2.4t-a95b-ep32-fp8-deepep-compact",
+      "ep": 32,
+      "model": "Qwen3.8-2.4T-A95B",
+      "precision": "fp8",
+      "backend": "deepep",
+      "environment": {
+        "DG_MOE_FP8_SOURCE_DISPATCH": "1",
+        "DEEPEP_NUM_MAX_ICN_PEERS": "32"
+      },
+      "benchmark_arguments": [
+        "--chunk-tokens",
+        "5504",
+        "--deepep-layout",
+        "compact"
+      ],
+      "layout": "compact",
+      "reference_windowed_recipe": "qwen3.8-2.4t-a95b-ep32-fp8-deepep",
+      "capacity": {
+        "policy": "representative_route_histogram_with_device_overflow_checks",
+        "headroom": 1.25,
+        "planning_in_steady_state_timing": false,
+        "routing_rebuilt_each_forward": true,
+        "overflow": "error_then_replan_and_recapture_or_use_windowed"
+      },
+      "communication": "Source-quantized FP8 forward dispatch; BF16 backward redispatch and combines"
+    },
+    {
+      "id": "qwen3.5-397b-a17b-ep64-fp8-deepep-compact",
+      "ep": 64,
+      "model": "Qwen3.5-397B-A17B",
+      "precision": "fp8",
+      "backend": "deepep",
+      "environment": {
+        "DG_MOE_FP8_SOURCE_DISPATCH": "0",
+        "DEEPEP_NUM_MAX_ICN_PEERS": "64"
+      },
+      "benchmark_arguments": [
+        "--deepep-layout",
+        "compact"
+      ],
+      "layout": "compact",
+      "reference_windowed_recipe": "qwen3.5-397b-a17b-ep64-fp8-deepep",
+      "capacity": {
+        "policy": "representative_route_histogram_with_device_overflow_checks",
+        "headroom": 1.25,
+        "planning_in_steady_state_timing": false,
+        "routing_rebuilt_each_forward": true,
+        "overflow": "error_then_replan_and_recapture_or_use_windowed"
+      },
+      "communication": "BF16 dispatch/combine; receiver-side row-FP8 quantization"
+    },
+    {
+      "id": "qwen3.8-2.4t-a95b-ep64-fp8-deepep-compact",
+      "ep": 64,
+      "model": "Qwen3.8-2.4T-A95B",
+      "precision": "fp8",
+      "backend": "deepep",
+      "environment": {
+        "DG_MOE_FP8_SOURCE_DISPATCH": "0",
+        "DEEPEP_NUM_MAX_ICN_PEERS": "64"
+      },
+      "benchmark_arguments": [
+        "--chunk-tokens",
+        "3968",
+        "--deepep-layout",
+        "compact"
+      ],
+      "layout": "compact",
+      "reference_windowed_recipe": "qwen3.8-2.4t-a95b-ep64-fp8-deepep",
+      "capacity": {
+        "policy": "representative_route_histogram_with_device_overflow_checks",
+        "headroom": 1.25,
+        "planning_in_steady_state_timing": false,
+        "routing_rebuilt_each_forward": true,
+        "overflow": "error_then_replan_and_recapture_or_use_windowed"
+      },
+      "communication": "BF16 dispatch/combine; receiver-side row-FP8 quantization"
+    }
+  ]
+}

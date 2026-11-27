@@ -4,6 +4,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <type_traits>
 #include <acblasLt.h>
 #include <hggc_ad.h>
 #include <hggc_runtime_api.h>
@@ -18,6 +19,19 @@
 #define PYTORCH_SUPPORTS_GET_ACBLASLT_HANDLE (TORCH_VERSION_MAJOR > 2 or (TORCH_VERSION_MAJOR == 2 and TORCH_VERSION_MINOR >= 3))
 
 namespace deep_gemm {
+
+// CUDA-compatible Torch may expose a wrapper handle with a distinct native
+// type. Keep the owned native acBLASLt handle; never reinterpret that wrapper.
+template <class Getter>
+static acblasLtHandle_t checked_native_torch_acblaslt_handle(Getter getter) {
+    if constexpr (std::is_convertible_v<std::invoke_result_t<Getter>, acblasLtHandle_t>) {
+        return getter();
+    } else {
+        DG_HOST_ASSERT(false && "Torch BLASLt wrapper is not a native acBLASLt handle");
+        return nullptr;
+    }
+}
+
 
 class DeviceRuntime {
     int tc_util = 0;
@@ -97,6 +111,12 @@ public:
         // By default, we don't use it,
         // as `at::cuda::getCurrentCUDABlasLtHandle` has large CPU overhead with some PyTorch versions
         use_pytorch_managed_acblaslt_handle = get_env<int>("DG_USE_PYTORCH_ACBLASLT_HANDLE", 0) > 0;
+#if PYTORCH_SUPPORTS_GET_ACBLASLT_HANDLE
+        constexpr bool native_torch_handle = std::is_convertible_v<
+            decltype(at::cuda::getCurrentCUDABlasLtHandle()), acblasLtHandle_t>;
+        DG_HOST_ASSERT((!use_pytorch_managed_acblaslt_handle || native_torch_handle)
+                       && "Use the owned native acBLASLt handle with CUDA-compatible Torch");
+#endif
 #if not PYTORCH_SUPPORTS_GET_ACBLASLT_HANDLE
         DG_HOST_ASSERT(not use_pytorch_managed_acblaslt_handle and "PyTorch does not support to get acBLASLt handle");
 #endif
@@ -121,7 +141,7 @@ public:
     acblasLtHandle_t get_acblaslt_handle() const {
 #if PYTORCH_SUPPORTS_GET_ACBLASLT_HANDLE
         if (use_pytorch_managed_acblaslt_handle)
-            return at::cuda::getCurrentCUDABlasLtHandle();
+            return checked_native_torch_acblaslt_handle([] { return at::cuda::getCurrentCUDABlasLtHandle(); });
 #endif
         return acblaslt_handle;
     }
