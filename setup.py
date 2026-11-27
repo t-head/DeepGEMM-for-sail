@@ -59,7 +59,11 @@ build_include_dirs = [path for path in (
     current_dir + '/third-party/actlize_v1.0.0/include/cute',
 ]
 
-build_libraries = ['hggc', 'hggcrt1', 'hgrtc', 'acblasLt']
+# `acblas` is listed explicitly because it provides `acblasGetStatusString`, which
+# `DG_ACBLASLT_CHECK` calls. SDK 2.2.x's `libacblasLt.so` carries a DT_NEEDED on
+# `libacblas.so`, so the symbol resolves transitively there; SDK 2.1.x's does not,
+# and the extension then fails to load with an undefined symbol.
+build_libraries = ['hggc', 'hggcrt1', 'hgrtc', 'acblasLt', 'acblas']
 # Search real libraries before the driver stubs used only at link time.
 build_library_dirs = [path for path in (
     os.path.join(ppu_sdk, 'lib'),

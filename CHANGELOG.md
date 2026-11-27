@@ -19,6 +19,11 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
   `c10::cuda` and the native HGGC runtime. `setup.py` adds the SDK's
   `CUDA_SDK/include` after the native include directories, as `c10` needs
   `cuda_runtime_api.h` and the native headers must keep precedence.
+- **Undefined `acblasGetStatusString` on PPU SDK 2.1.x**: the extension now
+  links `libacblas` explicitly. `DG_ACBLASLT_CHECK` calls that symbol, which
+  lives in `libacblas.so`. SDK 2.2.x's `libacblasLt.so` carries a DT_NEEDED on
+  `libacblas.so` so it resolved transitively, but SDK 2.1.x's does not, and
+  `import deep_gemm` failed with an undefined symbol.
 
 ### Changed
 
