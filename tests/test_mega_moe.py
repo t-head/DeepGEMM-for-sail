@@ -1078,6 +1078,13 @@ def test_mega_moe_physical_experts(case, mega_moe_group):
                   replicas=True, edge_cases=True, verbose=False)
 
 
+def test_mega_moe_smoke_int8_wide_intermediate(mega_moe_group):
+    case = MegaMoECase("int8_wide_intermediate", 2048, 4096, 2, 2, 256, tokens=(256, 1, 255),
+                       worlds=(1, 2), precision="int8_channelwise", routing="random")
+    case.require_world()
+    _run_mega_moe(case, mega_moe_group, verbose=False)
+
+
 def test_mega_moe_smoke_grouped_workspace(mega_moe_group):
     """Exercise the grouped scheduler's buffer-owned scratch at 128+ experts."""
     if dist.get_world_size() > 2:
