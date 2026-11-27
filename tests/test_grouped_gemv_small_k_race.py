@@ -7,14 +7,56 @@ import torch
 import deep_gemm as dg
 
 
-@pytest.mark.parametrize('kind', ['bf16', 'int8'])
-@pytest.mark.parametrize('k', [80, 128, 160, 256])
-def test_grouped_gemv_small_k_slot_reuse(kind, k):
+def _require_810e():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0):
         pytest.skip('requires the 810E (SM80) small-K GEMV dispatch')
 
+
+def _check_calls(api, a, b, ids, expected, iterations, label):
+    assert iterations > 0, 'stress iterations must be positive'
+    # Retain each output until checked: a later call must not hide corruption.
+    chunk_size = min(iterations, 32)
+    outputs = torch.empty((chunk_size, *expected.shape), dtype=torch.bfloat16, device='cuda')
+    api(a, b, outputs[0], ids)
+    if os.getenv('HGGC_WARM_UP') or dg.get_compile_mode() == 1:
+        return
+    torch.cuda.synchronize()
+    graph = None
+    if os.getenv('DG_GEMV_RACE_GRAPH') == '1':
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for i in range(chunk_size):
+                api(a, b, outputs[i], ids)
+        torch.cuda.synchronize()
+
+    wrong_calls = 0
+    first_error = None
+    for start in range(0, iterations, chunk_size):
+        count = min(chunk_size, iterations - start)
+        outputs[:count].fill_(-123)
+        if graph is None:
+            for i in range(count):
+                api(a, b, outputs[i], ids)
+        else:
+            graph.replay()
+        different = outputs[:count] != expected.unsqueeze(0)
+        bad_calls = different.flatten(1).any(1)
+        wrong_calls += int(bad_calls.sum().item())
+        if first_error is None and bad_calls.any().item():
+            call, row, col = different.nonzero()[0].tolist()
+            first_error = (start + call, row, col, outputs[call, row, col].item(),
+                           expected[row, col].item())
+    mode = 'graph' if graph is not None else 'eager'
+    print(f'{label} {mode}: wrong_calls={wrong_calls}/{iterations}, first_error={first_error}', flush=True)
+    assert wrong_calls == 0, f'shared-slot corruption: {wrong_calls} calls, first={first_error}'
+
+
+@pytest.mark.parametrize('kind', ['bf16', 'int8'])
+@pytest.mark.parametrize('k', [80, 128, 160, 256])
+def test_grouped_gemv_small_k_slot_reuse(kind, k):
+    _require_810e()
+
     iterations = int(os.getenv('DG_GEMV_RACE_ITERS', '32768'))
-    assert iterations > 0, 'DG_GEMV_RACE_ITERS must be positive'
     groups, m, n = 512, 4 * 10, 2560
     dtype = torch.bfloat16 if kind == 'bf16' else torch.int8
     a = torch.ones((m, k), dtype=dtype, device='cuda')
@@ -32,28 +74,21 @@ def test_grouped_gemv_small_k_slot_reuse(kind, k):
         a = a, torch.ones((m, 1), device='cuda')
         b = b, torch.ones((groups, n, 1), device='cuda')
 
-    # Retain every call's output until checked, so a later correct call
-    # cannot overwrite evidence of a transient failure.
-    chunk_size = min(iterations, 32)
-    outputs = torch.empty((chunk_size, m, n), dtype=torch.bfloat16, device='cuda')
-    api(a, b, outputs[0], ids)
-    if os.getenv('HGGC_WARM_UP') or dg.get_compile_mode() == 1:
-        return
-    torch.cuda.synchronize()
+    _check_calls(api, a, b, ids, expected, iterations, f'{kind} K={k}')
 
-    wrong_calls = 0
-    first_error = None
-    for start in range(0, iterations, chunk_size):
-        count = min(chunk_size, iterations - start)
-        outputs[:count].fill_(-123)
-        for i in range(count):
-            api(a, b, outputs[i], ids)
-        different = outputs[:count] != expected.unsqueeze(0)
-        bad_calls = different.flatten(1).any(1)
-        wrong_calls += int(bad_calls.sum().item())
-        if first_error is None and bad_calls.any().item():
-            call, row, col = different.nonzero()[0].tolist()
-            first_error = (start + call, row, col, outputs[call, row, col].item(),
-                           expected[row, col].item())
-    print(f'{kind} K={k}: wrong_calls={wrong_calls}/{iterations}, first_error={first_error}', flush=True)
-    assert wrong_calls == 0, f'shared-slot corruption: {wrong_calls} calls, first={first_error}'
+
+@pytest.mark.parametrize('k', [144, 160, 192, 240, 256])
+def test_grouped_bf16_small_k_dyadic(k):
+    _require_810e()
+    # Every product and FP32 sum is exact; this checks all columns with signed,
+    # nonuniform values without depending on a particular reduction order.
+    rng = torch.Generator().manual_seed(89481340 + k)
+    groups, m, n = 64, 17, 128
+    a_cpu = torch.randint(-4, 5, (m, k), generator=rng).bfloat16() / 8
+    b_cpu = torch.randint(-4, 5, (groups, n, k), generator=rng).bfloat16() / 8
+    ids_cpu = (torch.arange(m, dtype=torch.int32) * 13 + 7) % groups
+    expected = torch.stack([a_cpu[i].float() @ b_cpu[int(ids_cpu[i])].float().T
+                            for i in range(m)]).bfloat16().cuda()
+    iterations = int(os.getenv('DG_GEMV_RACE_RANDOM_ITERS', '1024'))
+    _check_calls(dg.m_grouped_bf16_gemm_nt_nopad, a_cpu.cuda(), b_cpu.cuda(),
+                 ids_cpu.cuda(), expected, iterations, f'bf16 dyadic K={k}')

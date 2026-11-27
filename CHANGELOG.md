@@ -8,10 +8,12 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Fixed
 
-- **810E small-K grouped GEMV slot reuse**: fence shared-memory reads before
-  refilling the same async-copy slot in the BF16/INT8 nopad kernel, preventing
-  intermittent missing K contributions (Aone 89481340). Add partial-lane
-  stress regressions to the 810E check-in suite.
+- **810E small-K grouped GEMV slot reuse**: load B directly into registers
+  for 810E BF16 small-K tiles with 32 K lanes, avoiding shared-slot reuse
+  and its fence overhead.
+  Other BF16/INT8 variants fence shared reads before async-copy refill,
+  preventing intermittent missing K contributions (Aone 89481340).
+  Add partial-lane, Graph replay and signed-input stress regressions.
 
 ### Added
 

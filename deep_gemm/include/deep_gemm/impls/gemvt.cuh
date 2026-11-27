@@ -90,10 +90,6 @@ __device__ void batched_gemvt_kernel_small_k_impl(const GemvtArgs args) {
   constexpr int alignmentMax = alignmentB;
   static_assert(alignmentB >= alignmentA, "only support alignmentB >= alignmentA");
 
-  // for mutlistage B
-  constexpr int TileM = ThreadPerN * alignmentB;
-  __shared__ src_type shared[Stages][NLoopStep][TileM];
-
   int offs_token = pid_m;
   int off_expert = *(args.expert_ids_ptr + pid_m);
 
@@ -112,7 +108,6 @@ __device__ void batched_gemvt_kernel_small_k_impl(const GemvtArgs args) {
   }
 
   load_atype vreg_a;
-  load_btype vreg_b[NPerThread];
   acc_type accum[NPerThread];
 
   HGGC_PRAGMA_UNROLL
@@ -129,44 +124,51 @@ __device__ void batched_gemvt_kernel_small_k_impl(const GemvtArgs args) {
   import_data<src_type, load_atype, 1>(&vreg_a, a_ptr_start, alignmentA);
 
 
-  // load B to shared
-  for (int stage = 0; stage < Stages; stage++) {
-    tix::LdgSts128(&(shared[stage][tid_n][tid_k * alignmentB]), b_ptr_start + stage * NLoopStep * args.stride_bn);
-    tix::LdgStsGroupCommit();
-  }
-  tix::LdgStsGroupWait<Stages - 1>();
-
-  HGGC_PRAGMA_UNROLL
-  for (int nloop = 0; nloop < NPerThread; nloop++) {
-    // load B to vreg
-    int current_stage = nloop % Stages;
-    import_data<src_type, load_btype, 1>(vreg_b + nloop,
-        &(shared[current_stage][tid_n][tid_k * alignmentB]), alignmentB);
-    // import_data<src_type, load_btype, 1>(vreg_b + nloop,
-    //   b_ptr_start + nloop * NLoopStep * args.stride_bn, alignmentB);
-
-    // auto current_b_ptr = reinterpret_cast<src_type*>(vreg_b + nloop);
-    // if (current_b_ptr[0] != shared[current_stage][tid_n][tid_k * alignmentB]) {
-    //   printf("tid = %d, nloop = %d, shared[%d][%d][%d] = %.4f, current_b[0] = %.4f\n",
-    //     tid, nloop, current_stage, tid_n, tid_k * alignmentB,
-    //     float(shared[current_stage][tid_n][tid_k * alignmentB]),
-    //     (float)current_b_ptr[0]);
-    // }
-    dot_op<src_type, acc_type, alignmentMax>((src_type *)&vreg_a,
-                                             (src_type *)(vreg_b + nloop),
-                                             accum[nloop]);
-    // Complete this lane's shared reads before cp.async refills the same slot.
-    // Some lanes return above, so a collective warp/CTA barrier is unsafe here.
-    __threadfence_block();
-    tix::LdgStsGroupWait<Stages - 2>();
-
-    int load_next_n = nloop + Stages;
-    if (nloop < NPerThread - 2) {
-      // load next B to shared
-      int next_stage = load_next_n % Stages;
-      auto b_ptr_next = b_ptr_start + load_next_n * NLoopStep * args.stride_bn;
-      tix::LdgSts128(&(shared[next_stage][tid_n][tid_k * alignmentB]), b_ptr_next, load_next_n < NPerThread);
+#if __HGGC_ARCH__ == 100
+  constexpr bool kUseDirectB = sizeof(src_type) == 2 && ThreadPerN == 32;
+#else
+  constexpr bool kUseDirectB = false;
+#endif
+  if constexpr (kUseDirectB) {
+    // The wide BF16 K tile loads immutable B directly into registers. This
+    // removes shared-slot reuse and the per-column fence from this path.
+    HGGC_PRAGMA_UNROLL
+    for (int nloop = 0; nloop < NPerThread; nloop++) {
+      load_btype b;
+      import_data<src_type, load_btype, 1>(&b,
+          b_ptr_start + nloop * NLoopStep * args.stride_bn, alignmentB);
+      dot_op<src_type, acc_type, alignmentMax>((src_type *)&vreg_a,
+                                              (src_type *)&b, accum[nloop]);
+    }
+  } else {
+    constexpr int TileM = ThreadPerN * alignmentB;
+    load_btype vreg_b[NPerThread];
+    __shared__ src_type shared[Stages][NLoopStep][TileM];
+    for (int stage = 0; stage < Stages; stage++) {
+      tix::LdgSts128(&(shared[stage][tid_n][tid_k * alignmentB]), b_ptr_start + stage * NLoopStep * args.stride_bn);
       tix::LdgStsGroupCommit();
+    }
+    tix::LdgStsGroupWait<Stages - 1>();
+
+    HGGC_PRAGMA_UNROLL
+    for (int nloop = 0; nloop < NPerThread; nloop++) {
+      int current_stage = nloop % Stages;
+      import_data<src_type, load_btype, 1>(vreg_b + nloop,
+          &(shared[current_stage][tid_n][tid_k * alignmentB]), alignmentB);
+      dot_op<src_type, acc_type, alignmentMax>((src_type *)&vreg_a,
+                                               (src_type *)(vreg_b + nloop),
+                                               accum[nloop]);
+      // Some lanes return above; fence each lane's reads before slot reuse.
+      __threadfence_block();
+      tix::LdgStsGroupWait<Stages - 2>();
+
+      int load_next_n = nloop + Stages;
+      if (nloop < NPerThread - 2) {
+        int next_stage = load_next_n % Stages;
+        auto b_ptr_next = b_ptr_start + load_next_n * NLoopStep * args.stride_bn;
+        tix::LdgSts128(&(shared[next_stage][tid_n][tid_k * alignmentB]), b_ptr_next, load_next_n < NPerThread);
+        tix::LdgStsGroupCommit();
+      }
     }
   }
 

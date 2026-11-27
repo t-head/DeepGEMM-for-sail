@@ -27,6 +27,9 @@ The 810E suite also runs `test_grouped_gemv_small_k_race.py`: BF16/INT8
 grouped nopad, 512 experts, 40 rows, N=2560, and K=80/128/160/256.
 Each case checks all outputs from 32768 calls, including partial-lane K tiles.
 Set `DG_GEMV_RACE_ITERS=100000` for a longer standalone stress run.
+Set `DG_GEMV_RACE_GRAPH=1` to check every output from repeated Graph replay.
+Signed dyadic BF16 K=144/160/192/240/256 cases compare all columns with an exact CPU
+reference; `DG_GEMV_RACE_RANDOM_ITERS` overrides their default 1024 calls.
 Compile-only mode prepares the same kernels without checking unwritten output.
 
 For full shape and explicit-tile coverage, use the daily entry. It first runs the functional caselist, then the board-specific daily list (`tests/daily/daily_810e.list` / `tests/daily/daily_890p.list`) directly, retaining per-command timeouts and failure-output detection. Both tile scans keep `--thread_count=32`. Daily scripts run after accuracy even if accuracy fails, and never after a compile failure. `HGGC_WARM_UP` is removed for real checks. Results appear as `DeepGEMM.script` alongside compile/run results. Raw script output is in `checkin-logs/script-*.log`.
