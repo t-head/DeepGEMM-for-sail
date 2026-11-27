@@ -14,6 +14,7 @@
 // =============================================================================
 
 #include <cstdint>
+#include <type_traits>
 #include <cutlass/bfloat16.h>
 #include <deep_gemm/cute_free/copy/aiu_g2s_atom.cuh>
 #include <deep_gemm/cute_free/copy/tsm_s2r_atom.cuh>
@@ -27,11 +28,11 @@ template <int BLOCK_M, int BLOCK_N, int BLOCK_K,
           int WARP_M, int WARP_N, int WARP_K, int STAGES,
           bool DenseS2Opt,
           bool IsAlignedN,
-          typename GemmTypeTag, typename ElementOutput = cutlass::bfloat16_t>
-#if defined(DG_DUAL_B_PACKED_N) && DG_DUAL_B_PACKED_N
-using BF16xFp32GemmCuteFreeKernel = kernel::PackedDualNRouterKernel<ElementOutput, BLOCK_M, BLOCK_N, BLOCK_K, STAGES>;
-#else
-using BF16xFp32GemmCuteFreeKernel = kernel::GemmBf16xFp32Kernel<
+          typename GemmTypeTag, typename ElementOutput = cutlass::bfloat16_t,
+          typename Policy = dual_b::KernelPolicy<>>
+using BF16xFp32GemmCuteFreeKernel = std::conditional_t<Policy::PackedN,
+    kernel::PackedDualNRouterKernel<ElementOutput, BLOCK_M, BLOCK_N, BLOCK_K, STAGES, Policy>,
+    kernel::GemmBf16xFp32Kernel<
     cutlass::bfloat16_t,
     copy::AiuG2SAtom<cutlass::bfloat16_t, BLOCK_M, BLOCK_K>,   // G2S A
     copy::AiuG2SAtom<cutlass::bfloat16_t, BLOCK_N, BLOCK_K>,   // G2S B
@@ -41,7 +42,6 @@ using BF16xFp32GemmCuteFreeKernel = kernel::GemmBf16xFp32Kernel<
     epilogue::Epilogue<ElementOutput, mma::Bf16MmaAtom::CLayout,
                              WARP_M, WARP_N, IsAlignedN, true>, // Epilogue
     BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, WARP_K, STAGES, DenseS2Opt,
-    GemmTypeTag>;
-#endif
+    GemmTypeTag, Policy>>;
 
 } // namespace deep_gemm

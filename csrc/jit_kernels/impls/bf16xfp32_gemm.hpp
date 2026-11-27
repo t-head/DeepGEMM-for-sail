@@ -98,30 +98,15 @@ public:
         return fmt::format(
             R"(
 #define BF16_HGRTC
-#define DG_DUAL_B_FULL_K_PREFETCH 0
-#define DG_DUAL_B_EARLY_G2S {13}
-#define DG_DUAL_B_MMA_S2R_OVERLAP {14}
-#define DG_DUAL_B_BOUNDED_KLOOP 0
-#define DG_DUAL_B_KLOOP_UNROLL 1
-#define DG_DUAL_B_KLOOP_CHUNK 0
-#define DG_DUAL_B_OVERLAP_PROLOGUE {15}
-#define DG_DUAL_B_VALID_EPILOGUE {16}
-#define DG_DUAL_B_PACKED_N {17}
-#define DG_DUAL_B_ROUTER_M {18}
-#define DG_DUAL_B_ROUTER_N {19}
-#define DG_DUAL_B_ROUTER_K {20}
-#define DG_DUAL_B_STATIC_STAGES {21}
-#define DG_DUAL_B_STREAMED_LOW 0
-#define DG_DUAL_B_STREAMED_PAIRS 0
-#define DG_DUAL_B_PAIRS_M_FIRST 0
-#define DG_DUAL_B_DECODE_SPLIT_K {22}
-{23}#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
+#include <deep_gemm/impls/bf16xfp32_gemm_cute_free.cuh>
 
 namespace deep_gemm {{
 
 using GemmTypeTag = std::integral_constant<GemmType, GemmType::{0}>;
 
-using Kernel = BF16xFp32GemmCuteFreeKernel<{1}, {2}, {3}, {4}, {5}, {6}, {7}, true, {8}, GemmTypeTag{9}>;
+using Pipeline = dual_b::PipelinePolicy<{13}, {14}, {21}, {26}>;
+using Policy = dual_b::KernelPolicy<Pipeline, {15}, {16}, {17}, {18}, {19}, {20}, {22}, {23}, {24}, {25}>;
+using Kernel = BF16xFp32GemmCuteFreeKernel<{1}, {2}, {3}, {4}, {5}, {6}, {7}, true, {8}, GemmTypeTag, {9}, Policy>;
 static_assert(sizeof(typename Kernel::Params) == {11}, "host/device Params ABI mismatch");
 static_assert(Kernel::SharedStorageSize == {12}, "host/device shared storage mismatch");
 
@@ -139,7 +124,7 @@ __global__ void {10}(typename deep_gemm::Kernel::Params params) {{
             info.block_m, info.block_n, info.block_k,
             info.warp_m, info.warp_n, info.warp_k, info.num_stages,
             is_aligned_n ? "true" : "false",
-            std::is_same_v<ElementOutput, float> ? ", float" : "",
+            std::is_same_v<ElementOutput, float> ? "float" : "cutlass::bfloat16_t",
             info.kernel_name, sizeof(GemmKernelParams),
             dual_b::shared_storage_bytes(info.block_m, info.block_n, info.block_k,
                 info.warp_m, info.warp_n, info.warp_k, info.num_stages,
@@ -150,10 +135,8 @@ __global__ void {10}(typename deep_gemm::Kernel::Params params) {{
             info.static_router ? args.kernel_params.N : 0,
             info.static_router ? args.kernel_params.K : 0,
             info.static_stages ? 1 : 0, info.decode_split_k,
-            info.packed_store ? fmt::format(
-                "#define DG_BFOUT_PACKED_STORE 1\n#define DG_BFOUT_CTA_K {}\n"
-                "#define DG_BFOUT_ONE_TILE {}\n#define DG_DUAL_B_K_ORDER {}\n",
-                int(info.cta_k), int(info.one_tile), info.k_order) : "");
+            int(info.packed_store), int(info.packed_store && info.cta_k),
+            int(info.packed_store && info.one_tile), info.packed_store ? info.k_order : 0);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {

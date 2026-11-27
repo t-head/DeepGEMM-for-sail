@@ -1,11 +1,14 @@
 """Native PPU host-codegen regression; requires the source checkout and PPU SDK.
 
 Run on an idle PPU: python tests/test_jit_compile_keys.py -v
-The helper compiles host C++ only. It never compiles or launches generated GEMMs.
+Host checks exercise codegen and keys. The coexistence check compiles generated
+GEMMs in one translation unit without launching them.
 """
 import os
 from pathlib import Path
 import shutil
+import subprocess
+import tempfile
 import unittest
 
 import torch
@@ -21,6 +24,7 @@ CPP_SOURCE = r'''
 #include "jit_kernels/impls/fp8_gemm.hpp"
 
 #include <stdexcept>
+#include <vector>
 
 namespace {
 using namespace deep_gemm;
@@ -162,20 +166,24 @@ int dual_b_checks() {
     count += check_change<Runtime>(args, [](auto& a) { a.kernel_params.K += 64; }, "static K");
     const auto source = Runtime::generate_impl(args);
     for (const char* fixed : {
-        "#define DG_DUAL_B_FULL_K_PREFETCH 0\n", "#define DG_DUAL_B_BOUNDED_KLOOP 0\n",
-        "#define DG_DUAL_B_KLOOP_UNROLL 1\n", "#define DG_DUAL_B_KLOOP_CHUNK 0\n",
-        "#define DG_DUAL_B_STREAMED_LOW 0\n", "#define DG_DUAL_B_STREAMED_PAIRS 0\n",
-        "#define DG_DUAL_B_PAIRS_M_FIRST 0\n",
+        "using Pipeline = dual_b::PipelinePolicy<0, 0, 0, 0>;",
+        "using Policy = dual_b::KernelPolicy<Pipeline, 0, 0, 0, 256, 384, 7168, 1, 1, 0, 0>;",
+        ", Policy>;", "host/device Params ABI mismatch", "host/device shared storage mismatch",
         "__launch_bounds__(deep_gemm::Kernel::MaxThreadsPerBlock, 1)",
         "BF16xFp32GemmCuteFreeKernel<128, 128, 64, 32, 64, 64, 4, true, true,"}) {
         if (source.find(fixed) == std::string::npos)
             throw std::runtime_error("fixed dual-B codegen default mismatch");
         ++count;
     }
+    for (const char* prefix : {"DG_DUAL_B_", "DG_BFOUT_"}) {
+        if (source.find(prefix) != std::string::npos)
+            throw std::runtime_error("dual-B codegen leaked a configuration macro");
+        ++count;
+    }
     return count;
 }
 
-int dual_b_lut_checks() {
+int dual_b_lut_checks(std::vector<std::string>* sources = nullptr) {
     using namespace dual_b;
     int count = 0;
     struct Expected {
@@ -273,30 +281,21 @@ int dual_b_lut_checks() {
                 cfg->has(StaticStages),cfg->decode_split_k,cfg->has(PackedStore),cfg->has(CtaK),
                 cfg->has(OneTile),cfg->k_order};
             args.kernel_params.M = key.m; args.kernel_params.N = key.n; args.kernel_params.K = key.k;
+            if (sources) args.launch_info.kernel_name += std::to_string(sources->size());
             const auto source = Runtime::generate_impl(args);
-            const std::pair<const char*,int> macros[] = {
-                {"DG_DUAL_B_EARLY_G2S",cfg->has(EarlyG2S)},
-                {"DG_DUAL_B_MMA_S2R_OVERLAP",cfg->has(MmaS2ROverlap)},
-                {"DG_DUAL_B_OVERLAP_PROLOGUE",cfg->has(OverlapPrologue)},
-                {"DG_DUAL_B_VALID_EPILOGUE",cfg->has(ValidEpilogue)},
-                {"DG_DUAL_B_PACKED_N",cfg->has(PackedN)},
-                {"DG_DUAL_B_ROUTER_M",cfg->has(StaticShape) ? key.m : 0},
-                {"DG_DUAL_B_ROUTER_N",cfg->has(StaticShape) ? key.n : 0},
-                {"DG_DUAL_B_ROUTER_K",cfg->has(StaticShape) ? key.k : 0},
-                {"DG_DUAL_B_STATIC_STAGES",cfg->has(StaticStages)},
-                {"DG_DUAL_B_DECODE_SPLIT_K",cfg->decode_split_k},
-            };
-            for (const auto& [name,value] : macros) {
-                if (source.find(fmt::format("#define {} {}\n",name,value)) == std::string::npos)
-                    throw std::runtime_error("LUT codegen macro mismatch");
-                ++count;
-            }
-            const auto packed = fmt::format("#define DG_BFOUT_PACKED_STORE 1\n#define DG_BFOUT_CTA_K {}\n"
-                "#define DG_BFOUT_ONE_TILE {}\n#define DG_DUAL_B_K_ORDER {}\n",
-                int(cfg->has(CtaK)),int(cfg->has(OneTile)),cfg->k_order);
-            if ((source.find(packed) != std::string::npos) != cfg->has(PackedStore)
+            const auto pipeline = fmt::format("dual_b::PipelinePolicy<{}, {}, {}, {}>",
+                int(cfg->has(EarlyG2S)), int(cfg->has(MmaS2ROverlap)),
+                int(cfg->has(StaticStages)), cfg->has(PackedStore) ? cfg->k_order : 0);
+            const auto policy = fmt::format("dual_b::KernelPolicy<Pipeline, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+                int(cfg->has(OverlapPrologue)), int(cfg->has(ValidEpilogue)), int(cfg->has(PackedN)),
+                cfg->has(StaticShape) ? key.m : 0, cfg->has(StaticShape) ? key.n : 0,
+                cfg->has(StaticShape) ? key.k : 0, cfg->decode_split_k, int(cfg->has(PackedStore)),
+                int(cfg->has(PackedStore) && cfg->has(CtaK)), int(cfg->has(PackedStore) && cfg->has(OneTile)));
+            if (source.find(pipeline) == std::string::npos || source.find(policy) == std::string::npos
+                || source.find("DG_DUAL_B_") != std::string::npos || source.find("DG_BFOUT_") != std::string::npos
                 || source.find(fmt::format("Kernel::SharedStorageSize == {}",e.smem)) == std::string::npos)
-                throw std::runtime_error("LUT codegen storage mismatch");
+                throw std::runtime_error("LUT template policy or storage mismatch");
+            if (sources) sources->push_back(source);
             ++count;
         };
         if (key.output_dtype == at::kFloat) check_codegen(float{});
@@ -420,6 +419,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("bf16_cute_free", [] { return bf16_checks<deep_gemm::DenseBF16GemmCuteFreeRuntimeT<cutlass::bfloat16_t>>()
                                     + bf16_checks<deep_gemm::DenseBF16GemmCuteFreeRuntimeT<float>>(); });
     m.def("dual_b", [] { return dual_b_checks<cutlass::bfloat16_t>() + dual_b_checks<float>() + dual_b_lut_checks(); });
+    m.def("dual_b_sources", [] {
+        std::vector<std::string> sources;
+        dual_b_lut_checks(&sources);
+        return sources;
+    });
     m.def("int8_and_fp8_channel", int8_checks);
     m.def("fp8_block", fp8_checks);
     m.def("fp4", fp4_checks);
@@ -443,6 +447,8 @@ class CompileKeyTests(unittest.TestCase):
         includes = [sdk / 'targets/x86_64-linux/include', sdk / 'targets/aarch64-linux/include',
                     sdk / 'include', sdk / 'include/cccl', root / 'csrc', root / 'deep_gemm/include',
                     actlize, actlize / 'include', actlize / 'tools', root / 'third-party/fmt/include']
+        cls.sdk = sdk
+        cls.device_includes = [root / 'deep_gemm/include', actlize / 'include', actlize / 'tools/util/include']
         library_dirs = [sdk / part for part in ('lib', 'lib64', 'lib64/stubs')]
         cls.native = load_inline(
             name='deep_gemm_compile_key_tests',
@@ -458,6 +464,37 @@ class CompileKeyTests(unittest.TestCase):
 
     def test_dual_b_lut_and_codegen_keys(self):
         self.assertGreater(self.native.dual_b(), 0)
+
+    def test_dual_b_template_coexistence(self):
+        if torch.cuda.get_device_capability() != (8, 9):
+            self.skipTest('dual-B device kernels require PPU1.5')
+        sources = self.native.dual_b_sources()
+        self.assertEqual(len(sources), 24)
+        units = []
+        for index, source in enumerate(sources):
+            source = source.replace('namespace deep_gemm {', f'namespace deep_gemm {{ namespace config_{index} {{')
+            source = source.replace('} // namespace deep_gemm', '}} // namespace deep_gemm')
+            source = source.replace('deep_gemm::Kernel', f'deep_gemm::config_{index}::Kernel')
+            units.append(source)
+        units.append(r'''
+using Tag = std::integral_constant<deep_gemm::GemmType, deep_gemm::GemmType::Normal>;
+using DefaultKernel = deep_gemm::BF16xFp32GemmCuteFreeKernel<128, 128, 64, 32, 64, 64, 4, true, true, Tag>;
+using ExplicitDefault = deep_gemm::BF16xFp32GemmCuteFreeKernel<128, 128, 64, 32, 64, 64, 4, true, true, Tag,
+    cutlass::bfloat16_t, deep_gemm::dual_b::KernelPolicy<>>;
+static_assert(std::is_same_v<DefaultKernel, ExplicitDefault>);
+static_assert(DefaultKernel::SharedStorageSize == 196608);
+static_assert(!std::is_same_v<deep_gemm::config_0::Kernel, deep_gemm::config_1::Kernel>);
+static_assert(!std::is_same_v<deep_gemm::config_0::Kernel, deep_gemm::config_11::Kernel>);
+''')
+        with tempfile.TemporaryDirectory(prefix='dual_b_templates_') as directory:
+            source = Path(directory) / 'coexist.cu'
+            source.write_text('\n'.join(units))
+            command = [str(self.sdk / 'bin/hgcc'), '-std=c++17', '-O3', '-arch=ppu_15', '-dopt', '3',
+                       '-ftemplate-depth=8192', '--expt-relaxed-constexpr', '--expt-extended-lambda',
+                       '-x', 'hg', '-hgbin', str(source), '-o', str(Path(directory) / 'coexist.hgbin')]
+            command.extend(f'-I{path}' for path in self.device_includes)
+            result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.assertEqual(result.returncode, 0, result.stdout)
 
     def test_int8_and_fp8_channel(self):
         self.assertGreater(self.native.int8_and_fp8_channel(), 0)
