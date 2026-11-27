@@ -155,6 +155,9 @@ __device__ void batched_gemvt_kernel_small_k_impl(const GemvtArgs args) {
     dot_op<src_type, acc_type, alignmentMax>((src_type *)&vreg_a,
                                              (src_type *)(vreg_b + nloop),
                                              accum[nloop]);
+    // Complete this lane's shared reads before cp.async refills the same slot.
+    // Some lanes return above, so a collective warp/CTA barrier is unsafe here.
+    __threadfence_block();
     tix::LdgStsGroupWait<Stages - 2>();
 
     int load_next_n = nloop + Stages;

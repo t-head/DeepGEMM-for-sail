@@ -6,6 +6,13 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ## unreleased
 
+### Fixed
+
+- **810E small-K grouped GEMV slot reuse**: fence shared-memory reads before
+  refilling the same async-copy slot in the BF16/INT8 nopad kernel, preventing
+  intermittent missing K contributions (Aone 89481340). Add partial-lane
+  stress regressions to the 810E check-in suite.
+
 ### Added
 
 - **Zhenwu810E INT8 AVG MQA**: adds `int8_mqa_avg_logits` and

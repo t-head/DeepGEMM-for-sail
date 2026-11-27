@@ -23,6 +23,12 @@ For W4 weights, warm-up prepares one synthetic expert through the production pre
 
 Default check-in does not run the full `test_core.py`, `test_fp4_core.py`, `test_fp8_core.py`, `test_attention.py` shape loops or either tile sweep. Required functionality stays in the operator cases: small-M/N/K tails, quantization layouts, masked overlap/signals, attention regression/metadata checks and preprocessing contracts. FP4 default-epilogue NoPad/Fused checks retain the old strict `0.001` accuracy boundary; fused activation/quantization paths retain their existing thresholds.
 
+The 810E suite also runs `test_grouped_gemv_small_k_race.py`: BF16/INT8
+grouped nopad, 512 experts, 40 rows, N=2560, and K=80/128/160/256.
+Each case checks all outputs from 32768 calls, including partial-lane K tiles.
+Set `DG_GEMV_RACE_ITERS=100000` for a longer standalone stress run.
+Compile-only mode prepares the same kernels without checking unwritten output.
+
 For full shape and explicit-tile coverage, use the daily entry. It first runs the functional caselist, then the board-specific daily list (`tests/daily/daily_810e.list` / `tests/daily/daily_890p.list`) directly, retaining per-command timeouts and failure-output detection. Both tile scans keep `--thread_count=32`. Daily scripts run after accuracy even if accuracy fails, and never after a compile failure. `HGGC_WARM_UP` is removed for real checks. Results appear as `DeepGEMM.script` alongside compile/run results. Raw script output is in `checkin-logs/script-*.log`.
 
 ```bash

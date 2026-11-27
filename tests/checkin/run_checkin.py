@@ -24,6 +24,7 @@ SUITES = {'ZW-810E': 'checkin_810e.list', 'ZW-M890P': 'checkin_890p.list'}
 SCRIPT_SUITES = {
     'ZW-810E': [
         '-m pytest -q -s --disable-warnings -x tests/test_cold_graph_capture.py -k bf16',
+        '-m pytest -q -s --disable-warnings -x tests/test_grouped_gemv_small_k_race.py',
     ],
     'ZW-M890P': [
         '-m pytest -q -s --disable-warnings -x tests/test_cold_graph_capture.py',
