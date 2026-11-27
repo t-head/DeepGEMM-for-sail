@@ -37,8 +37,112 @@ SCRIPT_SUITES = {
         'tests/test_mega_gate.py::test_mega_gate_sigmoid_partial_scores '
         'tests/test_mega_gate.py::test_mega_gate_api_contract',
     ],
+    'ZW-M890P-GemmRS': [
+        f'-m torch.distributed.run --standalone --nproc-per-node={tp} tests/test_gemm_comm.py --smoke'
+        for tp in (2, 4, 8)
+    ],
 }
 _worker_context = threading.local()
+
+
+def gemm_rs_config_check(world):
+    return 32 * world, 272, 768, (1, 16, 64, 128, 16, 16, 2)
+
+
+def gemm_rs_smoke_cases(world, num_sms=None, *, include_config_checks=False):
+    if num_sms is None:
+        from deep_gemm import get_num_sms
+        num_sms = get_num_sms()
+    cases = []
+    for dtype, quant, m, n, k, tile in (
+        ('fp8', 'block', world, 48, 640, None),
+        ('fp8', 'channel', 2 * world, 80, 96, None),
+        ('bf16', 'non_quantized', 3 * world, 144, 128, None),
+        ('fp8', 'block', 13 * world, 272, 768,
+         (32, 128, 128, 16, 32, 2) if world == 1 else (32, 192, 128, 16, 48, 2)),
+        ('fp8', 'channel', 1024, 4096, 768, (64, 64, 128, 32, 32, 3)),
+        ('bf16', 'non_quantized', 1024, 4096, 768, (64, 64, 128, 32, 32, 3)),
+    ):
+        spec = (f'GemmReduceScatter,data_type:{dtype},quant_type:{quant},m:{m},n:{n},k:{k},'
+                f'tp:{world},rank:0')
+        if tile:
+            spec += ',configs:[' + ','.join(map(str, (num_sms, *tile))) + ']'
+        cases.append(spec)
+    if include_config_checks:
+        m, n, k, config = gemm_rs_config_check(world)
+        for dtype, quant in (('fp8', 'block'), ('fp8', 'channel'), ('bf16', 'non_quantized')):
+            cases.append(f'GemmReduceScatter,data_type:{dtype},quant_type:{quant},m:{m},n:{n},k:{k},'
+                         f'tp:{world},rank:0,configs:[' + ','.join(map(str, config)) + ']')
+    return cases
+
+
+def gemm_rs_world(spec):
+    if not spec.startswith('GemmReduceScatter,'):
+        return None
+    match = re.search(r'(?:^|,)tp:(1|2|4|8)(?:,|$)', spec)
+    if match is None:
+        raise ValueError('GEMM/RS cases require tp:1, 2, 4 or 8')
+    return int(match[1])
+
+
+def compile_cases(cases):
+    expanded = []
+    for spec in cases:
+        world = gemm_rs_world(spec)
+        if world is None:
+            expanded.append(spec)
+            continue
+        spec = re.sub(r',rank:\d+(?=,|$)', '', spec)
+        expanded.extend(f'{spec},rank:{rank}' for rank in range(world))
+    # Repeated model aliases and rank dumps use the same compiler/cache entry.
+    return list(dict.fromkeys(expanded))
+
+
+def _process_tree(pid):
+    rows = subprocess.check_output(['ps', '-e', '-o', 'pid=,ppid=,pgid=,stat='], text=True)
+    processes = {int(p): (int(parent), int(group), state) for p, parent, group, state in
+                 (line.split() for line in rows.splitlines())}
+    descendants = {pid}
+    while True:
+        children = {p for p, (parent, _, _) in processes.items() if parent in descendants}
+        if children <= descendants:
+            return {p: processes[p] for p in descendants if p in processes}
+        descendants.update(children)
+
+
+def _stop_process(process):
+    # Elastic ranks have their own sessions; retain their groups before the
+    # launcher exits and they are reparented. Never signal our own process group.
+    descendants = _process_tree(process.pid)
+    groups = {process.pid, *(group for _, group, _ in descendants.values())} - {os.getpgrp()}
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for group in groups:
+            try:
+                os.killpg(group, sig)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                if process.poll() is None:
+                    raise
+        if sig == signal.SIGTERM:
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            descendants.update(_process_tree(process.pid))
+            groups.update(group for _, group, _ in descendants.values() if group != os.getpgrp())
+    process.wait()
+    deadline = time.monotonic() + 5
+    while descendants:
+        # The original descendants may have been adopted after launcher exit.
+        rows = subprocess.check_output(['ps', '-e', '-o', 'pid=,stat='], text=True)
+        alive = {int(p) for p, state in (line.split() for line in rows.splitlines()) if not state.startswith('Z')}
+        descendants = {p: info for p, info in descendants.items() if p in alive}
+        if not descendants:
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f'worker processes did not exit: {sorted(descendants)}')
+        time.sleep(0.05)
 
 
 @dataclass
@@ -93,15 +197,7 @@ class Worker:
                 except (OSError, subprocess.TimeoutExpired):
                     kill = True
             if kill:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                except PermissionError:
-                    # macOS may reject signalling an already-exited group.
-                    if process.poll() is None:
-                        raise
-                process.wait()
+                _stop_process(process)
                 try:
                     process.stdin.close()
                 except OSError:
@@ -192,12 +288,7 @@ def run_case(index, spec, phase, log_dir, timeout, base_env=None):
             try:
                 code = process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                # Kill the complete tree, including hgcc children.
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait()
+                _stop_process(process)
                 error = f'Timeout after {timeout}s'
             else:
                 if code:
@@ -210,6 +301,7 @@ def run_case(index, spec, phase, log_dir, timeout, base_env=None):
 def execute(cases, workers, log_dir, timeout, phase='all', runner=run_case):
     results = []
     if phase in ('all', 'compile'):
+        phase_start = time.monotonic()
         compiler_workers = []
 
         def install_worker():
@@ -219,30 +311,51 @@ def execute(cases, workers, log_dir, timeout, phase='all', runner=run_case):
 
         try:
             with ThreadPoolExecutor(max_workers=workers, initializer=install_worker) as pool:
+                planned = compile_cases(cases)
                 pending = [pool.submit(runner, i, spec, 'compile', log_dir, timeout)
-                           for i, spec in enumerate(cases, 1)]
+                           for i, spec in enumerate(planned, 1)]
                 for future in as_completed(pending):
                     result = future.result()
                     results.append(result)
-                    print(f'Compile [{result.index}/{len(cases)}]: {result.error or "OK"}', flush=True)
+                    print(f'Compile [{result.index}/{len(planned)}]: {result.error or "OK"}', flush=True)
         finally:
             for worker in compiler_workers:
                 worker.close()
+        print(f'Compile wall time: {time.monotonic() - phase_start:.3f}s', flush=True)
         if any(result.error for result in results):
             print('Compilation incomplete; accuracy phase was not started.', flush=True)
             return results
     if phase in ('all', 'run'):
+        phase_start = time.monotonic()
+        collectives = {}
         previous = getattr(_worker_context, 'worker', None)
         worker = Worker('run', log_dir)
         _worker_context.worker = worker
         try:
             for i, spec in enumerate(cases, 1):
+                world = gemm_rs_world(spec)
+                if world is not None:
+                    collectives.setdefault(world, []).append(spec)
+                    continue
                 result = runner(i, spec, 'run', log_dir, timeout)
                 results.append(result)
                 print(f'Accuracy [{i}/{len(cases)}]: {result.error or "OK"}', flush=True)
         finally:
             worker.close()
             _worker_context.worker = previous
+        # One process group per TP, sharing the warmed cache across all cases.
+        for world, specs in collectives.items():
+            path = Path(log_dir) / f'gemm-rs-tp{world}.list'
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('\n'.join(specs) + '\n')
+            command = (f'-m torch.distributed.run --standalone --nproc-per-node={world} '
+                       f'tests/test_gemm_comm.py --caselist {shlex.quote(str(path.resolve()))}')
+            result = runner(world, command, 'script', log_dir, timeout)
+            results.append(result)
+            print(f'GEMM/RS TP{world}: {result.error or "OK"}', flush=True)
+            if result.error:
+                break
+        print(f'Run wall time: {time.monotonic() - phase_start:.3f}s', flush=True)
     return results
 
 
@@ -303,13 +416,19 @@ def main(argv=None):
     parser.add_argument('--list', action='store_true', help='Print the selected cases without importing Torch')
     args = parser.parse_args(argv)
     if args.suite in SCRIPT_SUITES and args.suite not in SUITES:
-        if args.phase == 'compile':
+        gemm_rs = args.suite == 'ZW-M890P-GemmRS'
+        if args.phase == 'compile' and not gemm_rs:
             parser.error('Script suites run compilation and correctness together; use --phase all or run')
         cases = SCRIPT_SUITES[args.suite]
         if args.list:
             print('\n'.join(f'{i}: {sys.executable} {spec}' for i, spec in enumerate(cases, 1)))
             return 0
-        results = execute_scripts(cases, args.log_dir.resolve(), args.timeout)
+        results = []
+        if gemm_rs and args.phase in ('all', 'compile'):
+            warmup = [spec for tp in (2, 4, 8) for spec in gemm_rs_smoke_cases(tp, include_config_checks=True)]
+            results = execute(warmup, args.compile_workers, args.log_dir.resolve(), args.timeout, 'compile')
+        if args.phase != 'compile' and not any(result.error for result in results):
+            results.extend(execute_scripts(cases, args.log_dir.resolve(), args.timeout))
         write_report(results, args.output_xml)
         return int(any(result.error for result in results))
     path = REPO_ROOT / 'tests/checkin' / SUITES[args.suite] if args.suite else args.caselist

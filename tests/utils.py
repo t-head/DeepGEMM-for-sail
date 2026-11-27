@@ -1190,12 +1190,12 @@ def read_numbers_from_file(file_path):
 def parse_deepgemm_string_re(s):
     # give default value, for fp8 we have block and channel
     result = {"distribution": "uniform", "enable_sbo_overlap": False}
-    supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "HcPrenormGemm", "MqaLogits", "PagedMqaLogits", "MqaAvgLogits", "PagedMqaAvgLogits", "BatchGemm", "SparseMqaLogits", "PagedSparseMqaLogits", "MegaMhc", "AttentionRegression", "Preprocess", "Activation", "MoeAlign", "MegaGate"]
+    supported_gemm_type = ["GroupedContiguous", "GroupedNoPad", "GroupedFused", "GroupedMasked", "Normal", "DenseGemm", "HcPrenormGemm", "MqaLogits", "PagedMqaLogits", "MqaAvgLogits", "PagedMqaAvgLogits", "BatchGemm", "SparseMqaLogits", "PagedSparseMqaLogits", "MegaMhc", "AttentionRegression", "Preprocess", "Activation", "MoeAlign", "MegaGate", "GemmReduceScatter"]
     supported_indexer_epilogue_type = ["fp32", "bf16"]
     supported_quant_type = ["non_quantized", "block", "channel", "group"]
     import re
     supported_gemm_type.append("KGroupedContiguous")
-    dg_params = r"(KGroupedContiguous|GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|HcPrenormGemm|Normal|MqaAvgLogits|PagedMqaAvgLogits|PagedSparseMqaLogits|SparseMqaLogits|MqaLogits|PagedMqaLogits|BatchGemm|MegaMhc|AttentionRegression|Preprocess|Activation|MoeAlign|MegaGate),(.+)"
+    dg_params = r"(KGroupedContiguous|GroupedContiguous|GroupedNoPad|GroupedFused|GroupedMasked|DenseGemm|HcPrenormGemm|Normal|MqaAvgLogits|PagedMqaAvgLogits|PagedSparseMqaLogits|SparseMqaLogits|MqaLogits|PagedMqaLogits|BatchGemm|MegaMhc|AttentionRegression|Preprocess|Activation|MoeAlign|MegaGate|GemmReduceScatter),(.+)"
     pattern = re.compile(dg_params)
     m = pattern.search(s.strip("."))
     if not m:
