@@ -56,6 +56,36 @@ struct MegaMoEL1Config : MegaMoEPhaseConfig {
     int copy_blocks, k_tiles_per_flag;
 };
 
+static constexpr int fp4_pre_dispatch_threads(int hidden) {
+    // Aim for one quantization thread per 16 input values, plus one warp for top-k IDs and weights.
+    return std::clamp(hidden / 16 + 32, 256, 512);
+}
+
+static Stage1RoutePolicy select_stage1_routes(
+    int tokens, int ranks, int topk, int scale_vectors, const MegaMoEL1Config& config,
+    bool metadata_in_this_grid) {
+    const auto prop = device_runtime->get_prop();
+    const uint32_t sms = config.num_sms;
+    DG_HOST_ASSERT(config.warp_m > 0 && config.warp_n > 0 && config.smem_size > 0);
+    DG_HOST_ASSERT(config.block_m >= config.warp_m && config.block_n >= config.warp_n);
+    const uint32_t threads = (config.block_m / config.warp_m) * (config.block_n / config.warp_n) * 32;
+    const uint32_t max_grid = sms * std::min<uint32_t>(
+        prop->maxThreadsPerMultiProcessor / threads, prop->sharedMemPerMultiprocessor / config.smem_size);
+    const uint32_t metadata_ctas = metadata_in_this_grid ? 1 : 0;
+    const uint32_t route_ctas = max_grid > metadata_ctas ? max_grid - metadata_ctas : 0u;
+    const uint32_t token_ctas = stage1_token_cta_budget(route_ctas, ranks);
+    const uint64_t token_wave = uint64_t(token_ctas) * (threads / 32);
+    const bool exceeds_token_wave = route_ctas > 0 && uint64_t(tokens) > token_wave;
+    const uint32_t row_lanes = next_power_of_two(uint32_t(std::max(topk, std::min(32, scale_vectors))));
+    const bool long_scan = tokens >= 32u * (threads / row_lanes);
+    const bool spread_peer_work = (sms > 3u * ranks && exceeds_token_wave) ||
+                                  (sms > 2u * ranks && long_scan);
+    // A second token wave can still cost less than one full scan per peer.
+    const bool token_waves_fit = !exceeds_token_wave ||
+        (route_ctas > ranks && token_ctas < ranks && uint64_t(tokens) <= 2 * token_wave);
+    return token_waves_fit && !spread_peer_work ? Stage1RoutePolicy::PerToken : Stage1RoutePolicy::PerPeer;
+}
+
 struct MegaMoEL2Config : MegaMoEPhaseConfig {};
 
 struct MegaMoEConfig {
@@ -106,8 +136,7 @@ static bool fused_tile_fits(const MegaMoEPhaseConfig& config, int num_ranks, int
     const int bm = config.block_m, bn = config.block_n;
     const int threads = (bm / config.warp_m) * (bn / config.warp_n) * 32;
     return threads >= 64 && bn >= 64 &&
-        num_experts_per_rank * (num_ranks + kExpertMetadataAuxFields) *
-            static_cast<int>(sizeof(uint32_t)) <= config.smem_size;
+        expert_metadata_smem_bytes(num_experts_per_rank, num_ranks) <= config.smem_size;
 }
 
 static std::optional<CopyTile> select_copy_tile(
@@ -179,7 +208,7 @@ static MegaMoEL1Config get_l1_config(
         GemmType::MegaMoE, 256, 32));
     // Metadata preprocessing reuses the GEMM shared allocation before compute.
     config.smem_size = std::max(config.smem_size,
-        num_experts_per_rank * (num_ranks + kExpertMetadataAuxFields) * static_cast<int>(sizeof(uint32_t)));
+        expert_metadata_smem_bytes(num_experts_per_rank, num_ranks));
     DG_HOST_ASSERT(fused_tile_fits(config, num_ranks, num_experts_per_rank));
 
     const auto record = select_copy_tile(n, k, num_experts_per_rank, num_ranks, expected_m, config);

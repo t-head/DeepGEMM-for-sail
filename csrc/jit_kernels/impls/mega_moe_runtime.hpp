@@ -18,8 +18,8 @@ namespace deep_gemm::mega {
 
 class MegaMoESyncRuntime final : public LaunchRuntime<MegaMoESyncRuntime> {
 public:
+    static constexpr const char* kName = "mega_moe_scatter_sync";
     struct Args {
-        const char* kernel_name;
         int num_ranks;
         LaunchArgs launch_args;
         layout::MegaMoESignals* signals;
@@ -29,9 +29,9 @@ public:
         return fmt::format(R"(
 #include <deep_gemm/impls/mega_moe_sync.cuh>
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&deep_gemm::{}<{}>);
+    auto ptr = reinterpret_cast<void*>(&deep_gemm::mega_moe_scatter_sync<{}>);
 }}
-)", args.kernel_name, args.num_ranks);
+)", args.num_ranks);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -39,9 +39,9 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void launch_sync(const char* name, int num_ranks, layout::MegaMoESignals* signals) {
-    MegaMoESyncRuntime::Args args{name, num_ranks, {dim3(1), dim3(64), 0}, signals};
-    const auto runtime = compiler->build(name, MegaMoESyncRuntime::generate(args));
+static void launch_scatter_sync(int num_ranks, layout::MegaMoESignals* signals) {
+    MegaMoESyncRuntime::Args args{num_ranks, {dim3(1), dim3(64), 0}, signals};
+    const auto runtime = compiler->build(MegaMoESyncRuntime::kName, MegaMoESyncRuntime::generate(args));
     MegaMoESyncRuntime::launch(runtime, args);
 }
 
@@ -127,6 +127,48 @@ inline int get_kernel_occupancy(const std::shared_ptr<KernelRuntime>& runtime,
 }
 
 template <bool Int8>
+class MegaMoEDispatchPrepareRuntime final : public LaunchRuntime<MegaMoEDispatchPrepareRuntime<Int8>> {
+public:
+    static constexpr const char* kName = "mega_moe_dispatch_sync";
+    using SchedulerArguments = sched::MegaMoESchedulerArgumentsT<std::conditional_t<Int8, float, uint16_t>>;
+    struct Args {
+        int hidden, intermediate, block_m, groups, ranks, capacity, topk;
+        Stage1RoutePolicy routes;
+        LaunchArgs launch_args;
+        SchedulerArguments scheduler;
+        uint32_t num_compute_ctas;
+    };
+
+    static std::string generate_impl(const Args& a) {
+        return fmt::format(R"(
+#include <deep_gemm/impls/mega_moe_dispatch.cuh>
+using Kernel = deep_gemm::MegaMoEDispatchPrepare<{},{},{},{},{},{},{},{},{},{},static_cast<deep_gemm::Stage1RoutePolicy>({})>;
+static_assert(sizeof(Kernel::Arguments) == {});
+extern "C" __global__ __launch_bounds__({}) void mega_moe_dispatch_sync(
+        Kernel::Arguments scheduler, uint32_t num_compute_ctas) {{
+    extern __shared__ char smem[];
+    Kernel::run(scheduler, smem, num_compute_ctas);
+}}
+)", Int8, a.hidden, a.intermediate, a.block_m, a.groups, a.ranks, a.capacity, a.topk,
+            a.launch_args.block_dim.x, a.launch_args.smem_size, static_cast<int>(a.routes),
+            sizeof(a.scheduler), a.launch_args.block_dim.x);
+    }
+
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args a) {
+        DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, a.scheduler, a.num_compute_ctas));
+    }
+};
+
+template <bool Int8>
+static void launch_dispatch_prepare(typename MegaMoEDispatchPrepareRuntime<Int8>::Args args) {
+    using Runtime = MegaMoEDispatchPrepareRuntime<Int8>;
+    args.launch_args.smem_size = std::max(args.launch_args.smem_size,
+        expert_metadata_smem_bytes(args.groups, args.ranks));
+    const auto runtime = compiler->build(Runtime::kName, Runtime::generate(args));
+    Runtime::launch(runtime, args);
+}
+
+template <bool Int8>
 class MegaMoEPreDispatchRuntime final : public LaunchRuntime<MegaMoEPreDispatchRuntime<Int8>> {
 public:
     static constexpr const char* kName = "mega_moe_pre_dispatch";
@@ -146,11 +188,12 @@ public:
 #include <deep_gemm/impls/mega_moe_pre_dispatch.cuh>
 using TopkIdx = {};
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&deep_gemm::mega_moe_pre_dispatch<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, TopkIdx, {}>);
+    auto ptr = reinterpret_cast<void*>(&deep_gemm::mega_moe_pre_dispatch<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, TopkIdx, {}, {}>);
 }}
 )", args.topk_idx.scalar_type() == torch::kInt32 ? "int32_t" : "int64_t", Int8,
     args.hidden, args.num_topk, args.num_max_tokens_per_rank, args.num_ranks, args.num_experts, args.intermediate_hidden,
-    args.staging.scales, args.staging.counts, args.staging.tokens, is_bf16x8_aligned(args.hidden_states));
+    args.staging.scales, args.staging.counts, args.staging.tokens, is_bf16x8_aligned(args.hidden_states),
+    args.launch_args.block_dim.x);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -166,19 +209,19 @@ static void mega_moe_pre_dispatch_impl(
     int num_ranks, int num_experts, int num_max_tokens_per_rank, int rank_idx,
     int hidden, int intermediate_hidden, int num_topk, const layout::MegaMoEStaging& staging) {
     using Runtime = MegaMoEPreDispatchRuntime<Int8>;
+    const int threads = Int8 ? 256 : fp4_pre_dispatch_threads(hidden);
     typename Runtime::Args args{hidden, num_topk, num_max_tokens_per_rank, num_ranks, num_experts, intermediate_hidden,
-        {dim3(1), dim3(256), 0}, hidden_states.data_ptr(), topk_idx, topk_weights.data_ptr<float>(),
+        {dim3(1), dim3(threads), 0}, hidden_states.data_ptr(), topk_idx, topk_weights.data_ptr<float>(),
         static_cast<uint32_t>(hidden_states.size(0)), layout::SymBuffer<>(sym_buffer_ptrs, rank_idx), staging};
     const auto runtime = compiler->build(Runtime::kName, Runtime::generate(args));
-    const int count_blocks = num_experts / num_ranks;
-    const int resident = get_kernel_occupancy(runtime, 256, 0) * device_runtime->get_prop()->multiProcessorCount;
-    const int token_blocks = std::max(1, std::min(static_cast<int>(args.num_tokens), std::max(1, resident - count_blocks)));
-    args.launch_args.grid_dim.x = count_blocks + token_blocks;
+    constexpr uint32_t padding_routes_per_cta = 1024;
+    args.launch_args.grid_dim.x = args.num_tokens +
+        ceil_div((num_max_tokens_per_rank - args.num_tokens) * num_topk, padding_routes_per_cta);
     Runtime::launch(runtime, args);
 }
 
 template <class Scale, class BufferLayout>
-static sched::MegaMoESchedulerArgumentsT<Scale> make_mega_moe_scheduler(
+static auto make_mega_moe_scheduler(
     const BufferLayout& buffers, void* base, uint32_t shape_m) {
     sched::MegaMoESchedulerArgumentsT<Scale> scheduler;
     scheduler.shape_m = shape_m;

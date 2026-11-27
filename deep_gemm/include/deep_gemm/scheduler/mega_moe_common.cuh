@@ -25,6 +25,7 @@ namespace deep_gemm::sched {
 
 template <class Scale>
 struct MegaMoESchedulerArgumentsT {
+    using ScaleType = Scale;
     int* grouped_layout = nullptr;
     // Copy and compute CTAs share the same M-block metadata.
     int* copy_grouped_layout = nullptr;
@@ -41,6 +42,7 @@ struct MegaMoESchedulerArgumentsT {
     uint32_t* expert_base = nullptr;
     layout::TokenSrcMetadata* src_info = nullptr;
     int32_t* cumulative_local_expert_recv_stats = nullptr;
+    uint32_t num_source_tokens = 0;
 
     CUTLASS_HOST_DEVICE
     MegaMoESchedulerArgumentsT(uint32_t shape_m = 0, int* grouped_layout_ptr = nullptr)
