@@ -548,6 +548,60 @@ torch::Tensor fp8_fp4_paged_mqa_logits(const std::pair<torch::Tensor, std::optio
                                    torch::kBFloat16, /*is_avg=*/false, q.second, indices);
 }
 
+// Legacy explicit-dtype calls reuse the native weighted launchers and profiling.
+static torch::Tensor checked_legacy_fp4_weights(
+        const torch::Tensor& weights, const torch::Tensor& q, torch::ScalarType logits_dtype) {
+    TORCH_CHECK(logits_dtype == torch::kFloat32 or logits_dtype == torch::kBFloat16,
+                "FP4 logits_dtype must be float32 or bfloat16");
+    TORCH_CHECK(weights.scalar_type() == torch::kFloat32 or
+                (logits_dtype == torch::kBFloat16 and weights.scalar_type() == torch::kBFloat16),
+                "FP4 requires fp32 weights, or bf16 weights with bf16 logits");
+    return checked_weights(weights, q, weights.scalar_type());
+}
+
+static torch::Tensor fp4_mqa_logits_legacy(
+        const std::pair<torch::Tensor, std::optional<torch::Tensor>>& q,
+        const std::pair<torch::Tensor, torch::Tensor>& kv, const torch::Tensor& weights,
+        const torch::Tensor& starts, const torch::Tensor& ends, bool clean_logits,
+        int max_seqlen_k, torch::ScalarType logits_dtype) {
+    TORCH_CHECK(not clean_logits, "clean_logits=True is not supported on PPU");
+    TORCH_CHECK(q.second.has_value() and q.first.scalar_type() == torch::kInt8,
+                "legacy FP4 logits require packed MXFP4 Q");
+    TORCH_CHECK(q.first.dim() == 3 and kv.first.dim() == 2 and max_seqlen_k >= 0,
+                "invalid legacy FP4 logits shape or max_seqlen_k");
+    TORCH_CHECK(logits_dtype == torch::kFloat32 or logits_dtype == torch::kBFloat16,
+                "FP4 logits_dtype must be float32 or bfloat16");
+    const int64_t cols = max_seqlen_k > 0 ? max_seqlen_k : kv.first.size(0);
+    if (q.first.size(0) == 0 or cols == 0)
+        return torch::empty({q.first.size(0), cols}, q.first.options().dtype(logits_dtype));
+    const auto empty = torch::empty({0}, q.first.options().dtype(torch::kFloat32));
+    return mqa_logits_common(q.first, kv.first, empty,
+        checked_legacy_fp4_weights(weights, q.first, logits_dtype), starts, ends,
+        false, max_seqlen_k, logits_dtype, /*is_avg=*/false, q.second, kv.second);
+}
+
+static torch::Tensor fp4_paged_mqa_logits_legacy(
+        const std::pair<torch::Tensor, std::optional<torch::Tensor>>& q,
+        const torch::Tensor& kv_cache, const torch::Tensor& weights,
+        const torch::Tensor& context_lens, const torch::Tensor& block_table,
+        const torch::Tensor& schedule_meta, int max_context_len, bool clean_logits,
+        torch::ScalarType logits_dtype, const std::optional<torch::Tensor>& indices) {
+    TORCH_CHECK(not clean_logits, "clean_logits=True is not supported on PPU");
+    TORCH_CHECK(q.second.has_value() and q.first.scalar_type() == torch::kInt8 and q.first.dim() == 4,
+                "legacy FP4 paged logits require packed MXFP4 Q");
+    TORCH_CHECK(logits_dtype == torch::kFloat32 or logits_dtype == torch::kBFloat16,
+                "FP4 logits_dtype must be float32 or bfloat16");
+    TORCH_CHECK(max_context_len >= 0, "max_context_len must be nonnegative");
+    TORCH_CHECK(indices.has_value(), "legacy FP4 paged logits require normalized request indices");
+    check_row_indices(indices, context_lens);
+    if (q.first.size(0) == 0)
+        return torch::empty({int64_t{0}, int64_t(max_context_len)}, q.first.options().dtype(logits_dtype));
+    return paged_mqa_logits_common(q.first, kv_cache,
+        checked_legacy_fp4_weights(weights, q.first, logits_dtype),
+        context_lens, block_table, schedule_meta, max_context_len, false,
+        logits_dtype, /*is_avg=*/false, q.second, indices);
+}
+
 // ---- Sparse MQA logits (DeepSeek V4.1 DSA indexer; ported from open-source 26/09) ----
 // MXFP4 and non-paged INT8 share the metadata layout and selected-block semantics.
 //
@@ -916,6 +970,17 @@ static void register_apis(pybind11::module_& m) {
     m.def("fp8_fp4_mqa_logits", &fp8_fp4_mqa_logits, py::arg("q"), py::arg("kv"), py::arg("weights"),
           py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"), py::arg("max_seqlen_k"),
           py::arg("schedule_meta") = std::nullopt);
+    // Private launchers used only by the Python legacy-keyword adapter.
+    m.def("_fp4_mqa_logits_legacy", &fp4_mqa_logits_legacy,
+          py::arg("q"), py::arg("kv"), py::arg("weights"),
+          py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
+          py::arg("clean_logits") = false, py::arg("max_seqlen_k") = 0,
+          py::arg("logits_dtype") = torch::kFloat32);
+    m.def("_fp4_paged_mqa_logits_legacy", &fp4_paged_mqa_logits_legacy,
+          py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
+          py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
+          py::arg("max_context_len"), py::arg("clean_logits") = false,
+          py::arg("logits_dtype") = torch::kFloat32, py::arg("indices") = std::nullopt);
     // Sparse MQA logits (contiguous + paged)
     m.def("get_sparse_mqa_logits_metadata", &get_sparse_mqa_logits_metadata,
           py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"), py::arg("num_kv_tokens"),

@@ -63,8 +63,9 @@ atexit.register(device_sync_at_exit)
 
 
 def run_attention_regression(args):
-    from test_attention import test_ks_ke, test_per_layer_cache_view
-    functions = {'ks_ke': test_ks_ke, 'cache_view': test_per_layer_cache_view}
+    from test_attention import test_ks_ke, test_per_layer_cache_view, test_fp4_legacy_api
+    functions = {'ks_ke': test_ks_ke, 'cache_view': test_per_layer_cache_view,
+                 'legacy_fp4_api': test_fp4_legacy_api}
     return functions[args['case']](check_accuracy=get_acc_check())
 
 

@@ -1085,6 +1085,65 @@ def test_nvtx():
     print("Passed\n")
 
 
+
+def test_fp4_legacy_api(check_accuracy=True):
+    """Legacy dtype calls and nonmonotonic MTP windows keep all represented queries."""
+    if not is_ppu1v5_device():
+        return
+    nq, nk, heads, dim = 3, 129, 32, 128
+    q = torch.randn(nq * heads, dim, device='cuda', dtype=torch.bfloat16)
+    k = torch.randn(nk, dim, device='cuda', dtype=torch.bfloat16)
+    qp, qs = per_token_cast_to_fp4(q, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+    kp, ks = per_token_cast_to_fp4(k, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+    q_in = (qp.view(nq, heads, dim // 2).view(torch.int8), qs.view(nq, heads))
+    k_in = (kp.view(torch.int8), ks.view(nk))
+    qr = cast_back_from_fp4(qp, qs, gran_k=32, use_packed_ue8m0=True).view(nq, heads, dim).float()
+    kr = cast_back_from_fp4(kp, ks, gran_k=32, use_packed_ue8m0=True).float()
+    weights = torch.randn(nq, heads, device='cuda', dtype=torch.float32)
+    starts = torch.zeros(nq, device='cuda', dtype=torch.int32)
+    ends = torch.tensor([0, 64, nk], device='cuda', dtype=torch.int32)
+    valid = torch.arange(nk, device='cuda')[None, :] < ends[:, None]
+    if check_accuracy:
+        reference = (torch.einsum('qhd,kd->qhk', qr, kr).relu() * weights[:, :, None]).sum(1)
+    for dtype in (torch.float32, torch.bfloat16):
+        for max_k in (0, nk):
+            out = deep_gemm.fp8_fp4_mqa_logits(
+                q_in, k_in, weights, starts, ends, clean_logits=False,
+                max_seqlen_k=max_k, logits_dtype=dtype)
+            assert out.shape == (nq, nk) and out.dtype == dtype
+            if check_accuracy:
+                assert torch.isfinite(out[valid]).all()
+                assert calc_diff(out[valid].float(), reference[valid]) < 1e-3
+    try:
+        deep_gemm.fp8_fp4_mqa_logits(q_in, k_in, weights, starts, ends, clean_logits=True)
+    except RuntimeError as error:
+        assert 'clean_logits=True' in str(error)
+    else:
+        raise AssertionError('clean_logits=True must be rejected')
+
+    case = _PagedFP4VarlenCase(32, 64, context=129)
+    q_in = (case.q[0][:6].reshape(2, 3, heads, 64), case.q[1][:6].reshape(2, 3, heads))
+    contexts = torch.tensor([[0, 65, 1], [64, 129, 33]], device='cuda', dtype=torch.int32)
+    table = case.table[[0, 10]].contiguous()
+    weights = torch.randn(6, heads, device='cuda', dtype=torch.float32)
+    metadata = deep_gemm.get_paged_mqa_logits_metadata(
+        contexts, 64, deep_gemm.get_num_sms(), metadata_extra=(3, heads, 128, torch.int8))
+    valid = torch.arange(129, device='cuda')[None, :] < contexts.reshape(6, 1)
+    if check_accuracy:
+        reference = ref_paged_mqa_logits(
+            case.q_ref[:6].float(), case.cache_ref.float(), weights,
+            contexts.reshape(6, 1), table.repeat_interleave(3, dim=0), 129)
+    for dtype in (torch.float32, torch.bfloat16):
+        out = deep_gemm.fp8_fp4_paged_mqa_logits(
+            q_in, case.cache, weights, contexts, table, metadata, 129,
+            clean_logits=False, logits_dtype=dtype)
+        assert out.shape == (6, 129) and out.dtype == dtype
+        if check_accuracy:
+            assert torch.isfinite(out[valid]).all()
+            assert calc_diff(out[valid].float(), reference[valid]) < 1.5e-3
+    print('PASS: legacy FP4 dtype, masking bounds and MTP row/page mapping')
+
+
 if __name__ == '__main__':
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -1107,3 +1166,4 @@ if __name__ == '__main__':
     test_sparse_workspace()
     test_paged_fp4_varlen()
     test_paged_fp4_varlen_replay()
+    test_fp4_legacy_api()

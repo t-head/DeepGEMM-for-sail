@@ -6,6 +6,12 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ## unreleased
 
+### Compatibility
+
+- Add legacy explicit-dtype MXFP4 logits calls without changing the native
+  v1.1 entry points or GPU kernels. Normalize legacy paged MTP queries to
+  independent native rows; document metadata and dtype constraints.
+
 ### Added
 
 - **Zhenwu810E INT8 AVG MQA**: adds `int8_mqa_avg_logits` and
