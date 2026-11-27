@@ -1,14 +1,37 @@
 #pragma once
 
 #include <acblasLt.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <ATen/cuda/CUDADataType.h>
 
 #include "../../jit/device_runtime.hpp"
 #include "../../utils/exception.hpp"
 #include "../../utils/compatibility.hpp"
 
 namespace deep_gemm {
+
+// acBLASLt layouts take native `hggcDataType`, so map PyTorch scalar types to it
+// directly. This used to go through `at::cuda::ScalarTypeToCudaDataType`, which
+// returns `cudaDataType_t`: the two enums happen to agree numerically, but the
+// header that declares it also drags the CUDA `__half` definition into a
+// translation unit that already has the native one (see `device_runtime.hpp`).
+// Unsupported types now fail loudly here instead of silently punning an enum.
+static hggcDataType scalar_type_to_hggc_data_type(const torch::ScalarType& scalar_type) {
+    switch (scalar_type) {
+        case torch::kBFloat16:    return HGGC_R_16BF;
+        case torch::kHalf:        return HGGC_R_16F;
+        case torch::kFloat:       return HGGC_R_32F;
+        case torch::kDouble:      return HGGC_R_64F;
+        case torch::kChar:        return HGGC_R_8I;
+        case torch::kByte:        return HGGC_R_8U;
+        case torch::kShort:       return HGGC_R_16I;
+        case torch::kInt:         return HGGC_R_32I;
+        case torch::kLong:        return HGGC_R_64I;
+        case torch::kFloat8_e4m3fn: return HGGC_R_8F_E4M3;
+        case torch::kFloat8_e5m2:   return HGGC_R_8F_E5M2;
+        default:
+            DG_HOST_UNREACHABLE(std::string("Unsupported acBLASLt scalar type: ") +
+                                c10::toString(scalar_type));
+    }
+}
 
 static auto get_acblaslt_layout(const hggcDataType& type, const int& rows, const int& cols, const int& ld,
                                 const std::optional<int>& batch_count = std::nullopt,
@@ -106,9 +129,9 @@ static void acblaslt_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs,
     const auto trans_b = a_major == MajorType::K ? ACBLAS_OP_N : ACBLAS_OP_T;
 
     // Matrix layouts
-    const auto hggc_type_a = at::cuda::ScalarTypeToCudaDataType(rhs.scalar_type());
-    const auto hggc_type_b = at::cuda::ScalarTypeToCudaDataType(lhs.scalar_type());
-    const auto hggc_type_d = at::cuda::ScalarTypeToCudaDataType(out.scalar_type());
+    const auto hggc_type_a = scalar_type_to_hggc_data_type(rhs.scalar_type());
+    const auto hggc_type_b = scalar_type_to_hggc_data_type(lhs.scalar_type());
+    const auto hggc_type_d = scalar_type_to_hggc_data_type(out.scalar_type());
     const auto layout_a = b_major == MajorType::K ? get_acblaslt_layout(hggc_type_a, k, n, rhs.stride(0))
                                                            : get_acblaslt_layout(hggc_type_a, n, k, rhs.stride(1));
     const auto layout_b = a_major == MajorType::K ? get_acblaslt_layout(hggc_type_b, k, m, lhs.stride(0))

@@ -446,7 +446,12 @@ class CompileKeyTests(unittest.TestCase):
             raise unittest.SkipTest("requires the native PPU SDK")
         actlize = root / 'third-party/actlize_v1.0.0'
         includes = [sdk / 'targets/x86_64-linux/include', sdk / 'targets/aarch64-linux/include',
-                    sdk / 'include', sdk / 'include/cccl', root / 'csrc', root / 'deep_gemm/include',
+                    sdk / 'include', sdk / 'include/cccl',
+                    # Mirrors setup.py: Torch's c10 CUDA headers need `cuda_runtime_api.h`,
+                    # and this tree must stay after the native ones so that the native
+                    # `hggc_fp16.h` definitions win over its `cuda_fp16.h` copies.
+                    sdk / 'CUDA_SDK/include',
+                    root / 'csrc', root / 'deep_gemm/include',
                     actlize, actlize / 'include', actlize / 'tools', root / 'third-party/fmt/include']
         cls.sdk = sdk
         cls.device_includes = [root / 'deep_gemm/include', actlize / 'include', actlize / 'tools/util/include']

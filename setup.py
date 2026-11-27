@@ -44,6 +44,12 @@ build_include_dirs = [path for path in (
     ppu_include,
     os.path.join(ppu_sdk, 'include'),
     os.path.join(ppu_sdk, 'include', 'cccl'),
+    # Torch's c10 CUDA headers include `cuda_runtime_api.h`, which only the SDK's
+    # CUDA compatibility tree ships. It must stay *after* the native directories:
+    # that tree also carries `cuda_fp16.h`/`cuda_bf16.h`, whose `__half` and
+    # `__nv_bfloat16` definitions collide with the native `hggc_fp16.h` ones that
+    # `acblasLt.h` pulls in (see `csrc/jit/device_runtime.hpp`).
+    os.path.join(ppu_sdk, 'CUDA_SDK', 'include'),
 ) if os.path.isdir(path)] + [
     current_dir + '/deep_gemm/include',
     current_dir + '/third-party/actlize_v1.0.0/',

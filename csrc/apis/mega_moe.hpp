@@ -3,6 +3,7 @@
 #include <array>
 #include <limits>
 #include <pybind11/stl.h>
+#include <c10/cuda/CUDAFunctions.h>
 #include <deep_gemm/layout/mega_moe.cuh>
 
 #include "../jit_kernels/impls/sm80_int8_int8_mega_moe.hpp"
@@ -137,7 +138,7 @@ template <class BufferLayout>
 static void check_mega_moe_buffer(const torch::Tensor& buffer, const BufferLayout& layout) {
     TORCH_CHECK(buffer.is_cuda() && buffer.scalar_type() == torch::kUInt8 && buffer.dim() == 1 &&
                 buffer.is_contiguous() && buffer.storage_offset() == 0 &&
-                buffer.numel() >= layout.get_num_bytes() && buffer.get_device() == at::cuda::current_device(),
+                buffer.numel() >= layout.get_num_bytes() && buffer.get_device() == c10::cuda::current_device(),
                 "invalid MegaMoE symmetric buffer size, layout or current device");
 }
 
