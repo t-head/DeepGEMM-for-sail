@@ -475,6 +475,7 @@ public:
         uint32_t issued_table_row = 0, issued_context = 0;
         uint32_t issued_q_span = kNextN;
         uint32_t issued_q_shift = 0;
+        ElementLogits* output_base_cached = params.logits;
         uint32_t output_row_cached = 0;
         uint32_t output_context_cached = 0;
         bool output_valid_cached = false;
@@ -857,13 +858,12 @@ public:
             if (!output_valid_cached) return;
             const uint32_t base_column = kv * BLOCK_KV + warp_offset;
             const bool full = base_column + WARP_M <= output_context_cached;
-            const uint64_t row = uint64_t(output_row_cached) * params.logits_stride;
             const auto packed = (lane_idx & 2) ? high : low;
             const auto value = r_mine ? __high2bfloat16(packed) : __low2bfloat16(packed);
             const uint32_t column = base_column + (2 * pair) * InstM +
                 ((lane_idx & 2) ? InstM : 0) + v_offset_mine;
-            if (full) params.logits[row + column] = value;
-            else if (column < output_context_cached) params.logits[row + column] = value;
+            if (full) output_base_cached[column] = value;
+            else if (column < output_context_cached) output_base_cached[column] = value;
         };
         auto store_grouped_pair = [&](uint32_t kv, auto pair) {
             if (!output_valid_cached) return;
@@ -923,10 +923,13 @@ public:
                 const uint32_t q_lane = kReuseRequest ? request_q_lane : (FoldSingleQ ? 0 : warp_n_idx & (output_q_span_cached - 1));
                 output_row_cached = (kStaticRequest ? request_source_q : group_desc(q).source_q) + q_lane;
                 output_valid_cached = q_lane < output_q_count_cached;
+                output_base_cached = params.logits + uint64_t(output_row_cached) * params.logits_stride;
                 kv_group_offset_cached = warp_group_idx + (kReuseRequest ? 0 : warp_n_idx >> q_shift) * kNumMathWarpGroups;
                 read_kv_slot_cached = warp_group_idx;
                 output_context_cached = output_valid_cached
                     ? __ldg(params.context_lens + output_row_cached) : 0;
+                if constexpr (!kReuseRequest)
+                    output_context_cached = min(output_context_cached, first.context_len);
             }
             if constexpr (kNumQStages > 1 && !kReuseRequest) {
                 if (scheduler.exist_q_idx(next_q_idx(q_idx))) {
@@ -1053,7 +1056,7 @@ public:
         };
 
         auto request_kv_sync = [&]() {
-            if constexpr (kReuseRequest && kNumQStages == 2 && kNumHeads == 32)
+            if constexpr (kReuseRequest && kNumQStages == 2)
                 cutlass::arch::NamedBarrier::sync(WarpOnGroup * 32, warp_group_idx);
             else __syncthreads();
         };
@@ -1145,7 +1148,9 @@ public:
                         };
                         compute_current_q(recycle_kv);
                     });
-                    request_kv_sync();
+                    // H64 uses warp-group waits before KV recycle and before
+                    // the next cluster reads its first staged tile.
+                    if constexpr (kNumHeads != 64) request_kv_sync();
                 };
                 if constexpr (kStaticRequest) {
                     constexpr uint32_t Blocks = kRequestValid1 ? 2 : 1;
@@ -1246,10 +1251,28 @@ public:
             reinterpret_cast<const deep_gemm::FP4VarlenCTAStart*>(p.schedule_meta),
             p.indices, p.context_lens, p.batch_size};
         Kernel op;
+        auto run_single = [&](deep_gemm::FP4VarlenQBlock first, uint32_t begin, uint32_t end) {
+            // Limit both the KV loads and the logits stores in the last packed step.
+            first.context_len = min(first.context_len, end * BK);
+            const uint32_t span = deep_gemm::fp4_varlen_q_span<BQ>(first.valid_q);
+            auto run = [&](auto q_span) {
+                op.run_task(p, smem, 0, begin, end, 0,
+                            q_span, cute::false_type{}, Int<0>{}, Int<0>{}, first);
+            };
+            if (span == 1) run(Int<1>{});
+            else if (span == 2) run(Int<2>{});
+            else if constexpr (BQ == 4) run(Int<4>{});
+        };
         scheduler.for_each_task(
             [&](deep_gemm::FP4VarlenQBlock first, deep_gemm::FP4VarlenQBlock second,
                 uint32_t begin, uint32_t end) {
                 const uint32_t count0 = first.valid_q, count1 = second.valid_q;
+                if constexpr (BQ == 2) {
+                    if (!count1) {
+                        run_single(first, begin, end);
+                        return;
+                    }
+                }
                 const uint32_t blocks = count1 ? 2 : 1;
                 auto run_request = [&](auto valid0, auto valid1) {
                     op.run_task(p, smem, 0, begin, end, blocks,
@@ -1260,18 +1283,12 @@ public:
                     else if (count0 == 3 && count1 == 2) run_request(Int<3>{}, Int<2>{});
                     else if (count0 == 3 && count1 == 3) run_request(Int<3>{}, Int<3>{});
                     else run_request(Int<0>{}, Int<0>{});
-                } else run_request(Int<0>{}, Int<0>{});
-            },
-            [&](deep_gemm::FP4VarlenQBlock first, uint32_t begin, uint32_t end) {
-                const uint32_t span = deep_gemm::fp4_varlen_q_span<BQ>(first.valid_q);
-                auto run = [&](auto q_span) {
-                    op.run_task(p, smem, 0, begin, end, 0,
-                                q_span, cute::false_type{}, Int<0>{}, Int<0>{}, first);
-                };
-                if (span == 1) run(Int<1>{});
-                else if (span == 2) run(Int<2>{});
-                else if constexpr (BQ == 4) run(Int<4>{});
-            });
+                } else {
+                    // A two-block H64 window starts with two queries.
+                    if (count1 == 1) run_request(Int<2>{}, Int<1>{});
+                    else run_request(Int<2>{}, Int<2>{});
+                }
+            }, run_single);
     }
 };
 } // namespace cutlass::gemm::kernel

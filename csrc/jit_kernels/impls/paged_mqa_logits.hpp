@@ -88,31 +88,33 @@ __global__ void {}(
 
 class FP4VarlenMetadataRuntime final : public LaunchRuntime<FP4VarlenMetadataRuntime> {
 public:
+    static constexpr int kSharedWorkspaceRows = 1024;
+
     struct Args {
         LaunchArgs launch_args;
-        int block_q, split_kv, workers, singleton_cost_multiplier;
+        int block_q, split_kv, workers, singleton_cost_multiplier, shared_rows;
         uint32_t nq;
         const uint32_t* lengths;
         const uint32_t* indices;
         uint32_t* metadata;
-        uint32_t* descriptors;
-        uint64_t* prefix;
+        uint32_t* units;
+        uint64_t* suffix;
     };
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
 #include <deep_gemm/scheduler/paged_mqa_logits_scheduler.cuh>
 extern "C" __global__ void attention_paged_mqa_logits_metadata_varlen(
     uint32_t nq, const uint32_t* lengths, const uint32_t* indices,
-    uint32_t* metadata, uint32_t* descriptors, uint64_t* prefix) {{
-    deep_gemm::fp4_varlen_metadata<{}, {}, {}, {}>(nq, lengths, indices,
+    uint32_t* metadata, uint32_t* units, uint64_t* suffix) {{
+    deep_gemm::fp4_varlen_metadata<{}, {}, {}, {}, {}>(nq, lengths, indices,
         reinterpret_cast<deep_gemm::FP4VarlenCTAStart*>(metadata),
-        reinterpret_cast<deep_gemm::FP4VarlenQBlock*>(descriptors), prefix);
+        units, suffix);
 }}
-)", args.block_q, args.split_kv, args.workers, args.singleton_cost_multiplier);
+)", args.block_q, args.split_kv, args.workers, args.singleton_cost_multiplier, args.shared_rows);
     }
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_HGGC_UNIFIED_CHECK(launch_kernel(kernel, config, args.nq, args.lengths,
-                                            args.indices, args.metadata, args.descriptors, args.prefix));
+                                            args.indices, args.metadata, args.units, args.suffix));
     }
 };
 
@@ -391,22 +393,26 @@ static torch::Tensor paged_mqa_logits_metadata(const torch::Tensor& context_lens
     if (grouped and is_fp4) {
         const int rows = config.num_workers + 1;
         const int metadata_words = rows * 2;
-        const int scratch_offset = align(metadata_words, 4);
+        constexpr int SharedRows = FP4VarlenMetadataRuntime::kSharedWorkspaceRows;
+        const int shared_rows = batch_size <= SharedRows ? SharedRows : 0;
+        const int suffix_offset = align(metadata_words + batch_size, 2);
         // Retain the builder workspace through graph capture with the metadata owner.
         // Only the visible two-column view is consumed by the logits kernel.
-        auto storage = torch::empty({scratch_offset + batch_size * 6}, context_lens.options());
+        const int storage_words = shared_rows ? metadata_words : suffix_offset + batch_size * 2;
+        auto storage = torch::empty({storage_words}, context_lens.options());
         auto metadata = storage.narrow(0, 0, metadata_words).view({rows, 2});
-        auto* scratch = reinterpret_cast<uint32_t*>(storage.data_ptr()) + scratch_offset;
+        auto* scratch = reinterpret_cast<uint32_t*>(storage.data_ptr());
         const auto& args = FP4VarlenMetadataRuntime::Args{
             .launch_args = {dim3(1, 1, 1), dim3(config.num_threads, 1, 1), config.smem_size},
             .block_q = config.block_q, .split_kv = config.split_kv, .workers = config.num_workers,
             .singleton_cost_multiplier = deep_gemm_mqa_common::FP4PagedVarlenConfig::kSingletonCostMultiplier,
+            .shared_rows = shared_rows,
             .nq = static_cast<uint32_t>(batch_size),
             .lengths = reinterpret_cast<const uint32_t*>(context_lens.data_ptr()),
             .indices = reinterpret_cast<const uint32_t*>(indices->data_ptr()),
             .metadata = reinterpret_cast<uint32_t*>(metadata.data_ptr()),
-            .descriptors = scratch,
-            .prefix = reinterpret_cast<uint64_t*>(scratch + batch_size * 4),
+            .units = shared_rows ? nullptr : scratch + metadata_words,
+            .suffix = shared_rows ? nullptr : reinterpret_cast<uint64_t*>(scratch + suffix_offset),
         };
         const auto& runtime = compiler->build("attention_paged_mqa_logits_metadata_varlen",
                                               FP4VarlenMetadataRuntime::generate(args));
