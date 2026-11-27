@@ -8,6 +8,16 @@
 
 # ============ DenseGemm ============
 
+# --- DenseGemm / BF16xFP32 public disablement ---
+DenseGemm,data_type:bf16xfp32,m:5,n:14,k:13,scale:0.00390625,use_fp32_output:0,expect_error:BF16xFP32 GEMM is disabled on PPU1.0
+DenseGemm,data_type:bf16xfp32,m:5,n:14,k:13,scale:0.00390625,use_fp32_output:1,expect_error:BF16xFP32 GEMM is disabled on PPU1.0
+DenseGemm,data_type:bf16xfp32,m:0,n:14,k:13,scale:0.00390625,use_fp32_output:0,expect_error:BF16xFP32 GEMM is disabled on PPU1.0
+DenseGemm,data_type:bf16xfp32,m:0,n:14,k:13,scale:0.00390625,use_fp32_output:1,expect_error:BF16xFP32 GEMM is disabled on PPU1.0
+DenseGemm,data_type:bf16xfp32,m:5,n:0,k:13,scale:0.00390625,use_fp32_output:0,expect_error:BF16xFP32 GEMM is disabled on PPU1.0
+DenseGemm,data_type:bf16xfp32,m:5,n:0,k:13,scale:0.00390625,use_fp32_output:1,expect_error:BF16xFP32 GEMM is disabled on PPU1.0
+DenseGemm,data_type:bf16xfp32,m:5,n:14,k:0,scale:0.00390625,use_fp32_output:0,expect_error:BF16xFP32 GEMM is disabled on PPU1.0
+DenseGemm,data_type:bf16xfp32,m:5,n:14,k:0,scale:0.00390625,use_fp32_output:1,expect_error:BF16xFP32 GEMM is disabled on PPU1.0
+
 # --- DenseGemm / bf16 ---
 # Empty products and legacy automatic CU-budget selection.
 DenseGemm,data_type:bf16,m:32,n:64,k:0,device:810e,accumulate:separate,c_stride:96,num_sms:1,configs:[20,32,64,64,16,32,2]

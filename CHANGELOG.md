@@ -8,6 +8,19 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Added
 
+- **BF16 x FP32 dense GEMM**: adds `bf16xfp32_gemm_nt` (alias `gemm_bf16xfp32`). Computes
+  `D = x @ (w_high + w_low * scale)^T` on the
+  BF16 matrix units with FP32 accumulation, where the FP32 weight is supplied
+  as two BF16 matrices (typically `scale = 1/256`, i.e. the BF16 high part plus
+  a scaled residual). Inputs are BF16 row-major `[m, k]` activations and
+  `[n, k]` weights (NT layout); output is BF16 or FP32 row-major `[m, n]`.
+  Zhenwu M890P (PPU1.5) uses a fused dual-B cute-free kernel:
+  A is streamed once per K partition, high/low products accumulate
+  separately in FP32, and the final result is combined and stored once.
+  The public entry currently requires PPU1.5 and rejects PPU1.0.
+  The convenience wrapper accepts only `x`, `w_high`, `w_low`, `scale`, and
+  `use_fp32_output=False`; GEMM requires no external workspace. Requires `N % 2 == 0`.
+
 - **Zhenwu810E INT8 AVG MQA**: adds `int8_mqa_avg_logits` and
   `int8_paged_mqa_avg_logits` with H4/H8, logical D128 and BF16 output.
   Accepts explicit FP32 quantization scales per Q/head and per KV token.
