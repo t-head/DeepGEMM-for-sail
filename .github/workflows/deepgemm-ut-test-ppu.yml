@@ -12,6 +12,39 @@ on:
         required: false
         type: string
         default: deepgemm
+      sail_image:
+        description: "Container image for the build/test pod. Empty uses the default image pinned in env."
+        required: false
+        type: string
+        default: ''
+      target_ref:
+        description: "DeepGEMM-for-sail PR URL, branch name, release tag (x.y.z+va.b.c) or commit id. Empty builds the checked-out ref."
+        required: false
+        type: string
+        default: ''
+      fast:
+        description: 'Compile only: skip wheel install, the check-in suite and its summary, keep the staged wheel.'
+        required: false
+        type: boolean
+        default: false
+      suites:
+        description: 'JSON list of check-in suites; "board" runs the board suite, other values are extra suite names.'
+        required: false
+        type: string
+        default: '["board", "ZW-M890P-MegaMoE"]'
+    outputs:
+      repo:
+        description: 'Source repository used for the build'
+        value: ${{ jobs.build-test.outputs.repo }}
+      commit:
+        description: 'Source commit used for the build'
+        value: ${{ jobs.build-test.outputs.commit }}
+      branch:
+        description: 'Source branch used for the build'
+        value: ${{ jobs.build-test.outputs.branch }}
+      tag:
+        description: 'Tags pointing at the built commit'
+        value: ${{ jobs.build-test.outputs.tag }}
   workflow_dispatch:
     inputs:
       matrix:
@@ -24,16 +57,121 @@ on:
         required: false
         type: string
         default: deepgemm
+      sail_image:
+        description: "Container image for the build/test pod. Empty uses the default image pinned in env."
+        required: false
+        type: string
+        default: ''
+      target_ref:
+        description: "DeepGEMM-for-sail PR URL, branch name, release tag (x.y.z+va.b.c) or commit id. Empty builds the checked-out ref."
+        required: false
+        type: string
+        default: ''
+      fast:
+        description: 'Compile only: skip wheel install, the check-in suite and its summary, keep the staged wheel.'
+        required: false
+        type: boolean
+        default: false
+      suites:
+        description: 'JSON list of check-in suites; "board" runs the board suite, other values are extra suite names.'
+        required: false
+        type: string
+        default: '["board", "ZW-M890P-MegaMoE"]'
 
 permissions:
   contents: read
 
 env:
-  SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
+  SAIL_IMAGE: ${{ inputs.sail_image || 'download.t-head.cn/docker_release/pytorch:sdk2.2.1-2.13.0-ubuntu24.04-hggcrt3-py312-20261123' }}
 
 jobs:
+  # Resolve the target once so every leg builds the same immutable commit.
+  resolve:
+    name: Resolve target
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      commit: ${{ steps.target.outputs.commit }}
+      branch: ${{ steps.target.outputs.branch }}
+      tag: ${{ steps.target.outputs.tag }}
+      requested: ${{ steps.target.outputs.requested }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: tags and commit ids resolve locally.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve target ref
+        id: target
+        shell: bash
+        env:
+          # Passed through env so the raw input never lands in the script text.
+          TARGET_REF_INPUT: ${{ inputs.target_ref }}
+        run: |
+          set -euo pipefail
+          # Accepted forms: PR URL / branch / release tag / commit id. Empty keeps
+          # the triggering ref, which is what the legs check out by default.
+          raw="${TARGET_REF_INPUT//[[:space:]]/}"
+          # Drop a pasted ?query/#fragment before validating.
+          raw="${raw%%[?#]*}"
+          branch=""
+          requested=false
+          if [[ -z "$raw" ]]; then
+            commit="$(git rev-parse --verify "HEAD^{commit}")"
+            branch="$(git symbolic-ref --quiet --short HEAD || true)"
+          else
+            requested=true
+            # Whitelist: the value is reused as a git ref below.
+            if [[ ! "$raw" =~ ^[A-Za-z0-9][A-Za-z0-9._/@:+-]*$ ]]; then
+              echo "::error::Unsupported target_ref '$TARGET_REF_INPUT': expected a PR URL, branch name, release tag or commit id"
+              exit 1
+            fi
+            case "$raw" in
+              *'/pull/'*)
+                # PR URL: keep only the number, dropping /files and any suffix.
+                num="${raw#*/pull/}"
+                num="${num%%[!0-9]*}"
+                [[ "$num" =~ ^[0-9]+$ ]] || { echo "::error::Cannot read a PR number from '$raw'"; exit 1; }
+                # PR head from any fork, matching what the PR's own checks build.
+                git fetch --no-tags origin "+refs/pull/${num}/head:refs/remotes/origin/pr/${num}"
+                commit="$(git rev-parse --verify "refs/remotes/origin/pr/${num}^{commit}")"
+                ;;
+              *)
+                if [[ "$raw" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                  # Release tag such as 2.8.2+v2.1.0: never a branch or a commit id.
+                  commit="$(git rev-parse --verify --quiet "refs/tags/${raw}^{commit}")" || {
+                    git fetch --no-tags origin "refs/tags/${raw}:refs/tags/${raw}"
+                    commit="$(git rev-parse --verify "refs/tags/${raw}^{commit}")"
+                  }
+                elif [[ "$raw" =~ ^[0-9]+$ ]] && [[ ${#raw} -ne 40 ]]; then
+                  echo "::error::Bare PR numbers are not supported: pass the PR URL, a branch name, a release tag or a commit id (got '$raw')"
+                  exit 1
+                elif git rev-parse --verify --quiet "refs/remotes/origin/${raw}^{commit}" > /dev/null; then
+                  commit="$(git rev-parse --verify "refs/remotes/origin/${raw}^{commit}")"
+                elif git rev-parse --verify --quiet "${raw}^{commit}" > /dev/null; then
+                  # Commit that is already present in the full-history checkout.
+                  commit="$(git rev-parse --verify "${raw}^{commit}")"
+                else
+                  git fetch --no-tags origin "$raw"
+                  commit="$(git rev-parse --verify "FETCH_HEAD^{commit}")"
+                fi
+                ;;
+            esac
+            # Keep the requested branch only when it names the resolved tip.
+            if [[ "$(git rev-parse --verify --quiet "refs/remotes/origin/${raw}^{commit}" || true)" == "$commit" ]]; then
+              branch="$raw"
+            fi
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "tag=$(git tag --points-at "$commit" | paste -sd ',' -)" >> "$GITHUB_OUTPUT"
+          echo "requested=$requested" >> "$GITHUB_OUTPUT"
+          echo "Target ref: ${raw:-<triggering ref>} -> $commit"
+
   build-test:
     name: Build & Test (${{ matrix.suite == 'board' && matrix.runner || matrix.suite }})
+    needs: resolve
     runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -41,12 +179,17 @@ jobs:
     # compilation and serial accuracy checks. Retain the existing ceiling
     # until board measurements establish a smaller end-to-end limit.
     timeout-minutes: 480
+    outputs:
+      repo: ${{ steps.source.outputs.repo }}
+      commit: ${{ steps.source.outputs.commit }}
+      branch: ${{ steps.source.outputs.branch }}
+      tag: ${{ steps.source.outputs.tag }}
     strategy:
       fail-fast: false
       matrix:
         # Respect the selected boards; MegaMoE check-in runs only on M890P.
         runner: ${{ fromJson(inputs.matrix || '["ZW-M890P", "ZW-810E"]') }}
-        suite: [board, ZW-M890P-MegaMoE]
+        suite: ${{ fromJson(inputs.suites || '["board", "ZW-M890P-MegaMoE"]') }}
         exclude:
           - runner: ZW-810E
             suite: ZW-M890P-MegaMoE
@@ -57,6 +200,42 @@ jobs:
           # Fetch submodules (e.g. third-party/actlize_*, third-party/fmt) at checkout time, recursively.
           submodules: recursive
           persist-credentials: false
+
+      - name: Checkout resolved target
+        # Move the checkout to the resolved commit; a fork PR head may need an extra fetch.
+        shell: bash
+        env:
+          # Passed through env so the value never lands in the script text.
+          TARGET_COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: |
+          set -euo pipefail
+          if [[ "$(git rev-parse HEAD)" != "$TARGET_COMMIT" ]]; then
+            if ! git checkout --detach "$TARGET_COMMIT"; then
+              git fetch --no-tags origin "$TARGET_COMMIT"
+              git checkout --detach FETCH_HEAD
+            fi
+            # Submodules must follow the checked-out tree, not the triggering ref.
+            git submodule sync --recursive
+            git submodule update --init --recursive
+          fi
+
+      - name: Record source information used for the build
+        id: source
+        shell: bash
+        env:
+          SOURCE_REPO: ${{ github.repository }}
+          TARGET_COMMIT: ${{ needs.resolve.outputs.commit }}
+          TARGET_BRANCH: ${{ needs.resolve.outputs.branch }}
+          TARGET_TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Guard the published metadata against a drifted checkout.
+          [[ "$(git rev-parse HEAD)" == "$TARGET_COMMIT" ]]
+          printf 'repo=%s\n' "$SOURCE_REPO" >> "$GITHUB_OUTPUT"
+          printf 'commit=%s\n' "$TARGET_COMMIT" >> "$GITHUB_OUTPUT"
+          printf 'branch=%s\n' "$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
+          printf 'tag=%s\n' "$TARGET_TAG" >> "$GITHUB_OUTPUT"
+
       - name: Build and Test on PPU
         id: ppu-test
         uses: t-head/ci-infra/cluster-run@main
@@ -78,6 +257,12 @@ jobs:
             git config --global --unset-all url.https://ai-gerrit.eng.t-head.cn/Public/Github/.insteadOf 2>/dev/null || true
             git config --global --add safe.directory '*'
             SOURCE_MODE='${{ inputs.source_mode }}'
+            # Only an explicit target_ref pins the checkout: the actlize modes
+            # re-clone the upstream repository, where the caller's commit is absent.
+            TARGET_COMMIT=""
+            if [[ '${{ needs.resolve.outputs.requested }}' == 'true' ]]; then
+              TARGET_COMMIT='${{ needs.resolve.outputs.commit }}'
+            fi
             case "$SOURCE_MODE" in
               ""|deepgemm)
                 cd /workspace/source
@@ -96,6 +281,16 @@ jobs:
                 mv "$ACTLIZE_V100_SOURCE" "$DEEPGEMM_SOURCE/third-party/actlize_v1.0.0"
                 mv "$DEEPGEMM_SOURCE" /workspace/source
                 cd /workspace/source
+                # The fresh clone starts at main; move it to the resolved target when one was requested.
+                # A PR head may be outside main's history, so fetch the commit when checkout misses.
+                if [[ -n "$TARGET_COMMIT" ]]; then
+                  if ! git checkout --detach "$TARGET_COMMIT"; then
+                    git fetch --no-tags origin "$TARGET_COMMIT"
+                    git checkout --detach FETCH_HEAD
+                  fi
+                  git submodule sync --recursive
+                  git submodule update --init --recursive
+                fi
                 ;;
               *)
                 echo "Unsupported source_mode: $SOURCE_MODE"
@@ -133,9 +328,15 @@ jobs:
                 tail -n 200 "$LOG_FILE"
             fi
             # Keep board check-in and MegaMoE reports in separate directories.
-            NAS_RESULT_DIR="/mnt/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.suite == 'board' && matrix.runner || matrix.suite }}"
+            # Key results by board and suite: a suite name may equal a board name.
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}-${{ matrix.suite }}"
             mkdir -p "$NAS_RESULT_DIR/dist"
             cp dist/*.whl "$NAS_RESULT_DIR/dist/"
+            # Fast mode: the wheel is already staged, so stop before installing and testing.
+            if [[ '${{ inputs.fast }}' == 'true' ]]; then
+              echo "Fast mode: skipping wheel install and the check-in suite"
+              exit 0
+            fi
             echo "START TO INSTALL WHEEL"
             pip install ./dist/*.whl --force-reinstall
             if [ '${{ matrix.suite }}' = 'ZW-M890P-MegaMoE' ]; then
@@ -160,20 +361,24 @@ jobs:
           cleanup_policy: on_success
 
       - name: Upload wheel
-        if: always()
+        # Only the first leg uploads: wheels are board independent, and duplicate
+        # file names would collide when the artifacts are merged. always() keeps
+        # the artifact available even when the suite failed.
+        if: ${{ always() && strategy.job-index == 0 }}
         uses: actions/upload-artifact@v4
         with:
-          name: deepgemm-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.suite == 'board' && matrix.runner || matrix.suite }}
-          path: /wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.suite == 'board' && matrix.runner || matrix.suite }}/dist/*.whl
+          name: deepgemm-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}-${{ matrix.suite }}
+          path: /wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}-${{ matrix.suite }}/dist/*.whl
           if-no-files-found: warn
           compression-level: 0
           retention-days: 14
 
       - name: Test summary (${{ matrix.suite == 'board' && matrix.runner || matrix.suite }})
-        if: always()
+        # Fast mode produces no JUnit report, so the summary must not run.
+        if: ${{ always() && !inputs.fast }}
         shell: bash
         run: |
-          NAS_RESULT_DIR="/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.suite == 'board' && matrix.runner || matrix.suite }}"
+          NAS_RESULT_DIR="/wl_nas/devops/deepgemm-ci/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}-${{ matrix.suite }}"
           XML_FILE="$NAS_RESULT_DIR/test-results.xml"
           ENV_FILE="$NAS_RESULT_DIR/env_info.json"
           echo "## Suite: ${{ matrix.suite == 'board' && matrix.runner || matrix.suite }}" >> "$GITHUB_STEP_SUMMARY"
