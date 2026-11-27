@@ -278,156 +278,123 @@ template <uint32_t BlockQ> __device__ __forceinline__ uint32_t fp4_varlen_q_span
     return 1u << fp4_varlen_q_shift<BlockQ>(valid);
 }
 
-template <uint32_t BlockQ, uint32_t SingletonCostMultiplier>
-__device__ __forceinline__ uint32_t fp4_varlen_request_unit(const FP4VarlenQBlock *desc, uint32_t q, uint32_t groups) {
-    const FP4VarlenQBlock first = desc[q];
-    const uint32_t pack = BlockQ >> fp4_varlen_q_shift<BlockQ>(first.valid_q);
-    uint32_t unit = 0;
-    for (uint32_t i = q; i < groups && desc[i].table_row == first.table_row; ++i)
-        unit += desc[i].valid_q;
-    return pack == 1 ? unit
-                     : first.valid_q * pack *
-                           (pack == 4 ? SingletonCostMultiplier : 1);
-}
-
-// Descriptors and prefix sums are temporary. Only CTA boundaries are returned.
-template <uint32_t BlockQ, uint32_t SplitKV, uint32_t NumWorkers, uint32_t SingletonCostMultiplier>
+// Only CTA boundaries are returned. Scan request cost from the end so a
+// single CTA can find the next request head across tiles with bounded storage.
+template <uint32_t BlockQ, uint32_t SplitKV, uint32_t NumWorkers, uint32_t SingletonCostMultiplier, uint32_t SharedRows>
 __device__ __forceinline__ void fp4_varlen_metadata(uint32_t nq, const uint32_t *lengths, const uint32_t *indices,
-                                                    FP4VarlenCTAStart *metadata, FP4VarlenQBlock *desc,
-                                                    uint64_t *prefix) {
-    constexpr uint32_t Threads = 256;
+                                                    FP4VarlenCTAStart *metadata, uint32_t *units,
+                                                    uint64_t *suffix) {
+    static_assert(BlockQ == 2 || BlockQ == 4);
+    constexpr uint32_t Threads = 256, Warps = Threads / 32;
     const uint32_t tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
-    __shared__ uint64_t warp_cost[8], carried_cost;
-    __shared__ uint32_t warp_count[8], carried_count;
-    for (uint32_t q = tid; q < nq; q += Threads) {
-        desc[q] = FP4VarlenQBlock{0, 0, 0, 0};
+    __shared__ uint64_t warp_cost[Warps], carried_cost;
+    __shared__ uint32_t warp_first[Warps], next_run;
+    if constexpr (SharedRows > 0) {
+        __shared__ uint32_t shared_units[SharedRows];
+        __shared__ uint64_t shared_suffix[SharedRows];
+        units = shared_units;
+        suffix = shared_suffix;
     }
-    __syncthreads();
-    for (uint32_t q = tid; q < nq; q += Threads) {
-        if (q && indices[q] == indices[q - 1])
-            continue;
-        uint32_t end = q + 1;
-        while (end < nq && indices[end] == indices[q]) ++end;
-        // The caller guarantees this row has the run's maximum context.
-        const uint32_t context = lengths[end - 1];
-        const uint32_t count = end - q, blocks = math::ceil_div(count, BlockQ);
-        const uint32_t base = count / blocks, remainder = count % blocks;
-        uint32_t start = q;
-        for (uint32_t b = 0; b < blocks; ++b) {
-            const uint32_t valid = base + (b < remainder);
-            desc[start] = FP4VarlenQBlock{start, valid, context, q};
-            start += valid;
-        }
-    }
-    __syncthreads();
-    if (!tid)
-        carried_count = 0;
-    __syncthreads();
-    // All inputs of a chunk are read before compacted outputs overwrite them.
-    for (uint32_t base = 0; base < nq; base += Threads) {
-        const uint32_t q = base + tid;
-        FP4VarlenQBlock d = FP4VarlenQBlock{0, 0, 0, 0};
-        if (q < nq) {
-            const volatile FP4VarlenQBlock* source = desc + q;
-            d = FP4VarlenQBlock{source->source_q, source->valid_q, source->context_len, source->table_row};
-        }
-        const bool valid = d.valid_q != 0;
-        uint32_t count = valid;
-#pragma unroll
-        for (uint32_t offset = 1; offset < 32; offset <<= 1) {
-            uint32_t n = __shfl_up_sync(0xffffffffu, count, offset);
-            if (lane >= offset)
-                count += n;
-        }
-        if (lane == 31)
-            warp_count[warp] = count;
-        __syncthreads();
-        if (!tid) {
-            uint32_t n = carried_count;
-#pragma unroll
-            for (uint32_t w = 0; w < 8; ++w) {
-                const uint32_t next_n = n + warp_count[w];
-                warp_count[w] = n;
-                n = next_n;
-            }
-            carried_count = n;
-        }
-        __syncthreads();
-        if (valid) {
-            const uint32_t out = warp_count[warp] + count - 1;
-            desc[out] = d;
-        }
-        __syncthreads();
-    }
-    const uint32_t groups = carried_count;
-    if (!tid)
+    if (!tid) {
         carried_cost = 0;
+        next_run = nq;
+    }
     __syncthreads();
-    for (uint32_t base = 0; base < groups; base += Threads) {
-        const uint32_t q = base + tid;
+    for (uint32_t tile = math::ceil_div(nq, Threads); tile > 0; --tile) {
+        const uint32_t q = (tile - 1) * Threads + tid;
+        const uint32_t id = q < nq ? indices[q] : 0;
+        const uint32_t previous = __shfl_up_sync(0xffffffffu, id, 1);
+        const bool head = q < nq && (q == 0 || id != (lane ? previous : indices[q - 1]));
+        const uint32_t heads = __ballot_sync(0xffffffffu, head);
+        if (!lane)
+            warp_first[warp] = heads ? q + __ffs(heads) - 1 : nq;
+        __syncthreads();
         uint64_t cost = 0;
-        if (q < groups) {
-            const uint32_t pack = BlockQ / fp4_varlen_q_span<BlockQ>(desc[q].valid_q);
-            if (desc[q].source_q == desc[q].table_row)
-                cost = uint64_t(math::ceil_div(desc[q].context_len, SplitKV * pack)) *
-                       fp4_varlen_request_unit<BlockQ, SingletonCostMultiplier>(desc, q, groups);
+        if (head) {
+            uint32_t end = nq;
+            const uint32_t following = heads & (0xfffffffeu << lane);
+            if (following) {
+                end = (q & ~31u) + __ffs(following) - 1;
+            } else {
+                for (uint32_t w = warp + 1; w < Warps && end == nq; ++w)
+                    end = warp_first[w];
+                if (end == nq)
+                    end = next_run;
+            }
+            // The largest Q block has at least three queries for H32
+            // runs of length >= 3, and two queries for H64 runs of length >= 2.
+            const uint32_t count = end - q;
+            const uint32_t shift = count == 1 ? (BlockQ == 4 ? 2u : 1u)
+                : (BlockQ == 4 && count == 2 ? 1u : 0u);
+            const uint32_t pack = 1u << shift;
+            const uint32_t unit = (count << shift) * (shift == 2 ? SingletonCostMultiplier : 1);
+            const uint32_t splits = math::ceil_div(lengths[end - 1], SplitKV);
+            cost = uint64_t((splits + pack - 1) >> shift) * unit;
+            units[q] = unit;
         }
+        const uint64_t own_cost = cost;
 #pragma unroll
         for (uint32_t offset = 1; offset < 32; offset <<= 1) {
-            const uint32_t lo = __shfl_up_sync(0xffffffffu, uint32_t(cost), offset);
-            const uint32_t hi = __shfl_up_sync(0xffffffffu, uint32_t(cost >> 32), offset);
-            if (lane >= offset)
+            const uint32_t lo = __shfl_down_sync(0xffffffffu, uint32_t(cost), offset);
+            const uint32_t hi = __shfl_down_sync(0xffffffffu, uint32_t(cost >> 32), offset);
+            if (lane + offset < 32)
                 cost += (uint64_t(hi) << 32) | lo;
         }
-        if (lane == 31)
+        if (!lane)
             warp_cost[warp] = cost;
         __syncthreads();
         if (!tid) {
             uint64_t c = carried_cost;
+            uint32_t next = next_run;
 #pragma unroll
-            for (uint32_t w = 0; w < 8; ++w) {
-                const uint64_t next = c + warp_cost[w];
-                warp_cost[w] = c;
-                c = next;
+            for (uint32_t w = Warps; w > 0; --w) {
+                const uint64_t new_cost = c + warp_cost[w - 1];
+                warp_cost[w - 1] = c;
+                c = new_cost;
+                next = min(next, warp_first[w - 1]);
             }
             carried_cost = c;
+            next_run = next;
         }
         __syncthreads();
-        if (q < groups)
-            prefix[q] = warp_cost[warp] + cost;
+        if (q < nq)
+            suffix[q] = warp_cost[warp] + cost - own_cost;
         __syncthreads();
     }
     const uint64_t total = carried_cost;
-    for (uint32_t worker = tid; worker <= NumWorkers; worker += Threads) {
-        // floor(total * worker / NumWorkers), without overflowing uint64_t.
-        // Divide proportional cost intervals before aligning request boundaries.
-        const uint64_t target = (total / NumWorkers) * worker + ((total % NumWorkers) * worker) / NumWorkers;
-        uint32_t lo = 0, hi = groups;
+    // The exclusive suffix at q equals total minus the original prefix
+    // at q. Equal suffix values skip rows with no work.
+    auto first_below = [&](uint32_t lo, uint64_t remaining) {
+        uint32_t hi = nq;
         while (lo < hi) {
             const uint32_t mid = lo + (hi - lo) / 2;
-            if (prefix[mid] <= target)
+            if (suffix[mid] >= remaining)
                 lo = mid + 1;
             else
                 hi = mid;
         }
-        const uint64_t before = lo ? prefix[lo - 1] : 0;
-        uint32_t split = 0;
-        if (lo < groups) {
-            const uint32_t unit = fp4_varlen_request_unit<BlockQ, SingletonCostMultiplier>(desc, lo, groups);
-            const uint64_t from_start = target - before, to_end = prefix[lo] - target;
-            // Move at most one split, within half a worker's cost budget,
-            // to avoid loading two requests' Q for a nearly aligned interval.
+        return lo;
+    };
+    for (uint32_t worker = tid; worker <= NumWorkers; worker += Threads) {
+        // Quotient and remainder avoid overflow in total * worker.
+        const uint64_t target = (total / NumWorkers) * worker + ((total % NumWorkers) * worker) / NumWorkers;
+        const uint64_t remaining = total - target;
+        uint32_t q = first_below(0, remaining), split = 0;
+        if (q < nq) {
+            // The exclusive suffix drops only at nonempty request heads.
+            const uint32_t unit = units[q];
+            const uint64_t before = q ? suffix[q - 1] : total;
+            const uint64_t after = suffix[q];
+            const uint64_t from_start = before - remaining, to_end = remaining - after;
             const uint64_t margin = min(uint64_t(unit), total / NumWorkers / 2);
             if (min(from_start, to_end) <= margin) {
-                if (to_end < from_start) {
-                    const uint64_t boundary = prefix[lo];
-                    do { ++lo; } while (lo < groups && prefix[lo] <= boundary);
-                }
+                if (to_end < from_start)
+                    q = first_below(q + 1, after);
             } else {
                 split = uint32_t(from_start / unit);
             }
         }
-        metadata[worker] = FP4VarlenCTAStart{lo < groups ? desc[lo].table_row : nq, split};
+        metadata[worker] = FP4VarlenCTAStart{q, split};
     }
     __syncthreads();
 }

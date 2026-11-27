@@ -873,6 +873,85 @@ def test_sparse_workspace():
 
 
 # Request-grouped FP4 regressions: keep broad shape/performance sweeps offline.
+def test_paged_fp4_varlen_metadata_scan():
+    if not is_ppu1v5_device():
+        return
+    from bisect import bisect_right
+    from itertools import groupby
+
+    def reference(ids, lengths, block_q, split_kv, workers):
+        starts, units, prefix = [], [], [0]
+        start = 0
+        for _, run in groupby(ids):
+            count = sum(1 for _ in run)
+            end = start + count
+            blocks = (count + block_q - 1) // block_q
+            max_valid = (count + blocks - 1) // blocks
+            span = 1 << (max_valid - 1).bit_length()
+            pack = block_q // span
+            unit = count * pack * (2 if pack == 4 else 1)
+            width = split_kv * pack
+            cost = ((lengths[end - 1] + width - 1) // width) * unit
+            if cost:
+                starts.append(start)
+                units.append(unit)
+                prefix.append(prefix[-1] + cost)
+            start = end
+
+        total = prefix[-1]
+        starts.append(len(ids))
+        boundaries = []
+        for worker in range(workers + 1):
+            target = total * worker // workers
+            request = bisect_right(prefix, target) - 1
+            split = 0
+            if request < len(units):
+                left = target - prefix[request]
+                right = prefix[request + 1] - target
+                if min(left, right) <= min(units[request], total // workers // 2):
+                    request += int(right < left)
+                else:
+                    split = left // units[request]
+            boundaries.append((starts[request], split))
+        return torch.tensor(boundaries, dtype=torch.int32)
+
+    sms = deep_gemm.get_num_sms()
+    for heads, block_q, split_kv, workers_per_cu in ((32, 4, 128, 5), (64, 2, 256, 3)):
+        for nq in (255, 256, 257, 1023, 1024, 1025):
+            ids = torch.empty(nq, dtype=torch.int32, device='cuda')
+            lengths = torch.empty((nq, 1), dtype=torch.int32, device='cuda')
+
+            def update(phase):
+                # Straddle warp/tile boundaries with live runs and interleave zero-work runs.
+                stops = (1, 29, 34, 63, 97, 251, 265, 509, 522, 1019)
+                cuts = [0] + [q + phase for q in stops if q + phase < nq] + [nq]
+                host_ids, host_lengths = [], []
+                for run, (start, end) in enumerate(zip(cuts, cuts[1:])):
+                    count = end - start
+                    last = 0 if phase == 2 or run % 4 == 1 else (17 + 5 * run + phase) * split_kv + 1
+                    host_ids.extend([3 * phase + run % 3] * count)
+                    host_lengths.extend(max(0, last - offset) for offset in range(count - 1, -1, -1))
+                ids.copy_(torch.tensor(host_ids, dtype=torch.int32))
+                lengths.copy_(torch.tensor(host_lengths, dtype=torch.int32)[:, None])
+                return reference(host_ids, host_lengths, block_q, split_kv, sms * workers_per_cu)
+
+            def schedule():
+                return deep_gemm.get_paged_mqa_logits_metadata(
+                    lengths, 64, sms, indices=ids, metadata_extra=(1, heads, 128, torch.int8))
+
+            expected = update(0)
+            assert torch.equal(schedule().cpu(), expected), (heads, nq, 'eager')
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                metadata = schedule()
+            for phase in (1, 2):
+                expected = update(phase)
+                metadata.fill_(-1)
+                graph.replay()
+                assert torch.equal(metadata.cpu(), expected), (heads, nq, phase)
+    print('PASS grouped FP4 metadata scan and Graph replay', flush=True)
+
+
 class _PagedFP4VarlenCase:
     def __init__(self, heads, page, context=4097):
         self.heads, self.page, self.context = heads, page, context
@@ -1105,5 +1184,6 @@ if __name__ == '__main__':
     test_sparse_mqa_logits_loop()
     test_sparse_input_contracts()
     test_sparse_workspace()
+    test_paged_fp4_varlen_metadata_scan()
     test_paged_fp4_varlen()
     test_paged_fp4_varlen_replay()
