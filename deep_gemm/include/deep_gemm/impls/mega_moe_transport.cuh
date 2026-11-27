@@ -165,6 +165,7 @@ CUTLASS_DEVICE void dispatch_handshake(
         const uint32_t& thread_idx) {
     const auto block_sync = [=]() { __syncthreads(); };
     const uint32_t capacity = workspace.num_max_tokens_per_rank;
+    const uint32_t num_ctas = kNumCTAs > 0 ? kNumCTAs : gridDim.x;
 
     // Small decode batches fit in one routing CTA. The remaining CTAs wait
     // at the cross-rank barrier's epilogue and then help transport payloads.
@@ -179,7 +180,7 @@ CUTLASS_DEVICE void dispatch_handshake(
             const uint32_t total = num_tokens * kNumTopk;
             const uint32_t first = single_count_cta ? thread_idx
                 : cta_idx * kNumThreads + thread_idx;
-            const uint32_t stride = single_count_cta ? kNumThreads : kNumCTAs * kNumThreads;
+            const uint32_t stride = single_count_cta ? kNumThreads : num_ctas * kNumThreads;
             for (uint32_t p = first; p < total; p += stride) {
                 const int64_t expert_idx = __ldg(input_topk_idx + p);
                 if (expert_idx >= 0 &&
@@ -197,7 +198,7 @@ CUTLASS_DEVICE void dispatch_handshake(
         for (uint32_t i = thread_idx; i < kNumExperts; i += kNumThreads) {
             if (single_count_cta) {
                 *workspace.get_expert_send_count_ptr(i) =
-                    (static_cast<uint64_t>(kNumCTAs) << 32) | smem_expert_count[i];
+                    (static_cast<uint64_t>(num_ctas) << 32) | smem_expert_count[i];
                 smem_expert_count[i] = 0;
             } else {
                 const uint64_t send_value =

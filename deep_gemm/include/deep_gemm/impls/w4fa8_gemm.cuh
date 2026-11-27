@@ -3,6 +3,8 @@
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 #pragma clang diagnostic ignored "-Wswitch"
 
+#include <type_traits>
+#include <utility>
 #include <cute/ppu_tensor_mix.hpp>
 #include <cutlass/gemm/config/gemm_operands.hpp>
 #include <cute/atom/mma_traits_ppu0010.hpp>
@@ -26,7 +28,23 @@ using namespace cute;
 
 namespace cutlass::gemm::kernel {
 
+template <class Scheduler, class = void> struct W4A8DeferredA : std::false_type {};
+template <class Scheduler>
+struct W4A8DeferredA<Scheduler, std::void_t<decltype(std::declval<Scheduler&>().wait_for_input())>>
+    : std::true_type {};
+
+
 using deep_gemm::GemmType;
+
+template <class Epilogue, class = void>
+struct W4A8EpilogueTraits {
+  static constexpr bool BatchDecode = false;
+};
+
+template <class Epilogue>
+struct W4A8EpilogueTraits<Epilogue, std::void_t<decltype(Epilogue::kBatchDecode)>> {
+  static constexpr bool BatchDecode = Epilogue::kBatchDecode;
+};
 
 template <int ShapeN, int ShapeK, int BlockM, int BlockN, int BlockK, int WarpM, int WarpN, int WarpK, int kNumGroups,
           int kNumStages, GemmType kGemmType, int N_EXPAND = 1, bool ApplyInvScale = false,
@@ -39,8 +57,8 @@ public:
   static constexpr bool Compact = Fragment == deep_gemm::w4fa8::FragmentPolicy::RollingK32;
   static constexpr int DecodeN = WideM ? 1 : WarpN / 16;
   // A narrow ring bounds live A operands for wide M tiles.
-  static constexpr int ADistance = ALoad == deep_gemm::w4fa8::ALoadPolicy::Ring2 ? 1 : -1;
-  static constexpr bool EarlyA = ALoad == deep_gemm::w4fa8::ALoadPolicy::Ring2;
+  static constexpr bool EarlyA = ALoad != deep_gemm::w4fa8::ALoadPolicy::Bulk;
+  static constexpr int ADistance = EarlyA ? (ALoad == deep_gemm::w4fa8::ALoadPolicy::Ring3 ? 2 : 1) : -1;
   static_assert(!WideM || (Compact && EarlyA && BlockN == 256 && WarpN == 32),
                 "W4FA8 wide tiles require RollingK32/Ring2 with BlockN256/WarpN32");
   static_assert(BlockK == WarpK, "W4FA8 native tiles require BlockK == WarpK");
@@ -231,6 +249,9 @@ public:
   template <class Scheduler, class Epilogue>
   CUTLASS_DEVICE void run(Params const& params, char* smem_buf,
                          Scheduler& deep_scheduler, const Epilogue& epilogue) {
+    constexpr bool BatchDecode = W4A8EpilogueTraits<Epilogue>::BatchDecode;
+    static_assert(!BatchDecode || (!WideM && !Compact && WarpN == 64),
+                  "batched FP4 decode requires a FullK WarpN64 tile");
     int thread_idx = threadIdx.x;
     int warp_idx = canonical_warp_idx_sync();
     int warpm_idx = warp_idx % WarpsOnM;
@@ -640,8 +661,12 @@ public:
       auto epilogue_no_tsm = [&](auto active_m) {
         constexpr int UsedM = decltype(active_m)::value;
         if constexpr (!cute::is_same_v<Epilogue, DefaultEpilogue>) {
+          const float* staged_scales = nullptr;
+          // Keep staged row scales clear of the epilogue scratch tile.
+          if constexpr (WideM && Epilogue::SharedBytes <= sizeof(MainloopStorage))
+            staged_scales = storage.row_scales[scale_buffer];
           epilogue.store(accum, thr_mma.partition_C(cD), deep_scheduler,
-                         m_block_idx, n_block_idx, residual_m);
+                         m_block_idx, n_block_idx, residual_m, staged_scales, active_m);
           return;
         }
 
@@ -691,11 +716,26 @@ public:
       // mainloop
       constexpr int k_tile_count = size<2>(gB);
       uint32_t current_stage = 0;
+      constexpr bool DeferA = W4A8DeferredA<std::remove_reference_t<decltype(deep_scheduler)>>::value;
+      if constexpr (DeferA) {
+        static_assert(!WideM && !CacheRowScale && !ResidentA);
+        // The first weight and scale copy is independent of routing readiness.
+        // Keep it in the same async group as the first A copy.
+        g2s_copy_B_and_scale(0, 0);
+        deep_scheduler.wait_for_input();
+      }
       // Prologue
       CUTLASS_PRAGMA_UNROLL
       for (int k_pipe = 0; k_pipe < kNumStages - 1; k_pipe++) {
         if (k_pipe < k_tile_count) {
-          g2s(k_pipe, k_pipe);
+          if constexpr (DeferA) {
+            if (k_pipe == 0)
+              g2s_copy_A(0, 0);
+            else
+              g2s(k_pipe, k_pipe);
+          } else {
+            g2s(k_pipe, k_pipe);
+          }
         }
         current_stage++;
         cp_async_fence();
@@ -807,14 +847,30 @@ public:
                 if constexpr (WarpM <= 64)
                   s2r_copy_A(ResidentA ? k_tile_idx : stage_idx, k_block);
 
-#pragma unroll
-                for (int n_block = 0; n_block < WarpN / 16; n_block++) {
+                if constexpr (BatchDecode) {
+                  // Use the existing four N fragments independently before
+                  // converting their results; each half reuses the same slots.
                   CUTE_UNROLL
                   for (int half = 0; half < 2; ++half) {
-                    auto dequant_accum = decode_fragment(n_block, half);
-                    clear(dequant_accum);
-                    fp4_mma_dequant(n_block, 2 * k_block + half);
-                    quant_fp32C_to_e5m2B(n_block, k_block, half);
+                    CUTE_UNROLL
+                    for (int n_block = 0; n_block < WarpN / 16; ++n_block) {
+                      clear(decode_fragment(n_block, half));
+                      fp4_mma_dequant(n_block, 2 * k_block + half);
+                    }
+                    CUTE_UNROLL
+                    for (int n_block = 0; n_block < WarpN / 16; ++n_block)
+                      quant_fp32C_to_e5m2B(n_block, k_block, half);
+                  }
+                } else {
+#pragma unroll
+                  for (int n_block = 0; n_block < WarpN / 16; n_block++) {
+                    CUTE_UNROLL
+                    for (int half = 0; half < 2; ++half) {
+                      auto dequant_accum = decode_fragment(n_block, half);
+                      clear(dequant_accum);
+                      fp4_mma_dequant(n_block, 2 * k_block + half);
+                      quant_fp32C_to_e5m2B(n_block, k_block, half);
+                    }
                   }
                 }
                 if constexpr (WarpM > 64)

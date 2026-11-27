@@ -1,8 +1,25 @@
 #pragma once
 #include <cstdint>
+#include <deep_gemm/layout/sym_buffer.cuh>
+
+namespace deep_gemm::layout {
+struct RoutedMoESignals;
+}
+
+namespace deep_gemm::mega_moe {
+struct FusedReduceParams {
+    layout::SymBuffer<> sym_buffer;
+    const float* weights = nullptr;
+    const int64_t* ids = nullptr;
+    void* output = nullptr;
+    layout::RoutedMoESignals* signals = nullptr;
+    int tokens = 0, num_experts = 0;
+};
+} // namespace deep_gemm::mega_moe
+
 namespace deep_gemm::w4fa8 {
 enum class FragmentPolicy { FullK, RollingK32 };
-enum class ALoadPolicy { Bulk, Ring2 };
+enum class ALoadPolicy { Bulk, Ring2, Ring3 };
 
 constexpr bool uses_ring_a(int warp_m) {
   return warp_m >= 80 && warp_m <= 192 && warp_m % 16 == 0;
