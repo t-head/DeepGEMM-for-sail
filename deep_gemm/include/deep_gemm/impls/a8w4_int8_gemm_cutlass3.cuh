@@ -102,7 +102,7 @@ struct A8W4PackedOperandB {
 
 namespace cutlass::gemm {
 
-template <int Stages_, typename Schedule_ = KernelAiuMultistage, int CopyKTilesPerFlag_ = 0>
+template <int Stages_, typename Schedule_ = KernelAiuMultistage, int CopyKTilesPerFlag_ = 0, bool TrimMTail = false>
 struct MainloopPPUAiuA8W4 {
   static constexpr int Stages = Stages_;
   static constexpr int CopyKTilesPerFlag = CopyKTilesPerFlag_;
@@ -116,18 +116,18 @@ struct MainloopPPUAiuA8W4 {
 namespace cutlass::gemm::collective {
 
 template <
-    int Stages, typename KernelSchedule, int CopyKTilesPerFlag,
+    int Stages, typename KernelSchedule, int CopyKTilesPerFlag, bool TrimMTail,
     typename TileShape_, typename StrideA_, typename StrideB_,
     typename TiledMma_, typename GmemTiledCopyA_, typename SmemLayoutAtomA_, typename SmemCopyAtomA_,
     typename TransformA_, typename GmemTiledCopyB_, typename SmemLayoutAtomB_, typename SmemCopyAtomB_,
     typename TransformB_>
 struct CollectiveMma<
-    cutlass::arch::PPU0010, MainloopPPUAiuA8W4<Stages, KernelSchedule, CopyKTilesPerFlag>, TileShape_,
+    cutlass::arch::PPU0010, MainloopPPUAiuA8W4<Stages, KernelSchedule, CopyKTilesPerFlag, TrimMTail>, TileShape_,
     int8_t, StrideA_, cutlass::int4b_t, StrideB_, TiledMma_,
     GmemTiledCopyA_, SmemLayoutAtomA_, SmemCopyAtomA_, TransformA_,
     GmemTiledCopyB_, SmemLayoutAtomB_, SmemCopyAtomB_, TransformB_> {
 public:
-  using DispatchPolicy = MainloopPPUAiuA8W4<Stages, KernelSchedule, CopyKTilesPerFlag>;
+  using DispatchPolicy = MainloopPPUAiuA8W4<Stages, KernelSchedule, CopyKTilesPerFlag, TrimMTail>;
   using TileShape = TileShape_;
   using ElementA = int8_t;
   using StrideA = StrideA_;
@@ -265,7 +265,7 @@ public:
       }
 
       mma_mainloop(mma_acc, cute::get<0>(inputs), cute::get<1>(inputs), k_tile_iter, k_tile_count,
-                   thread_idx, smem_buf);
+                   thread_idx, smem_buf, cute::get<0>(residue));
 
       CUTLASS_PRAGMA_UNROLL
       for (int n = 0; n < kMmaN; ++n) {
@@ -279,7 +279,7 @@ public:
       }
     } else {
       mma_mainloop(mma_acc, cute::get<0>(inputs), cute::get<1>(inputs), k_tile_iter, k_tile_count,
-                   thread_idx, smem_buf);
+                   thread_idx, smem_buf, cute::get<0>(residue));
 
       TiledMma tiled_mma;
       auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
@@ -322,7 +322,7 @@ private:
   template <class FrgTensorAcc, class TensorA, class TensorB, class KTileIterator>
   CUTLASS_DEVICE void mma_mainloop(
       FrgTensorAcc& accum, TensorA const& gA, TensorB const& gB,
-      KTileIterator k_tile_iter, int k_tile_count, int thread_idx, char* smem_buf) {
+      KTileIterator k_tile_iter, int k_tile_count, int thread_idx, char* smem_buf, int valid_rows) {
     using namespace cute;
     clear(accum);
     using SmemLayoutA = typename MixedInputBase::SmemLayoutA;
@@ -397,53 +397,76 @@ private:
     constexpr int K_ATOM_PER_COPY = size<2>(decltype(tCrB_mma){}) / K_BLOCK_MAX;
     using Converter = cutlass::MixGemmNumericArrayConverter<int8_t, ElementB, 32>;
 
-    CUTLASS_PRAGMA_NO_UNROLL
-    for (int k_tile = 0; k_tile < num_k_tiles; ++k_tile) {
-      // Tile k_tile is commit group k_tile; one refill group is committed per iteration after the first.
-      if (k_tile == 0) {
-        cp_async_wait<kStages - 1>();
-      } else {
-        cp_async_wait<kStages - 2>();
-      }
-      __syncthreads();
-
-      // Every warp has finished reading the previous stage, so refill it with the next pending k-tile.
-      const int smem_pipe_read = k_tile % kStages;
-      if (k_tile > 0) {
-        const int smem_pipe_write = (k_tile - 1) % kStages;
-        if (k_tile_count > 0) {
-          wait_for_a();
-          copy_aiu(gmem_tiled_copy_A, tAgA(_, _, _, *k_tile_iter), tAsA(_, _, _, smem_pipe_write),
-                   gmem_tiled_copy_B, tBgB(_, _, _, idx2crd(*k_tile_iter, k_iter_shape)), tBsB(_, _, _, smem_pipe_write),
-                   warp_idx);
-          ++k_tile_iter;
+    const auto run_mma = [&](auto active_m) {
+      CUTLASS_PRAGMA_NO_UNROLL
+      for (int k_tile = 0; k_tile < num_k_tiles; ++k_tile) {
+        // Tile k_tile is commit group k_tile; one refill group is committed per iteration after the first.
+        if (k_tile == 0) {
+          cp_async_wait<kStages - 1>();
+        } else {
+          cp_async_wait<kStages - 2>();
         }
-        cp_async_fence();
-        --k_tile_count;
-      }
+        __syncthreads();
 
-      CUTLASS_PRAGMA_UNROLL
-      for (int k_block = 0; k_block < K_BLOCK_MAX; ++k_block) {
-        copy(smem_tiled_copy_B, tCsB(_, _, k_block, smem_pipe_read), tCrB_copy_view(_, _, k_block));
-        copy(smem_tiled_copy_A, tCsA(_, _, k_block, smem_pipe_read), tCrA_copy_view(_, _, k_block));
-
-        Tensor cvt_in = recast<ElementB>(tCrB_load(_, _, k_block));
-        Tensor cvt_out = make_tensor(tCrB_mma(_, _, k_block * K_ATOM_PER_COPY).data(), cvt_in.layout());
-        static_assert(size(decltype(cvt_in.layout()){}) % 32 == 0, "Unexpected packed B fragment size");
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(decltype(cvt_in.layout()){}) / 32; ++i) {
-          auto const* src = reinterpret_cast<typename Converter::source_type const*>(raw_pointer_cast(cvt_in(_, i).data()));
-          auto* dst = reinterpret_cast<typename Converter::result_type*>(raw_pointer_cast(cvt_out(_, i).data()));
-          *dst = Converter::convert(*src);
+        // Every warp has finished reading the previous stage, so refill it with the next pending k-tile.
+        const int smem_pipe_read = k_tile % kStages;
+        if (k_tile > 0) {
+          const int smem_pipe_write = (k_tile - 1) % kStages;
+          if (k_tile_count > 0) {
+            wait_for_a();
+            copy_aiu(gmem_tiled_copy_A, tAgA(_, _, _, *k_tile_iter), tAsA(_, _, _, smem_pipe_write),
+                     gmem_tiled_copy_B, tBgB(_, _, _, idx2crd(*k_tile_iter, k_iter_shape)), tBsB(_, _, _, smem_pipe_write),
+                     warp_idx);
+            ++k_tile_iter;
+          }
+          cp_async_fence();
+          --k_tile_count;
         }
 
         CUTLASS_PRAGMA_UNROLL
-        for (int k_atom = 0; k_atom < K_ATOM_PER_COPY; ++k_atom) {
-          const int atom_idx = k_block * K_ATOM_PER_COPY + k_atom;
-          cute::gemm(tiled_mma, accum,
-                     tCrA(_, _, atom_idx), tCrB_mma(_, _, atom_idx), accum);
+        for (int k_block = 0; k_block < K_BLOCK_MAX; ++k_block) {
+          copy(smem_tiled_copy_B, tCsB(_, _, k_block, smem_pipe_read), tCrB_copy_view(_, _, k_block));
+          copy(smem_tiled_copy_A, tCsA(_, _, k_block, smem_pipe_read), tCrA_copy_view(_, _, k_block));
+
+          Tensor cvt_in = recast<ElementB>(tCrB_load(_, _, k_block));
+          Tensor cvt_out = make_tensor(tCrB_mma(_, _, k_block * K_ATOM_PER_COPY).data(), cvt_in.layout());
+          static_assert(size(decltype(cvt_in.layout()){}) % 32 == 0, "Unexpected packed B fragment size");
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < size(decltype(cvt_in.layout()){}) / 32; ++i) {
+            auto const* src = reinterpret_cast<typename Converter::source_type const*>(raw_pointer_cast(cvt_in(_, i).data()));
+            auto* dst = reinterpret_cast<typename Converter::result_type*>(raw_pointer_cast(cvt_out(_, i).data()));
+            *dst = Converter::convert(*src);
+          }
+
+          CUTLASS_PRAGMA_UNROLL
+          for (int k_atom = 0; k_atom < K_ATOM_PER_COPY; ++k_atom) {
+            const int atom_idx = k_block * K_ATOM_PER_COPY + k_atom;
+            if constexpr (decltype(active_m)::value == size<1>(FrgTensorAcc{})) {
+              cute::gemm(tiled_mma, accum,
+                         tCrA(_, _, atom_idx), tCrB_mma(_, _, atom_idx), accum);
+            } else {
+              CUTLASS_PRAGMA_UNROLL
+              for (int n = 0; n < size<2>(FrgTensorAcc{}); ++n) {
+                CUTLASS_PRAGMA_UNROLL
+                for (int m = 0; m < decltype(active_m)::value; ++m) {
+                  cute::gemm(tiled_mma, tCrA(_, m, atom_idx), tCrB_mma(_, n, atom_idx), accum(_, m, n));
+                }
+              }
+            }
+          }
         }
       }
+    };
+    constexpr int kRowsPerMmaGroup = WarpOnM * 16;
+    constexpr int kMmaGroups = size<1>(FrgTensorAcc{});
+    if constexpr (TrimMTail && kMmaGroups == 4) {
+      // Each group interleaves 16 M rows from every warp in the M dimension.
+      if (valid_rows <= kRowsPerMmaGroup) run_mma(Int<1>{});
+      else if (valid_rows <= 2 * kRowsPerMmaGroup) run_mma(Int<2>{});
+      else if (valid_rows <= 3 * kRowsPerMmaGroup) run_mma(Int<3>{});
+      else run_mma(Int<4>{});
+    } else {
+      run_mma(Int<kMmaGroups>{});
     }
 
     cp_async_wait<0>();
