@@ -130,7 +130,7 @@ struct CastToFP8PerToken {
             } else {
                 atomicMax(reinterpret_cast<unsigned*>(scale),
                     __float_as_uint(get_scale(float(rounded))));
-                if constexpr (RowTiles > 1) __threadfence();
+                __threadfence();
             }
         }
         __syncthreads();

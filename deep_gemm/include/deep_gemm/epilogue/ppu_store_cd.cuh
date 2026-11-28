@@ -72,7 +72,7 @@ public:
         epilogue_operator.finalize();
         __syncthreads();
     }
-private:
+protected:
     const Params& args;
     SharedStorage& storage;
 };
@@ -81,11 +81,7 @@ template <class Base, int BM, int BN, int RowTiles,
           class EpilogueOperator = epilogue::operators::CastToFP8PerToken>
 struct EinsumUnbufferedEpilogue : PPUStoreCD<Base, BM, BN> {
     using Parent = PPUStoreCD<Base, BM, BN>;
-    using Params = typename Parent::Params;
-    const Params& ep;
-    typename Parent::SharedStorage& tile;
-    CUTLASS_DEVICE EinsumUnbufferedEpilogue(const Params& p, typename Parent::SharedStorage& s)
-        : Parent(p, s), ep(p), tile(s) {}
+    using Parent::Parent;
 
     uint32_t* output_base = nullptr;
 
@@ -100,19 +96,19 @@ struct EinsumUnbufferedEpilogue : PPUStoreCD<Base, BM, BN> {
         const int cols = min(BN, get<1>(problem) - col0);
         const int rows = min(BM, get<0>(problem) - first);
 
-        if (ep.phase != RowQuantPhase::Store) {
+        if (this->args.phase != RowQuantPhase::Store) {
             EpilogueOperator::template reduce_and_publish<Base::kIsAlignedN, BM, RowTiles>(
-                acc, coords, mma, tile.values, ep.epilogue_args.row_scales,
+                acc, coords, mma, this->storage.values, this->args.epilogue_args.row_scales,
                 first, rows, cols, tid);
-            if (ep.phase == RowQuantPhase::Reduce) return;
+            if (this->args.phase == RowQuantPhase::Reduce) return;
             if constexpr (RowTiles > 1) {
                 if (tid == 0) {
-                    auto* arrivals = output_base + int64_t(first) * get<0>(ep.dD) / 4;
+                    auto* arrivals = output_base + int64_t(first) * get<0>(this->args.dD) / 4;
                     tix::atomic_add_rel(arrivals, 1);
                     while (tix::ld_acq(arrivals) < RowTiles) {}
                     // Once all waiters have read the counter, its owner can overwrite it with FP8.
                     tix::atomic_add_rel(arrivals, 1);
-                    if (col0 == 0 && reinterpret_cast<uint32_t*>(ep.ptr_D) == output_base)
+                    if (col0 == 0 && reinterpret_cast<uint32_t*>(this->args.ptr_D) == output_base)
                         while (tix::ld_acq(arrivals) < 2 * RowTiles) {}
                 }
                 __syncthreads();
@@ -122,12 +118,12 @@ struct EinsumUnbufferedEpilogue : PPUStoreCD<Base, BM, BN> {
             // In a native 16x16 MMA, four lanes cover columns [0,8) and [8,16) of a row.
             static_assert(cute::is_same_v<typename MMA::LayoutC_TV, cute::PPU0015_16x16_Row>);
             // Reuse the existing shared tile for packed output followed by one inverse per row.
-            auto* packed = reinterpret_cast<uint8_t*>(tile.values);
+            auto* packed = reinterpret_cast<uint8_t*>(this->storage.values);
             auto* scales = reinterpret_cast<float*>(packed + BM * BN);
             cp_async_wait<0>();
             __syncthreads();
             for (int row = tid; row < rows; row += blockDim.x) {
-                auto* scale = ep.epilogue_args.row_scales + first + row;
+                auto* scale = this->args.epilogue_args.row_scales + first + row;
                 scales[row] = 1.f / *scale;
             }
             __syncthreads();
@@ -157,7 +153,7 @@ struct EinsumUnbufferedEpilogue : PPUStoreCD<Base, BM, BN> {
                 const int row = i / vectors_per_row;
                 const int c = (i % vectors_per_row) * 16;
                 if (!Base::kIsAlignedN && c >= cols) continue;
-                auto* dst = ep.ptr_D + int64_t(first + row) * get<0>(ep.dD) + col0 + c;
+                auto* dst = this->args.ptr_D + int64_t(first + row) * get<0>(this->args.dD) + col0 + c;
                 const auto* src = packed + row * BN + (c ^ ((row % min(8, BN / 16)) * 16));
                 const uint4 value = *reinterpret_cast<const uint4*>(src);
                 const uint4 output{__byte_perm(value.x, value.y, 0x5410), __byte_perm(value.z, value.w, 0x5410),
