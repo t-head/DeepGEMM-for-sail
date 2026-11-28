@@ -151,7 +151,7 @@ static torch::Tensor& get_sparse_workspace(const torch::TensorOptions& options, 
     constexpr int64_t kNumWorkspaceBytes = sizeof(WorkspaceState) +
         static_cast<int64_t>(kNumMaxQTokens) * sizeof(QBlockInfo);
     DG_HOST_ASSERT(num_q_tokens > 0 and num_q_tokens <= kNumMaxQTokens);
-    const auto stream = at::cuda::getCurrentCUDAStream();
+    const auto stream = c10::cuda::getCurrentCUDAStream();
     DG_HOST_ASSERT(options.device() == stream.device());
     static std::unordered_map<c10::cuda::CUDAStream, torch::Tensor> workspaces;
     auto& workspace = workspaces[stream];

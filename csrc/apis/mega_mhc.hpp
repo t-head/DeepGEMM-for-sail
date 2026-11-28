@@ -146,7 +146,7 @@ static void mega_mhc(
     const int tensor_cu_count = tc01 && !shifted ? device_runtime->get_tensor_cu_count() : 0;
     const auto plan = select_mega_mhc_plan(t, h, num_sinkhorn_iters, num_sms, tensor_cu_count, tc01,
         y_bf16.has_value(), y_fp8.has_value(), shared_sf_block_m, y_token_sf.has_value(),
-        at::cuda::getCurrentDeviceProperties()->multiProcessorCount, shifted);
+        device_runtime->get_prop()->multiProcessorCount, shifted);
     const auto& y_primary_sf = y_token_sf.has_value() ? y_token_sf :
                                y_routed_sf.has_value() ? y_routed_sf : y_gemm_sf;
     mhc::Args args{

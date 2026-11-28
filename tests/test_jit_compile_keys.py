@@ -446,7 +446,12 @@ class CompileKeyTests(unittest.TestCase):
             raise unittest.SkipTest("requires the native PPU SDK")
         actlize = root / 'third-party/actlize_v1.0.0'
         includes = [sdk / 'targets/x86_64-linux/include', sdk / 'targets/aarch64-linux/include',
-                    sdk / 'include', sdk / 'include/cccl', root / 'csrc', root / 'deep_gemm/include',
+                    sdk / 'include', sdk / 'include/cccl',
+                    # Mirrors setup.py: Torch's c10 CUDA headers need `cuda_runtime_api.h`,
+                    # and this tree must stay after the native ones so that the native
+                    # `hggc_fp16.h` definitions win over its `cuda_fp16.h` copies.
+                    sdk / 'CUDA_SDK/include',
+                    root / 'csrc', root / 'deep_gemm/include',
                     actlize, actlize / 'include', actlize / 'tools', root / 'third-party/fmt/include']
         cls.sdk = sdk
         cls.device_includes = [root / 'deep_gemm/include', actlize / 'include', actlize / 'tools/util/include']
@@ -457,7 +462,10 @@ class CompileKeyTests(unittest.TestCase):
             extra_include_paths=[str(path) for path in includes if path.is_dir()],
             extra_cflags=['-O0', '-std=c++17', '-DUSE_HGGC'],
             extra_ldflags=[f'-L{path}' for path in library_dirs if path.is_dir()]
-                          + ['-lhggc', '-lhggcrt1', '-lhgrtc', '-lacblasLt', '-lc10_cuda', '-ltorch_cuda'],
+                          # `-lacblas` provides `acblasGetStatusString`; see the note next to
+                          # `build_libraries` in `setup.py`.
+                          + ['-lhggc', '-lhggcrt1', '-lhgrtc', '-lacblasLt', '-lacblas',
+                             '-lc10_cuda', '-ltorch_cuda'],
             with_cuda=False)
 
     def test_bf16_cute_free_both_output_types(self):

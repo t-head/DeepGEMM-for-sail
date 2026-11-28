@@ -44,6 +44,12 @@ build_include_dirs = [path for path in (
     ppu_include,
     os.path.join(ppu_sdk, 'include'),
     os.path.join(ppu_sdk, 'include', 'cccl'),
+    # Torch's c10 CUDA headers include `cuda_runtime_api.h`, which only the SDK's
+    # CUDA compatibility tree ships. It must stay *after* the native directories:
+    # that tree also carries `cuda_fp16.h`/`cuda_bf16.h`, whose `__half` and
+    # `__nv_bfloat16` definitions collide with the native `hggc_fp16.h` ones that
+    # `acblasLt.h` pulls in (see `csrc/jit/device_runtime.hpp`).
+    os.path.join(ppu_sdk, 'CUDA_SDK', 'include'),
 ) if os.path.isdir(path)] + [
     current_dir + '/deep_gemm/include',
     current_dir + '/third-party/actlize_v1.0.0/',
@@ -53,7 +59,11 @@ build_include_dirs = [path for path in (
     current_dir + '/third-party/actlize_v1.0.0/include/cute',
 ]
 
-build_libraries = ['hggc', 'hggcrt1', 'hgrtc', 'acblasLt']
+# `acblas` is listed explicitly because it provides `acblasGetStatusString`, which
+# `DG_ACBLASLT_CHECK` calls. SDK 2.2.x's `libacblasLt.so` carries a DT_NEEDED on
+# `libacblas.so`, so the symbol resolves transitively there; SDK 2.1.x's does not,
+# and the extension then fails to load with an undefined symbol.
+build_libraries = ['hggc', 'hggcrt1', 'hgrtc', 'acblasLt', 'acblas']
 # Search real libraries before the driver stubs used only at link time.
 build_library_dirs = [path for path in (
     os.path.join(ppu_sdk, 'lib'),

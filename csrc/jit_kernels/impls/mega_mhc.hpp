@@ -182,7 +182,7 @@ static std::mutex mega_mhc_submit_mutex;
 static int* mega_mhc_counters(int64_t count, const torch::TensorOptions& options) {
     if (!count) return nullptr;
     static std::unordered_map<c10::cuda::CUDAStream, std::vector<torch::Tensor>> counters;
-    auto& buffers = counters[at::cuda::getCurrentCUDAStream()];
+    auto& buffers = counters[c10::cuda::getCurrentCUDAStream()];
     if (buffers.empty() || buffers.back().numel() < count) {
         DG_HOST_ASSERT(c10::cuda::currentStreamCaptureStatusMayInitCtx() == c10::cuda::CaptureStatus::None and
                        "Warm up Mega-mHC on the capture stream with sufficient workspace capacity before capture");
@@ -204,7 +204,7 @@ static void run_mega_mhc(const MegaMhcPlan& plan, mhc::Args kernel_args,
         kernel_args.y = reinterpret_cast<__ppu_bfloat16*>(static_cast<uint8_t*>(scratch.data_ptr()) + partial_bytes);
     MegaMhcRuntime::Args args{plan.config, plan.launch_args, kernel_args};
     const int num_sms = plan.num_sms;
-    const auto* prop = at::cuda::getCurrentDeviceProperties();
+    const auto prop = device_runtime->get_prop();
     std::array<PreparedMegaMhc, 3> kernels;
     int num_kernels = 0;
     if (!args.config.tc01) {

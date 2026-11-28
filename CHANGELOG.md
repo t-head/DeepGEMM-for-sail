@@ -6,6 +6,36 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ## unreleased
 
+### Fixed
+
+- **Host build on PPU SDK 2.2.x with PyTorch 2.13**: the host sources no longer
+  include ATen's CUDA headers. `acblasLt.h` pulls the native `hggc_fp16.h`,
+  which defines `__half` and `__half_raw` behind its own `__FP16_DEFINED__`
+  guard, while the SDK's CUDA compatibility `cuda_fp16.h` defines the same
+  names without ever setting that guard. Any translation unit holding both
+  definitions failed to compile. `ATen/cuda/CUDAContext.h` was what pulled the
+  CUDA copies in; the narrower `c10/cuda` headers and `cuda_runtime_api.h` do
+  not, so stream, current-device and device-property queries now go through
+  `c10::cuda` and the native HGGC runtime. `setup.py` adds the SDK's
+  `CUDA_SDK/include` after the native include directories, as `c10` needs
+  `cuda_runtime_api.h` and the native headers must keep precedence.
+- **Undefined `acblasGetStatusString` on PPU SDK 2.1.x**: the extension now
+  links `libacblas` explicitly. `DG_ACBLASLT_CHECK` calls that symbol, which
+  lives in `libacblas.so`. SDK 2.2.x's `libacblasLt.so` carries a DT_NEEDED on
+  `libacblas.so` so it resolved transitively, but SDK 2.1.x's does not, and
+  `import deep_gemm` failed with an undefined symbol.
+
+### Changed
+
+- **Torch-managed acBLASLt handles are opt-in at build time**: the new
+  `DG_ENABLE_PYTORCH_ACBLASLT_HANDLE` build macro defaults to `0`, which keeps
+  ATen's CUDA headers out of the build. The runtime default is unchanged, since
+  `DG_USE_PYTORCH_ACBLASLT_HANDLE` already defaulted to off; requesting it at
+  runtime without the build macro now fails with a message naming the macro.
+  Builds that enable it also need a PyTorch whose acBLASLt handle type is
+  `acblasLtHandle_t` -- PPU Torch 2.13 declares `cublasLtHandle_t`, an
+  unrelated opaque pointer type that does not convert.
+
 ### Added
 
 - **BF16 x FP32 dense GEMM**: adds `bf16xfp32_gemm_nt` (alias `gemm_bf16xfp32`). Computes

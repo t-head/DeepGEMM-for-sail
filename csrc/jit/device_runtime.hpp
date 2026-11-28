@@ -9,15 +9,64 @@
 #include <hggc_runtime_api.h>
 #include <torch/version.h>
 #include <torch/torch.h>
-#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
 
 #include "../utils/exception.hpp"
 #include "../utils/lazy_init.hpp"
 
-#define PYTORCH_SUPPORTS_GET_ACBLASLT_HANDLE (TORCH_VERSION_MAJOR > 2 or (TORCH_VERSION_MAJOR == 2 and TORCH_VERSION_MINOR >= 3))
+// Torch-managed acBLASLt handles are opt-in at build time.
+//
+// `acblasLt.h` pulls the SDK's native `hggc_fp16.h`, which defines `__half` and
+// `__half_raw` behind its own `__FP16_DEFINED__` guard. The SDK's CUDA
+// compatibility header `cuda_fp16.h` defines the same names but never sets that
+// guard, so the yield never triggers and any translation unit holding both
+// definitions fails to compile. `ATen/cuda/CUDAContext.h` is what drags
+// `cuda_fp16.h` in; the narrower `c10/cuda/CUDAStream.h` and `cuda_runtime_api.h`
+// do not. DeepGEMM therefore stays on the native and c10 interfaces, and the
+// only ATen/CUDA dependency -- `at::cuda::getCurrentCUDABlasLtHandle` -- lives
+// behind this macro.
+//
+// Keeping it off is not a feature regression: the handle is already disabled by
+// default at runtime (`DG_USE_PYTORCH_ACBLASLT_HANDLE=0`) because
+// `at::cuda::getCurrentCUDABlasLtHandle` has large CPU overhead on some PyTorch
+// versions. Builds that want it must also supply a PyTorch whose handle type is
+// `acblasLtHandle_t`; PPU Torch 2.13 declares `cublasLtHandle_t`, an unrelated
+// opaque pointer type that does not convert.
+#ifndef DG_ENABLE_PYTORCH_ACBLASLT_HANDLE
+#define DG_ENABLE_PYTORCH_ACBLASLT_HANDLE 0
+#endif
+
+#define PYTORCH_SUPPORTS_GET_ACBLASLT_HANDLE \
+    (DG_ENABLE_PYTORCH_ACBLASLT_HANDLE and \
+     (TORCH_VERSION_MAJOR > 2 or (TORCH_VERSION_MAJOR == 2 and TORCH_VERSION_MINOR >= 3)))
+
+#if PYTORCH_SUPPORTS_GET_ACBLASLT_HANDLE
+#include <ATen/cuda/CUDAContext.h>
+#endif
 
 namespace deep_gemm {
+
+// Properties of an explicit device, cached per device index.
+//
+// Deliberately a free function rather than a `DeviceRuntime` member: constructing
+// `DeviceRuntime` creates an acBLASLt handle and a persistent 32 MiB workspace on
+// whatever device is current at that moment. Callers that only want to know what
+// a tensor's own device is -- weight preprocessing runs before any GEMM, with no
+// device guard -- must not trigger that, or preparing device-1 weights while
+// device 0 is current would bind the workspace to device 0. Native HGGC query, so
+// it also avoids the ATen/CUDA headers that conflict with `acblasLt.h`.
+inline std::shared_ptr<hggcDeviceProp> get_device_prop(const int& device_idx) {
+    static std::mutex mutex;
+    static std::unordered_map<int, std::shared_ptr<hggcDeviceProp>> cache;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto& prop = cache[device_idx];
+    if (prop == nullptr) {
+        hggcDeviceProp queried;
+        DG_HGGC_RUNTIME_CHECK(hggcGetDeviceProperties(&queried, device_idx));
+        prop = std::make_shared<hggcDeviceProp>(queried);
+    }
+    return prop;
+}
 
 class DeviceRuntime {
     int tc_util = 0;
@@ -37,11 +86,8 @@ class DeviceRuntime {
         int device_idx;
         DG_HGGC_RUNTIME_CHECK(hggcGetDevice(&device_idx));
         auto& state = device_states[device_idx];
-        if (state.prop == nullptr) {
-            hggcDeviceProp prop;
-            DG_HGGC_RUNTIME_CHECK(hggcGetDeviceProperties(&prop, device_idx));
-            state.prop = std::make_shared<hggcDeviceProp>(prop);
-        }
+        if (state.prop == nullptr)
+            state.prop = get_device_prop(device_idx);
         return state;
     }
 
@@ -98,7 +144,10 @@ public:
         // as `at::cuda::getCurrentCUDABlasLtHandle` has large CPU overhead with some PyTorch versions
         use_pytorch_managed_acblaslt_handle = get_env<int>("DG_USE_PYTORCH_ACBLASLT_HANDLE", 0) > 0;
 #if not PYTORCH_SUPPORTS_GET_ACBLASLT_HANDLE
-        DG_HOST_ASSERT(not use_pytorch_managed_acblaslt_handle and "PyTorch does not support to get acBLASLt handle");
+        DG_HOST_ASSERT(not use_pytorch_managed_acblaslt_handle and
+                       "DG_USE_PYTORCH_ACBLASLT_HANDLE needs a build with "
+                       "DG_ENABLE_PYTORCH_ACBLASLT_HANDLE=1 and a PyTorch whose "
+                       "acBLASLt handle type is `acblasLtHandle_t`");
 #endif
 
         // Whether to create workspace tensor on each call instead of holding one.
@@ -219,7 +268,7 @@ inline auto device_runtime = LazyInit<DeviceRuntime>([](){ return std::make_shar
 // object, so `reinterpret_cast` is the only well-formed conversion. Kept here instead of at every
 // launch site; after cudafy the two types coincide and the cast degenerates to a no-op.
 inline hggcStream_t current_stream() {
-    return reinterpret_cast<hggcStream_t>(at::cuda::getCurrentCUDAStream().stream());
+    return reinterpret_cast<hggcStream_t>(c10::cuda::getCurrentCUDAStream().stream());
 }
 
 } // namespace deep_gemm
