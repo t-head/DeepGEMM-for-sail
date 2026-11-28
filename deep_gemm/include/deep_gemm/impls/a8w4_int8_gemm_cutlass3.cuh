@@ -102,7 +102,8 @@ struct A8W4PackedOperandB {
 
 namespace cutlass::gemm {
 
-template <int Stages_, typename Schedule_ = KernelAiuMultistage, int CopyKTilesPerFlag_ = 0, bool TrimMTail = false>
+template <int Stages_, typename Schedule_ = KernelAiuMultistage, int CopyKTilesPerFlag_ = 0,
+          bool TrimMTail = false, bool OperandOnlyStorage = CopyKTilesPerFlag_ != 0>
 struct MainloopPPUAiuA8W4 {
   static constexpr int Stages = Stages_;
   static constexpr int CopyKTilesPerFlag = CopyKTilesPerFlag_;
@@ -116,18 +117,18 @@ struct MainloopPPUAiuA8W4 {
 namespace cutlass::gemm::collective {
 
 template <
-    int Stages, typename KernelSchedule, int CopyKTilesPerFlag, bool TrimMTail,
+    int Stages, typename KernelSchedule, int CopyKTilesPerFlag, bool TrimMTail, bool OperandOnlyStorage,
     typename TileShape_, typename StrideA_, typename StrideB_,
     typename TiledMma_, typename GmemTiledCopyA_, typename SmemLayoutAtomA_, typename SmemCopyAtomA_,
     typename TransformA_, typename GmemTiledCopyB_, typename SmemLayoutAtomB_, typename SmemCopyAtomB_,
     typename TransformB_>
 struct CollectiveMma<
-    cutlass::arch::PPU0010, MainloopPPUAiuA8W4<Stages, KernelSchedule, CopyKTilesPerFlag, TrimMTail>, TileShape_,
+    cutlass::arch::PPU0010, MainloopPPUAiuA8W4<Stages, KernelSchedule, CopyKTilesPerFlag, TrimMTail, OperandOnlyStorage>, TileShape_,
     int8_t, StrideA_, cutlass::int4b_t, StrideB_, TiledMma_,
     GmemTiledCopyA_, SmemLayoutAtomA_, SmemCopyAtomA_, TransformA_,
     GmemTiledCopyB_, SmemLayoutAtomB_, SmemCopyAtomB_, TransformB_> {
 public:
-  using DispatchPolicy = MainloopPPUAiuA8W4<Stages, KernelSchedule, CopyKTilesPerFlag, TrimMTail>;
+  using DispatchPolicy = MainloopPPUAiuA8W4<Stages, KernelSchedule, CopyKTilesPerFlag, TrimMTail, OperandOnlyStorage>;
   using TileShape = TileShape_;
   using ElementA = int8_t;
   using StrideA = StrideA_;
@@ -170,7 +171,13 @@ private:
   using MixedInputBaseParams = typename MixedInputBase::Params;
 
 public:
-  using SharedStorage = typename MixedInputBase::SharedStorage;
+  // MegaMoE loads FP32 scales from global memory, so only stage A and B in TSM.
+  using MixedInputStorage = typename MixedInputBase::SharedStorage;
+  struct OperandStorage {
+    decltype(MixedInputStorage::smem_a) smem_a;
+    decltype(MixedInputStorage::smem_b) smem_b;
+  };
+  using SharedStorage = cute::conditional_t<OperandOnlyStorage, OperandStorage, MixedInputStorage>;
 
   struct Arguments {
     ElementA const* ptr_A;

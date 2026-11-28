@@ -41,7 +41,7 @@ struct MegaMoEInt8Kernel {
     // Tail trimming pays off on the larger W4A8 GEMM1 tile.
     static constexpr bool kTrimMTail = kIsLinear1 && BM == 128;
     using Policy = cute::conditional_t<PackedInt4,
-        cutlass::gemm::MainloopPPUAiuA8W4<Stages, Schedule, kCopyKTiles, kTrimMTail>,
+        cutlass::gemm::MainloopPPUAiuA8W4<Stages, Schedule, kCopyKTiles, kTrimMTail, /*OperandOnlyStorage=*/true>,
         cutlass::gemm::MainloopPPUAiuA8W8<Stages, Schedule, kCopyKTiles>>;
     using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<Arch, Element, Element, int32_t>::type;
     using Mma = cute::TiledMMA<cute::MMA_Atom<MmaInst>,
