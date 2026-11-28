@@ -263,13 +263,30 @@ static MegaMoEConfig select_int8_mega_moe(
 }
 
 static MegaMoEConfig select_int8_int4_mega_moe(int expected_m, int hidden, int intermediate,
-                                               int groups, int num_sms, int copy_threads) {
+                                               int groups, int num_sms, int copy_threads,
+                                               int num_tokens, int num_ranks, int topk) {
     const auto select = [&](int n, int k) {
         return make_phase_config(deep_gemm_a8w4_common::get_best_configs(
             expected_m, n, k, groups, num_sms, GemmType::MGroupedNoPad));
     };
     const auto up = select(2 * intermediate, hidden);
-    const auto down = select(hidden, intermediate);
+    // W4A8 Stage2 tiles measured on 810E. The shape uses the local expert count.
+    const auto shape_matches = [&](int h, int i, int local_experts, int k) {
+        return hidden == h && intermediate == i && groups == local_experts && topk == k;
+    };
+    const bool prefill = num_tokens == 1024 || num_tokens == 2048 || num_tokens == 4096;
+    const bool glm_ep8 = num_ranks == 8 && shape_matches(6144, 2048, 32, 8);
+    const bool wide_ep8 = num_ranks == 8 && prefill &&
+        (glm_ep8 || shape_matches(8192, 2048, 64, 10) || // Qwen
+         shape_matches(6144, 2048, 48, 8) ||              // MiMo
+         shape_matches(4096, 2048, 32, 6) ||              // DeepSeek V4 Flash
+         shape_matches(5120, 2304, 48, 6));               // DeepSeek V4.1 Flash
+    const bool wide_ep16 = num_ranks == 16 && (num_tokens == 512 || prefill) &&
+                           shape_matches(6144, 2048, 16, 8);
+    const int wide_bm = wide_ep16 || (glm_ep8 && num_tokens == 4096) ? 128 : 64;
+    const auto down = (wide_ep8 || wide_ep16)
+        ? MegaMoEPhaseConfig{num_sms, wide_bm, 256, 128, 64, 64, 2, 0}
+        : select(hidden, intermediate);
     const int ktpf = aligned_copy_ktpf(hidden, up.block_k, 0);
     return {{up, select_l1_copy_blocks(expected_m, 2 * intermediate, hidden, groups, up, ktpf,
         get_int8_mega_moe_copy_threads(copy_threads) / 32), ktpf}, {down}};

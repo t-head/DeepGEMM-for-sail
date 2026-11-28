@@ -432,8 +432,10 @@ static void int8_mega_moe_impl(
     const int hidden = std::get<0>(w1).size(2) * packed, intermediate = std::get<0>(w2).size(2) * packed;
     const int groups = std::get<0>(w1).size(0), num_sms = device_runtime->get_num_sms();
     const int copy_threads = get_env<int>("DG_MEGAMOE_COPY_THREADS", 0);
+    const int num_tokens = y.size(0);
     const auto config = packed_int4
-        ? mega::select_int8_int4_mega_moe(expected_m, hidden, intermediate, groups, num_sms, copy_threads)
+        ? mega::select_int8_int4_mega_moe(expected_m, hidden, intermediate, groups, num_sms, copy_threads,
+                                         num_tokens, Ranks, topk)
         : mega::select_int8_mega_moe(expected_m, hidden, intermediate, groups, num_sms, copy_threads);
     const bool split_sync = get_env<int>("DG_MEGAMOE_SPLIT_SYNC", 0) != 0;
 
@@ -441,14 +443,14 @@ static void int8_mega_moe_impl(
         capacity, topk, config.l1, num_sms, activation, limit,
         beta, linear_beta, alpha, fast_math, cumulative_local_expert_recv_stats, packed_int4);
     l1_args.split_sync = split_sync;
-    launch_linear1<Ranks>(l1_args, buffers, base, y.size(0), num_sms, streams);
+    launch_linear1<Ranks>(l1_args, buffers, base, num_tokens, num_sms, streams);
 
     auto l2_args = make_linear2_args<Ranks>(w2, buffers, base, pointers, rank, capacity, topk,
         l1_args.kernel_params.scheduler.grouped_layout, config.l2, num_sms, packed_int4);
     l2_args.reduce_ids = buffers.topk_idx.data<int64_t>(base);
     l2_args.reduce_weights = buffers.topk_weights.data<float>(base);
     l2_args.reduce_output = y.data_ptr();
-    l2_args.tokens = y.size(0);
+    l2_args.tokens = num_tokens;
     l2_args.split_sync = split_sync;
     launch_linear2<Ranks>(l2_args, num_sms);
 }
