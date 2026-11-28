@@ -104,7 +104,7 @@ inline PreprocessedWeights preprocess_weights_and_scales(
         int gate_up_group_size = 1;
         if (fuse_activation) {
             TORCH_CHECK(weight.is_cuda(), "INT8 fused weights require a PPU device");
-            const auto prop = device_runtime->get_prop(weight.get_device());
+            const auto prop = get_device_prop(weight.get_device());
             TORCH_CHECK(prop->major == 8 && (prop->minor == 0 || prop->minor == 9),
                         "INT8 fused weights require PPU SM80 or SM89");
             gate_up_group_size = prop->minor == 0 ? 4 : 1;

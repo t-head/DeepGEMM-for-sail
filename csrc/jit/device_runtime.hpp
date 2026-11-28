@@ -46,6 +46,28 @@
 
 namespace deep_gemm {
 
+// Properties of an explicit device, cached per device index.
+//
+// Deliberately a free function rather than a `DeviceRuntime` member: constructing
+// `DeviceRuntime` creates an acBLASLt handle and a persistent 32 MiB workspace on
+// whatever device is current at that moment. Callers that only want to know what
+// a tensor's own device is -- weight preprocessing runs before any GEMM, with no
+// device guard -- must not trigger that, or preparing device-1 weights while
+// device 0 is current would bind the workspace to device 0. Native HGGC query, so
+// it also avoids the ATen/CUDA headers that conflict with `acblasLt.h`.
+inline std::shared_ptr<hggcDeviceProp> get_device_prop(const int& device_idx) {
+    static std::mutex mutex;
+    static std::unordered_map<int, std::shared_ptr<hggcDeviceProp>> cache;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto& prop = cache[device_idx];
+    if (prop == nullptr) {
+        hggcDeviceProp queried;
+        DG_HGGC_RUNTIME_CHECK(hggcGetDeviceProperties(&queried, device_idx));
+        prop = std::make_shared<hggcDeviceProp>(queried);
+    }
+    return prop;
+}
+
 class DeviceRuntime {
     int tc_util = 0;
     bool enable_pdl = false;
@@ -64,11 +86,8 @@ class DeviceRuntime {
         int device_idx;
         DG_HGGC_RUNTIME_CHECK(hggcGetDevice(&device_idx));
         auto& state = device_states[device_idx];
-        if (state.prop == nullptr) {
-            hggcDeviceProp prop;
-            DG_HGGC_RUNTIME_CHECK(hggcGetDeviceProperties(&prop, device_idx));
-            state.prop = std::make_shared<hggcDeviceProp>(prop);
-        }
+        if (state.prop == nullptr)
+            state.prop = get_device_prop(device_idx);
         return state;
     }
 
@@ -165,20 +184,6 @@ public:
     std::shared_ptr<hggcDeviceProp> get_prop() {
         std::lock_guard<std::mutex> lock(device_states_mutex);
         return current_device_state().prop;
-    }
-
-    // Properties of an explicit device, for callers that validate a tensor's own
-    // device rather than the current one. Native HGGC query, so it does not need
-    // the ATen/CUDA headers that conflict with `acblasLt.h`.
-    std::shared_ptr<hggcDeviceProp> get_prop(const int& device_idx) {
-        std::lock_guard<std::mutex> lock(device_states_mutex);
-        auto& state = device_states[device_idx];
-        if (state.prop == nullptr) {
-            hggcDeviceProp prop;
-            DG_HGGC_RUNTIME_CHECK(hggcGetDeviceProperties(&prop, device_idx));
-            state.prop = std::make_shared<hggcDeviceProp>(prop);
-        }
-        return state.prop;
     }
 
     std::pair<int, int> get_arch_pair() {

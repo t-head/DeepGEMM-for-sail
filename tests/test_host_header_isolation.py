@@ -30,10 +30,26 @@ GUARD = 'PYTORCH_SUPPORTS_GET_ACBLASLT_HANDLE'
 
 INCLUDE_RE = re.compile(r'^\s*#\s*include\s*[<"]ATen/cuda/')
 USAGE_RE = re.compile(r'\bat::cuda::')
-# Both the `#if`/`#elif` that opens the allowed region and the `#if not ...`
-# diagnostic that closes off the unsupported runtime mode mention the guard.
-IF_RE = re.compile(r'^\s*#\s*(if|ifdef|ifndef|elif)\b')
+IF_RE = re.compile(r'^\s*#\s*(?P<kind>if|ifdef|ifndef)\b(?P<cond>.*)$')
+ELIF_RE = re.compile(r'^\s*#\s*elif\b(?P<cond>.*)$')
+ELSE_RE = re.compile(r'^\s*#\s*else\b')
 ENDIF_RE = re.compile(r'^\s*#\s*endif\b')
+# Only a branch taken when the guard is *on* may use ATen/CUDA. Mentioning the
+# guard is not enough: `#ifndef GUARD`, `#if not GUARD` and the `#else` of a
+# positive test are all compiled with the guard off, which is the default, so
+# ATen/CUDA there would reintroduce the `__half` conflict. The condition must
+# therefore be the guard itself, which is also the only form the sources use.
+POSITIVE_GUARD_RE = re.compile(
+    r'^\s*\(*\s*(?:{g}|defined\s*\(\s*{g}\s*\)|defined\s+{g})\s*\)*\s*$'.format(g=re.escape(GUARD)))
+
+
+def _opens_guarded_branch(kind: str, condition: str) -> bool:
+    """Whether a branch is entered only when the guard is on."""
+    if kind == 'ifndef':
+        return False
+    if kind == 'ifdef':
+        return condition.strip() == GUARD
+    return bool(POSITIVE_GUARD_RE.match(condition))
 
 
 def strip_comments(text: str) -> str:
@@ -69,12 +85,19 @@ def offending_lines(path: Path):
     # Depth of the #if nest, and the depths whose condition named the guard.
     depth, guarded_depths, found = 0, set(), []
     for number, line in enumerate(lines, start=1):
-        if IF_RE.match(line):
-            if not line.lstrip().startswith('#elif') and not line.lstrip().startswith('# elif'):
-                depth += 1
+        if opened := IF_RE.match(line):
+            depth += 1
             guarded_depths.discard(depth)
-            if GUARD in line:
+            if _opens_guarded_branch(opened.group('kind'), opened.group('cond')):
                 guarded_depths.add(depth)
+        elif continued := ELIF_RE.match(line):
+            # A new branch at the same depth, so the previous verdict lapses.
+            guarded_depths.discard(depth)
+            if _opens_guarded_branch('if', continued.group('cond')):
+                guarded_depths.add(depth)
+        elif ELSE_RE.match(line):
+            # The negation of every branch above it, hence never guarded.
+            guarded_depths.discard(depth)
         elif ENDIF_RE.match(line):
             guarded_depths.discard(depth)
             depth = max(depth - 1, 0)
@@ -133,6 +156,55 @@ class TestHostHeaderIsolation(unittest.TestCase):
                                'auto s = at::cuda::getCurrentCUDABlasLtHandle();\n'
                                '#endif\n')
             self.assertEqual(offending_lines(guarded), [])
+
+            # A branch compiled with the guard off is not a guarded branch, however
+            # prominently it names the guard.
+            negated = Path(directory) / 'negated.hpp'
+            negated.write_text(f'#ifndef {GUARD}\n'
+                               '#include <ATen/cuda/CUDAContext.h>\n'
+                               '#endif\n'
+                               f'#if not {GUARD}\n'
+                               'auto s = at::cuda::getCurrentCUDAStream();\n'
+                               '#endif\n'
+                               f'#if !{GUARD}\n'
+                               'auto t = at::cuda::getCurrentCUDAStream();\n'
+                               '#endif\n')
+            self.assertEqual(len(offending_lines(negated)), 3)
+
+            else_branch = Path(directory) / 'else_branch.hpp'
+            else_branch.write_text(f'#if {GUARD}\n'
+                                   'auto s = at::cuda::getCurrentCUDABlasLtHandle();\n'
+                                   '#else\n'
+                                   '#include <ATen/cuda/CUDAContext.h>\n'
+                                   'auto t = at::cuda::getCurrentCUDAStream();\n'
+                                   '#endif\n'
+                                   f'#if {GUARD}\n'
+                                   'auto u = at::cuda::getCurrentCUDABlasLtHandle();\n'
+                                   '#elif 1\n'
+                                   'auto v = at::cuda::getCurrentCUDAStream();\n'
+                                   '#endif\n')
+            self.assertEqual(len(offending_lines(else_branch)), 3)
+
+            # A guarded region keeps its exemption through an inner conditional.
+            nested = Path(directory) / 'nested.hpp'
+            nested.write_text(f'#if {GUARD}\n'
+                              '#ifdef SOMETHING_ELSE\n'
+                              'auto s = at::cuda::getCurrentCUDABlasLtHandle();\n'
+                              '#else\n'
+                              'auto t = at::cuda::getCurrentCUDABlasLtHandle();\n'
+                              '#endif\n'
+                              '#endif\n')
+            self.assertEqual(offending_lines(nested), [])
+
+            # `defined(...)` spellings of the same positive test.
+            defined = Path(directory) / 'defined.hpp'
+            defined.write_text(f'#if defined({GUARD})\n'
+                               'auto s = at::cuda::getCurrentCUDABlasLtHandle();\n'
+                               '#endif\n'
+                               f'#ifdef {GUARD}\n'
+                               'auto t = at::cuda::getCurrentCUDABlasLtHandle();\n'
+                               '#endif\n')
+            self.assertEqual(offending_lines(defined), [])
 
             commented = Path(directory) / 'commented.hpp'
             commented.write_text('// mentions at::cuda::getCurrentCUDAStream in prose\n'
