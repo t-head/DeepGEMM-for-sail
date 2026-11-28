@@ -28,6 +28,7 @@ struct alignas(256) MegaMoESignals {
     uint32_t grid_sync_count;
     uint64_t scatter_writer_mask;  // Passed from the standalone scatter wait to reduce.
     alignas(16) uint32_t dispatch_retire[4];
+    uint64_t scatter_bulk128_writer_mask;
     // Each forward publishes dispatch, then scatter, before either slot is reused.
     alignas(128) uint32_t dispatch_arrivals[kNumMaxRanks];
     alignas(128) uint32_t scatter_arrivals[kNumMaxRanks];

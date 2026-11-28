@@ -85,11 +85,16 @@ __device__ __forceinline__ void pre_dispatch_release(
     }
 }
 
+// The highest scatter-arrival bit distinguishes 128-column from ordinary writes.
+inline constexpr uint32_t kScatterBulk128Bit = 1u << 31;
+static_assert(kFusedRoundGenerationLimit < (kScatterBulk128Bit >> 1));
+
 // Each rank owns one slot. All threads in the CTA participate in the wait.
-template <uint32_t kWorldSize, bool kWithWriterMask = false>
+template <uint32_t kWorldSize, bool kWithWriterMask = false, bool kWithBulk128Mask = false>
 __device__ __forceinline__ void rank_barrier(
         const volatile uint32_t* arrivals, uint32_t generation,
         uint32_t* writer_mask = nullptr) {
+    static_assert(!kWithBulk128Mask || kWithWriterMask);
     uint32_t observed = 0;
     if (threadIdx.x < kWorldSize && generation != 0) {
         do {
@@ -98,7 +103,9 @@ __device__ __forceinline__ void rank_barrier(
             } else {
                 observed = arrivals[threadIdx.x];
             }
-        } while ((kWithWriterMask ? observed >> 1 : observed) != generation);
+        } while ((kWithWriterMask
+            ? ((kWithBulk128Mask ? observed & ~kScatterBulk128Bit : observed) >> 1)
+            : observed) != generation);
     }
     if constexpr (kWithWriterMask) {
         if (threadIdx.x < 64) {
@@ -106,6 +113,12 @@ __device__ __forceinline__ void rank_barrier(
                 threadIdx.x >= kWorldSize || (observed & 1u));
             if ((threadIdx.x & 31u) == 0)
                 writer_mask[threadIdx.x / 32] = mask;
+            if constexpr (kWithBulk128Mask) {
+                const uint32_t bulk128_mask = __ballot_sync(0xffffffffu,
+                    threadIdx.x >= kWorldSize || (observed & kScatterBulk128Bit));
+                if ((threadIdx.x & 31u) == 0)
+                    writer_mask[2 + threadIdx.x / 32] = bulk128_mask;
+            }
         }
     }
     __syncthreads();
@@ -117,7 +130,7 @@ __device__ __forceinline__ void scatter_release(
         layout::MegaMoESignals& signals,
         const layout::SymBuffer<kWorldSize>& sym_buffer,
         uint32_t num_blocks, uint32_t block_idx, uint32_t thread_idx,
-        uint32_t generation, bool bulk_writer) {
+        uint32_t generation, bool bulk_writer, bool bulk128_writer = false) {
     // PPU fences drain only the calling warp; each warp leader releases its stores.
     // The following grid sync joins these releases before peer notification.
     __syncwarp();
@@ -129,7 +142,8 @@ __device__ __forceinline__ void scatter_release(
         signals, num_blocks, block_idx, thread_idx);
 
     if (block_idx == 0) {
-        const uint32_t notification = (generation << 1) | uint32_t(bulk_writer);
+        const uint32_t notification = (generation << 1) | uint32_t(bulk_writer) |
+            (bulk128_writer ? kScatterBulk128Bit : 0u);
         rank_arrive(sym_buffer, signals.scatter_arrivals, notification);
     }
 }

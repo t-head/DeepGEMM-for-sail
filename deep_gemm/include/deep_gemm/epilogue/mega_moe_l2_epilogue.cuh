@@ -42,7 +42,8 @@ template <
     int kWorldSize = 2,
     bool kWideScatterOffset = false,
     bool kWarpPipeline_ = false,
-    bool kWaitScatterPair = false>
+    bool kWaitScatterPair = false,
+    bool kEnableBulk128_ = false>
 class MegaMoEScatterEpilogue {
 public:
     using StrideC = StrideC_;
@@ -56,6 +57,8 @@ public:
     using ElementCompute = typename ThreadEpilogueOp::ElementCompute;
     static constexpr int kWorldSize_ = kWorldSize;
     static constexpr bool kWarpPipeline = kWarpPipeline_;
+    static constexpr bool kEnableBulk128 = kEnableBulk128_;
+    static constexpr bool kBulk128Writer = kEnableBulk128 && cute::size<1>(SmemLayout{}) == 128;
     static constexpr int kPipelineSlots = 3;
     static constexpr int kReadyBarrier = 4;
     static constexpr int kFreeBarrier = kReadyBarrier + kPipelineSlots;
@@ -391,10 +394,16 @@ private:
                         const int2 packed = {
                             *reinterpret_cast<const int32_t*>(&low),
                             *reinterpret_cast<const int32_t*>(&high)};
-                        asm volatile(
-                            "ppu.st.global.bl.v2.b32 [%0], {%1, %2};"
-                            :: "l"(destination), "r"(packed.x),
-                               "r"(packed.y) : "memory");
+                        if (kBulk128Writer && destination_rank != scatter_buffer.rank_idx) {
+                            __ppu_remote_store_bulk_volatile_b32x2(
+                                reinterpret_cast<volatile void*>(destination),
+                                *reinterpret_cast<const uint2*>(&packed));
+                        } else {
+                            asm volatile(
+                                "ppu.st.global.bl.v2.b32 [%0], {%1, %2};"
+                                :: "l"(destination), "r"(packed.x),
+                                   "r"(packed.y) : "memory");
+                        }
                     } else {
                         const float2 values = *reinterpret_cast<const float2*>(source);
                         const __ppu_bfloat162 packed = __floats2bfloat162_rn(values.x, values.y);
@@ -428,11 +437,43 @@ private:
 
 namespace deep_gemm {
 
-template <bool kBulkRemote>
+// A 256-column load pairs two narrow waves. Shuffle them into contiguous 8-BF16 spans
+// when narrow and wide writers coexist.
+__device__ __forceinline__ int4 moe_reduce_load_bulk128(const __ppu_bfloat16* source) {
+    const int lane = threadIdx.x & 31;
+    const auto* base = source - lane * 8;
+    const uint2 low = __ppu_global_ldcg_bulk_b32x2(base);
+    const uint2 high = __ppu_global_ldcg_bulk_b32x2(base + 128);
+    const int even = (lane & 15) * 2;
+    // Each half of the warp must still read from all 32 lanes of its wave.
+    const uint4 low_pair = make_uint4(
+        __shfl_sync(0xffffffffu, low.x, even), __shfl_sync(0xffffffffu, low.y, even),
+        __shfl_sync(0xffffffffu, low.x, even + 1), __shfl_sync(0xffffffffu, low.y, even + 1));
+    const uint4 high_pair = make_uint4(
+        __shfl_sync(0xffffffffu, high.x, even), __shfl_sync(0xffffffffu, high.y, even),
+        __shfl_sync(0xffffffffu, high.x, even + 1), __shfl_sync(0xffffffffu, high.y, even + 1));
+    const auto result = lane < 16 ? low_pair : high_pair;
+    return *reinterpret_cast<const int4*>(&result);
+}
+
+template <bool kBulkRemote, bool kMixedBulk128 = false, bool kBulk128Only = false>
 __device__ __forceinline__ int4 moe_reduce_load(
-        const __ppu_bfloat16* source, bool remote) {
+        const __ppu_bfloat16* source, uint8_t format) {
+    if constexpr (kBulk128Only) {
+        if (format) {
+            const uint2 low = __ppu_global_ldcg_bulk_b32x2(source);
+            const uint2 high = __ppu_global_ldcg_bulk_b32x2(source + 128);
+            return make_int4(low.x, low.y, high.x, high.y);
+        }
+        const int2 low = __ldbl(reinterpret_cast<const int2*>(source));
+        const int2 high = __ldbl(reinterpret_cast<const int2*>(source + 128));
+        return make_int4(low.x, low.y, high.x, high.y);
+    }
+    if constexpr (kMixedBulk128) {
+        if (format == 2) return moe_reduce_load_bulk128(source);
+    }
     if constexpr (kBulkRemote) {
-        if (remote) {
+        if (format) {
             const uint4 bulk = __ppu_global_ldbl_bulk_b32x4(source);
             return *reinterpret_cast<const int4*>(&bulk);
         }
@@ -440,17 +481,40 @@ __device__ __forceinline__ int4 moe_reduce_load(
     return __ldbl(reinterpret_cast<const int4*>(source));
 }
 
+template <bool kOutputAligned, bool kBulk128Only>
+__device__ __forceinline__ void moe_reduce_store(__ppu_bfloat16* destination, const int4& packed_output) {
+    if constexpr (kBulk128Only) {
+        if constexpr (kOutputAligned) {
+            *reinterpret_cast<int2*>(destination) = make_int2(packed_output.x, packed_output.y);
+            *reinterpret_cast<int2*>(destination + 128) = make_int2(packed_output.z, packed_output.w);
+        } else {
+            const auto* values = reinterpret_cast<const __ppu_bfloat16*>(&packed_output);
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                destination[i] = values[i];
+                destination[128 + i] = values[4 + i];
+            }
+        }
+    } else {
+        tix::store_bf16x8<kOutputAligned>(destination, packed_output);
+    }
+}
+
 template <bool kCheckInvalid, bool kOutputAligned, int kTopK, int kHidden, bool kBulkRemote,
-          int kThreads, int kColumnSplits = 1>
+          int kThreads, int kColumnSplits = 1, bool kBulk128Only = false>
 __device__ __forceinline__ void moe_reduce_token(
         const __ppu_bfloat16* __restrict__ input,
         __ppu_bfloat16* __restrict__ output,
         const int64_t (&slots)[kTopK], const float (&weights)[kTopK],
-        const bool (&remote_slots)[kTopK], int token, int column_part, unsigned int reduce_thread) {
+        const bool (&remote_slots)[kTopK],
+        int token, int column_part, unsigned int reduce_thread) {
     constexpr int kVector = sizeof(int4) / sizeof(__ppu_bfloat16);
     constexpr int kStride = kThreads * kVector;
     constexpr int kColumns = kHidden / kColumnSplits;
-    for (int column = column_part * kColumns + reduce_thread * kVector;
+    const int lane_column = kBulk128Only
+        ? (reduce_thread / 32) * 256 + (reduce_thread % 32) * 4
+        : reduce_thread * kVector;
+    for (int column = column_part * kColumns + lane_column;
          column < (column_part + 1) * kColumns; column += kStride) {
         int4 inputs[kTopK];
         // The fused GEMM grid has fewer resident warps. Overlap TopK
@@ -460,7 +524,7 @@ __device__ __forceinline__ void moe_reduce_token(
             if constexpr (kCheckInvalid) {
                 if (slots[index] < 0) continue;
             }
-            inputs[index] = moe_reduce_load<kBulkRemote>(
+            inputs[index] = moe_reduce_load<kBulkRemote, false, kBulk128Only>(
                 input + slots[index] * kHidden + column, remote_slots[index]);
         }
         float accumulator[kVector] = {0.0f};
@@ -483,41 +547,56 @@ __device__ __forceinline__ void moe_reduce_token(
             pairs[pair] = __floats2bfloat162_rn(
                 accumulator[2 * pair], accumulator[2 * pair + 1]);
         }
-        tix::store_bf16x8<kOutputAligned>(output + static_cast<int64_t>(token) * kHidden + column, packed_output);
+        auto* destination = output + static_cast<int64_t>(token) * kHidden + column;
+        moe_reduce_store<kOutputAligned, kBulk128Only>(destination, packed_output);
     }
 }
 
 // GEMM2 scatter completes peer synchronization before this weighted reduction.
 template <bool kOutputAligned, int kTopK, int kHidden, bool kBulkRemote, int kThreads,
-          int kColumnSplits = 1, bool kSkipZeroWeight = false>
+          int kColumnSplits = 1, bool kSkipZeroWeight = false,
+          bool kMixedBulk128 = false, bool kBulk128Only = false, bool kStreamBulk128 = false>
 __device__ __forceinline__ void moe_reduce_impl(
         const __ppu_bfloat16* __restrict__ input,
         const int64_t* __restrict__ topk_indices,
         const float* __restrict__ topk_weights,
         __ppu_bfloat16* __restrict__ output,
-        int max_m, int local_experts, int rank_idx, int token, int column_part, uint64_t writer_mask, unsigned int reduce_thread) {
+        int max_m, int local_experts, int rank_idx, int token, int column_part, uint64_t writer_mask,
+        unsigned int reduce_thread, uint64_t bulk128_mask) {
     static_assert(kThreads % 32 == 0);
     static_assert(kHidden % kColumnSplits == 0 && (kHidden / kColumnSplits) % 256 == 0,
                   "each column split must contain complete 256-element warp rows");
-    // Consume each route immediately to keep the TopK16 split-K kernel at three CTAs per CU.
-    if constexpr (kSkipZeroWeight && kTopK == 16 && kThreads == 512 && kColumnSplits == 1) {
+    // Streaming keeps mixed formats and small tiles within their register budget.
+    if constexpr (kMixedBulk128 || kStreamBulk128 ||
+                  (kSkipZeroWeight && kTopK == 16 && kThreads == 512 && kColumnSplits == 1)) {
         constexpr int kVector = sizeof(int4) / sizeof(__ppu_bfloat16);
-        for (int column = reduce_thread * kVector; column < kHidden; column += kThreads * kVector) {
+        constexpr int kColumns = kHidden / kColumnSplits;
+        const int lane_column = kBulk128Only
+            ? (reduce_thread / 32) * 256 + (reduce_thread % 32) * 4
+            : reduce_thread * kVector;
+        for (int column = column_part * kColumns + lane_column;
+             column < (column_part + 1) * kColumns; column += kThreads * kVector) {
             float accumulator[kVector]{};
             #pragma unroll 1
             for (int route = 0; route < kTopK; ++route) {
                 const int offset = token * kTopK + route;
                 const int expert = static_cast<int>(__ldg(topk_indices + offset));
                 const float weight = __ldg(topk_weights + offset);
-                if (expert < 0 || weight == 0.0f) continue;
+                if (expert < 0 || (kSkipZeroWeight && weight == 0.0f)) continue;
 
                 const int owner = expert / local_experts;
-                bool remote = kBulkRemote && owner != rank_idx;
+                uint8_t format = kBulkRemote && owner != rank_idx;
+                if constexpr (kMixedBulk128) {
+                    if (format)
+                        format = ((bulk128_mask >> owner) & 1) ? 2 : ((writer_mask >> owner) & 1);
+                } else if constexpr (!kBulk128Only) {
 #if DG_MEGAMOE_OWNER_MODE
-                if (remote) remote = ((writer_mask >> owner) & 1) != 0;
+                    if (format) format = (writer_mask >> owner) & 1;
 #endif
+                }
                 const int64_t slot = static_cast<int64_t>(route) * max_m + token;
-                const int4 packed = moe_reduce_load<kBulkRemote>(input + slot * kHidden + column, remote);
+                const int4 packed = moe_reduce_load<kBulkRemote, kMixedBulk128, kBulk128Only>(
+                    input + slot * kHidden + column, format);
                 const auto* values = reinterpret_cast<const __ppu_bfloat16*>(&packed);
                 #pragma unroll
                 for (int lane = 0; lane < kVector; ++lane)
@@ -528,7 +607,7 @@ __device__ __forceinline__ void moe_reduce_impl(
             #pragma unroll
             for (int pair = 0; pair < kVector / 2; ++pair)
                 pairs[pair] = __floats2bfloat162_rn(accumulator[2 * pair], accumulator[2 * pair + 1]);
-            tix::store_bf16x8<kOutputAligned>(
+            moe_reduce_store<kOutputAligned, kBulk128Only>(
                 output + static_cast<int64_t>(token) * kHidden + column, packed_output);
         }
         return;
@@ -562,15 +641,16 @@ __device__ __forceinline__ void moe_reduce_impl(
             weights[index] = __ldg(topk_weights + token * kTopK + index);
             remote_slots[index] = kBulkRemote &&
                 (expert_ids[index] < local_expert_begin || expert_ids[index] >= local_expert_end);
+            if constexpr (!kBulk128Only) {
 #if DG_MEGAMOE_OWNER_MODE
 #if DG_MEGAMOE_OWNER_READER_OPT
-            // Uniform all-bulk launches need no per-route owner calculation.
-            if (writer_mask != UINT64_MAX && remote_slots[index])
+                if (writer_mask != UINT64_MAX && remote_slots[index])
 #endif
-                remote_slots[index] &= ((writer_mask >> (expert_ids[index] / local_experts)) & 1) != 0;
+                    remote_slots[index] &= ((writer_mask >> (expert_ids[index] / local_experts)) & 1) != 0;
 #endif
+            }
         }
-        moe_reduce_token<false, kOutputAligned, kTopK, kHidden, kBulkRemote, kThreads, kColumnSplits>(
+        moe_reduce_token<false, kOutputAligned, kTopK, kHidden, kBulkRemote, kThreads, kColumnSplits, kBulk128Only>(
             input, output, slots, weights, remote_slots, token, column_part, reduce_thread);
         return;
     }
@@ -584,14 +664,16 @@ __device__ __forceinline__ void moe_reduce_impl(
         } else {
             remote_slots[index] = false;
         }
+        if constexpr (!kBulk128Only) {
 #if DG_MEGAMOE_OWNER_MODE
 #if DG_MEGAMOE_OWNER_READER_OPT
-        if (writer_mask != UINT64_MAX && remote_slots[index])
+            if (writer_mask != UINT64_MAX && remote_slots[index])
 #else
-        if (valid)
+            if (valid)
 #endif
-            remote_slots[index] &= ((writer_mask >> (expert / local_experts)) & 1) != 0;
+                remote_slots[index] &= ((writer_mask >> (expert / local_experts)) & 1) != 0;
 #endif
+        }
         slots[index] = valid
             ? index * static_cast<int64_t>(max_m) + token
             : -1;
@@ -600,17 +682,18 @@ __device__ __forceinline__ void moe_reduce_impl(
             : 0.0f;
     }
 
-    moe_reduce_token<true, kOutputAligned, kTopK, kHidden, kBulkRemote, kThreads, kColumnSplits>(
+    moe_reduce_token<true, kOutputAligned, kTopK, kHidden, kBulkRemote, kThreads, kColumnSplits, kBulk128Only>(
         input, output, slots, weights, remote_slots, token, column_part, reduce_thread);
 }
 
 // Distribute token/column tasks across warp-aligned groups for every operand type.
 template <bool kOutputAligned, int kTopK, int kHidden, int kCtaThreads,
-          int kColumnSplits = 1, int kReduceGroupThreads = 0, bool kSkipZeroWeight = false>
+          int kColumnSplits = 1, int kReduceGroupThreads = 0, bool kSkipZeroWeight = false,
+          bool kMixedBulk128 = false, bool kBulk128Only = false, bool kStreamBulk128 = false>
 __device__ __forceinline__ void moe_reduce_dispatch(
         const __ppu_bfloat16* input, const int64_t* ids, const float* weights,
         __ppu_bfloat16* output, int token_capacity, int local_experts, int rank_idx,
-        int tokens, uint64_t writer_mask) {
+        int tokens, uint64_t writer_mask, uint64_t bulk128_mask = 0) {
     constexpr int kReduceThreads = kReduceGroupThreads > 0 ? kReduceGroupThreads : kCtaThreads;
     static_assert(kReduceThreads % 32 == 0 && kCtaThreads % kReduceThreads == 0);
     constexpr int kTokenGroups = kCtaThreads / kReduceThreads;
@@ -624,11 +707,12 @@ __device__ __forceinline__ void moe_reduce_dispatch(
     if (kColumnSplits == 1 || reduce_thread * 8 < kHidden / kColumnSplits) {
         for (int work = blockIdx.x * kTokenGroups + token_group;
              work < tokens * kColumnSplits; work += gridDim.x * kTokenGroups) {
-            moe_reduce_impl<kOutputAligned, kTopK, kHidden, true, kReduceThreads, kColumnSplits, kSkipZeroWeight>(
+            moe_reduce_impl<kOutputAligned, kTopK, kHidden, true, kReduceThreads, kColumnSplits,
+                            kSkipZeroWeight, kMixedBulk128, kBulk128Only, kStreamBulk128>(
                 input,
                 ids, weights, output,
                 token_capacity, local_experts,
-                rank_idx, work / kColumnSplits, work % kColumnSplits, writer_mask, reduce_thread);
+                rank_idx, work / kColumnSplits, work % kColumnSplits, writer_mask, reduce_thread, bulk128_mask);
         }
     }
 }

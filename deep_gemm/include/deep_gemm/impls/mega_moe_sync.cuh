@@ -13,10 +13,12 @@ __global__ void mega_moe_dispatch_sync(const layout::MegaMoESignals* signals) {
 template <uint32_t NumRanks>
 __global__ void mega_moe_scatter_sync(layout::MegaMoESignals* signals) {
     const uint32_t generation = signals->preprocess_ready[0] & ~kPreprocessMetadataReadyBit;
-    __shared__ uint32_t mask[2];
-    comm::rank_barrier<NumRanks, true>(signals->scatter_arrivals, generation, mask);
-    if (threadIdx.x == 0)
+    __shared__ uint32_t mask[4];
+    comm::rank_barrier<NumRanks, true, true>(signals->scatter_arrivals, generation, mask);
+    if (threadIdx.x == 0) {
         signals->scatter_writer_mask = (uint64_t(mask[1]) << 32) | mask[0];
+        signals->scatter_bulk128_writer_mask = (uint64_t(mask[3]) << 32) | mask[2];
+    }
 }
 
 }  // namespace deep_gemm

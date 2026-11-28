@@ -67,7 +67,7 @@ struct MegaMoEInt8Kernel {
         cute::Copy_Atom<cute::AutoVectorizingCopyWithAssumedAlignment<128>, float>,
         float, cutlass::bfloat16_t,
         cutlass::epilogue::thread::LinearCombination<cutlass::bfloat16_t, 16, float, float>,
-        Ranks, (int64_t(TopK) * SourceCapacity * N > UINT32_MAX), false, WaitScatterPair>;
+        Ranks, (int64_t(TopK) * SourceCapacity * N > UINT32_MAX), false, WaitScatterPair, PackedInt4>;
     using Epilogue = std::conditional_t<kIsLinear1, ActivationEpilogue, ScatterEpilogue>;
     using Scheduler = sched::SM80MegaMoEScheduler<N, K, BM, BN, Groups, Stage,
         Ranks, kIsLinear1 ? KTilesPerFlag : 0, SourceCapacity, TopK, sm80::Int8FusedDispatch<BK>>;
@@ -81,10 +81,34 @@ template <class Kernel, int Hidden, int TopK, int Groups, int Ranks, bool kOutpu
           int kColumnSplits = 1, int kReduceGroupThreads = 0>
 __device__ __forceinline__ void mega_moe_int8_reduce_impl(
         typename Kernel::Params const& params, const int64_t* ids, const float* weights,
-        __ppu_bfloat16* output, int tokens, uint64_t writer_mask) {
+        __ppu_bfloat16* output, int tokens, uint64_t writer_mask, uint64_t bulk128_mask = 0) {
+    const auto* input = reinterpret_cast<const __ppu_bfloat16*>(params.scatter_buffer.base);
+    if constexpr (Kernel::CollectiveEpilogue::kEnableBulk128) {
+        if constexpr (DG_MEGAMOE_SPLIT_SYNC)
+            bulk128_mask = params.signals->scatter_bulk128_writer_mask;
+        if constexpr (Kernel::CollectiveEpilogue::kBulk128Writer) {
+            if (bulk128_mask == UINT64_MAX) {
+                // Small GEMM tiles need more resident CTAs. Larger tiles can overlap the TopK loads.
+                constexpr bool kStreamBulk128 = cute::size<0>(typename Kernel::TileShape{}) < 64;
+                moe_reduce_dispatch<kOutputAligned, TopK, Hidden, Kernel::MaxThreadsPerBlock,
+                                    kColumnSplits, kReduceGroupThreads, false, false, true, kStreamBulk128>(
+                    input, ids, weights, output, params.epilogue.token_capacity, Groups,
+                    params.scatter_buffer.rank_idx, tokens, writer_mask);
+                return;
+            }
+        }
+        const uint64_t rank_mask = UINT64_MAX >> (64 - Ranks);
+        if (bulk128_mask & rank_mask) {
+            moe_reduce_dispatch<kOutputAligned, TopK, Hidden, Kernel::MaxThreadsPerBlock,
+                                kColumnSplits, kReduceGroupThreads, false, true>(
+                input, ids, weights, output, params.epilogue.token_capacity, Groups,
+                params.scatter_buffer.rank_idx, tokens, writer_mask, bulk128_mask);
+            return;
+        }
+    }
     moe_reduce_dispatch<kOutputAligned, TopK, Hidden, Kernel::MaxThreadsPerBlock,
                         kColumnSplits, kReduceGroupThreads>(
-        reinterpret_cast<const __ppu_bfloat16*>(params.scatter_buffer.base),
+        input,
         ids, weights, output, params.epilogue.token_capacity, Groups,
         params.scatter_buffer.rank_idx, tokens, writer_mask);
 }
@@ -97,11 +121,13 @@ __device__ __forceinline__ void mega_moe_int8_scatter_impl(
     const uint32_t generation = __ldbl(params.signals->preprocess_ready) & ~kPreprocessMetadataReadyBit;
     Kernel{}(params, smem);
     if constexpr (!DG_MEGAMOE_SPLIT_SYNC) {
-        comm::rank_barrier<Ranks, true>(params.signals->scatter_arrivals, generation,
-                                        reinterpret_cast<uint32_t*>(smem));
+        constexpr bool kBulk128 = Kernel::CollectiveEpilogue::kEnableBulk128;
+        auto* writer_masks = reinterpret_cast<uint64_t*>(smem);
+        comm::rank_barrier<Ranks, true, kBulk128>(params.signals->scatter_arrivals, generation,
+                                                 reinterpret_cast<uint32_t*>(writer_masks));
         mega_moe_int8_reduce_impl<Kernel, Hidden, TopK, Groups, Ranks, kOutputAligned,
                                  kColumnSplits, kReduceGroupThreads>(
-            params, ids, weights, output, tokens, *reinterpret_cast<const uint64_t*>(smem));
+            params, ids, weights, output, tokens, writer_masks[0], kBulk128 ? writer_masks[1] : 0);
     }
 }
 

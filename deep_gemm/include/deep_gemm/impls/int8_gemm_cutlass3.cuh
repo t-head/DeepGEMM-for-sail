@@ -1662,7 +1662,7 @@ public:
       deep_gemm::comm::scatter_release<kWorldSize>(
           *params.signals, params.scatter_buffer,
           gridDim.x, blockIdx.x, threadIdx.x, generation,
-          cute::size<1>(TileShape{}) == 256);
+          cute::size<1>(TileShape{}) == 256, CollectiveEpilogue::kBulk128Writer);
     }
   }
 
